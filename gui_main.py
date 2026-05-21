@@ -975,8 +975,10 @@ class application(tk.Tk):
             else:
                 enemy.stats[stat] -= active_debuffs[stat]
         enemy.stats["Base Defense"] = useful_enemy_stats["Defense"]
+        enemy.stats["Defense"] = max(1, enemy.stats.get("Defense", 1)) # Enemy Defense can not be brought lower than 1
         enemy.stats["Magic Defense"] = max(-50, enemy.stats.get("Magic Defense", 0)) # Enemy Magic Defense can not be brought lower than -50 (magic damage taken x2)
         enemy.stats["Magic Damage Taken"] = enemy.stats.pop("Magic DT%")
+
 
         if trigger=="run one ws":
 
@@ -1434,7 +1436,7 @@ class application(tk.Tk):
         mystyle = ttk.Style()
         mystyle.theme_use('vista') # 'winnative', 'clam', 'alt', 'default', 'classic', 'vista', 'xpnative'
 
-        self.title("Kastra FFXI Damage Simulator  (2026 May 03a)") # pyinstaller --exclude-module gear --exclude-module enemies --clean --onefile --icon=icons32/23937.ico gui_main.py
+        self.title("Kastra FFXI Damage Simulator  (2026 May 21a)") # pyinstaller --exclude-module gear --exclude-module enemies --clean --onefile --icon=icons32/23937.ico gui_main.py
         self.geometry("700x850")
         self.resizable(False, False)
         self.app_icon = tk.PhotoImage(file="icons32/23937.png") # hat

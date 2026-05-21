@@ -194,8 +194,8 @@ def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric,
     verbose_dps = player.abilities.get("Verbose DPS", False)
     very_verbose_dps = player.abilities.get("Very Verbose DPS", False)
 
-    enemy_defense = enemy.stats["Defense"]
-    enemy_evasion = enemy.stats["Evasion"]
+    enemy_defense = max(1, enemy.stats["Defense"])
+    enemy_evasion = max(1, enemy.stats["Evasion"])
 
     nhits = 1
 
@@ -1491,8 +1491,8 @@ def cast_spell(player, enemy, spell_name, spell_type, input_metric):
         stp = player.stats.get("Store TP",0)/100
         
         enemy_agi = enemy.stats.get("AGI",0)
-        enemy_evasion = enemy.stats.get("Evasion",0)
-        enemy_defense = enemy.stats.get("Defense",0)
+        enemy_evasion = max(1, enemy.stats.get("Evasion", 1))
+        enemy_defense = max(1, enemy.stats.get("Defense", 1))
         
         sharpshot = player.abilities.get("Sharpshot",False)
         hover_shot = player.abilities.get("Hover Shot",False)
@@ -1718,7 +1718,7 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
 
     crit_dmg = player.stats.get("Crit Damage",0)/100 # Crit rate was read in earlier directly from the WS attributes.
     stp = player.stats.get("Store TP",0)/100
-    enemy_defense = ws_info["enemy_def"] # I treat all "defense down" debuffs as multiplicative stacking. Otherwise we could end up with negative or zero defense with additive stacking. This results in slightly less damage than additive stacking would.
+    enemy_defense = max(1, ws_info["enemy_def"]) # I treat all "defense down" debuffs as multiplicative stacking. Otherwise we could end up with negative or zero defense with additive stacking. This results in slightly less damage than additive stacking would.
     enemy_evasion = enemy.stats["Evasion"]
 
     # Read in delay values now so we can use them in the magical WS section, which return TP for their one magic hit.
