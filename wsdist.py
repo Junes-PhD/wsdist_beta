@@ -578,12 +578,26 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
 if __name__ == "__main__":
 
-    main_job = sys.argv[1]
-    sub_job = sys.argv[2]
-    master_level = int(sys.argv[3])
+    if len(sys.argv) > 1:
+        main_job = sys.argv[1]
+    else:
+        main_job = "nin"
+
+    if len(sys.argv) > 2:
+        sub_job = sys.argv[2]
+    else:
+        sub_job = "war"
+
+    if len(sys.argv) > 3:
+        master_level = int(sys.argv[3])
+    else:
+        master_level = 50
+
     buffs = {}
     abilities = {}
-    enemy = create_enemy(apex_toad)
+    enemy = create_enemy(preset_enemies["Apex Toad"])
+    enemy.stats["Base Defense"] = preset_enemies["Apex Toad"]["Defense"]
+    enemy.stats["Magic Defense"] = max(-50, enemy.stats.get("Magic Defense", 0))
     ws_name = "Blade: Metsu"
     spell_name = "Waterja"
     action_type = "weapon skill"
