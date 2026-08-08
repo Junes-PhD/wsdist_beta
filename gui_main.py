@@ -3059,6 +3059,17 @@ class application(tk.Tk):
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     app = application()
+
+    # Tk on Windows can receive Configure events faster than it redraws a large
+    # widget tree while a window is dragged or resized. A tiny throttle lets the
+    # compositor catch up and avoids the visible jitter.
+    from time import sleep
+
+    def on_configure(event):
+        if event.widget == app:
+            sleep(0.005)
+
+    app.bind("<Configure>", on_configure)
     app.wait_visibility()
 
     app.mainloop()
