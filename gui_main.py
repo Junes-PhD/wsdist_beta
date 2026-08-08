@@ -2591,7 +2591,13 @@ class application(tk.Tk):
         optimize_frame_bottomleft = ttk.Frame(optimize_frame_bottom, width=250, height=230)
         optimize_frame_bottomleft.grid(row=0, column=0, sticky="n")
         optimize_frame_bottomleft.grid_propagate(False)
-        optimize_frame_bottomleft.columnconfigure(0, weight=1) 
+        optimize_frame_bottomleft.columnconfigure(0, weight=1)
+
+        def optimizer_help(row, message):
+            help_button = ttk.Button(optimize_frame_bottomleft, text="?", width=2)
+            help_button.grid(row=row, column=2, padx=(3, 0), pady=2)
+            Hovertip(help_button, message, hover_delay=300)
+            return help_button
 
         self.pdt_requirements_value = tk.IntVar(value=0)
         self.mdt_requirements_value = tk.IntVar(value=0)
@@ -2650,18 +2656,21 @@ class application(tk.Tk):
         optimizer_restarts_entry = ttk.Entry(optimize_frame_bottomleft, textvariable=self.optimizer_restarts_value, width=10, justify="center")
         optimizer_restarts_entry.grid(row=5, column=1, pady=2, sticky="ew")
         Hovertip(optimizer_restarts_entry, "Run independent seeded searches and keep the strongest result. 1 preserves a single search.", hover_delay=500)
+        optimizer_help(5, "Restarts run independent randomized searches. Higher values explore more starting paths and can find better sets, but increase total work.")
 
         optimizer_workers_text = ttk.Label(optimize_frame_bottomleft, text="Parallel workers", width=20, anchor="w")
         optimizer_workers_text.grid(row=6, column=0, pady=2, sticky="w")
         optimizer_workers_entry = ttk.Entry(optimize_frame_bottomleft, textvariable=self.optimizer_workers_value, width=10, justify="center")
         optimizer_workers_entry.grid(row=6, column=1, pady=2, sticky="ew")
         Hovertip(optimizer_workers_entry, "0 = Auto. Workers run restarts in separate processes; use 1 for serial execution.", hover_delay=500)
+        optimizer_help(6, "Number of restart processes. 0 chooses automatically while leaving one CPU core available. Use 1 to disable parallel execution.")
 
         optimizer_seed_text = ttk.Label(optimize_frame_bottomleft, text="Optimizer seed", width=20, anchor="w")
         optimizer_seed_text.grid(row=7, column=0, pady=2, sticky="w")
         optimizer_seed_entry = ttk.Entry(optimize_frame_bottomleft, textvariable=self.optimizer_seed_value, width=10, justify="center")
         optimizer_seed_entry.grid(row=7, column=1, pady=2, sticky="ew")
         Hovertip(optimizer_seed_entry, "Optional. Reuse a printed winning seed to reproduce a single optimizer restart.", hover_delay=500)
+        optimizer_help(7, "Optional whole-number seed. Leave blank for a fresh search. Reusing a winning seed reproduces that restart's randomized search order.")
 
 
         '''
