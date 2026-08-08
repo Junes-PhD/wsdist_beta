@@ -1532,10 +1532,14 @@ class application(tk.Tk):
     def update_visible_quicklook_frame(self, slot):
         '''
         When clicking the quicklook equipment icons.
-        Use tkraise() to raise the selected slot's frame to the top and make it visible.
+        Map only the selected slot's frame. Keeping all overlapping virtual
+        frames mapped makes Windows redraw every hidden picker while moving the
+        main window.
         Update the self.visible_quicklook_frame_slot variable
         '''
-        self.quicklook_scrollframes[slot].tkraise()
+        for frame in self.quicklook_scrollframes.values():
+            frame.place_forget()
+        self.quicklook_scrollframes[slot].place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
         self.visible_quicklook_frame_slot = slot
 
     def update_visible_quicklook_frame_tp(self, slot):
@@ -1544,7 +1548,9 @@ class application(tk.Tk):
         Use tkraise() to raise the selected slot's frame to the top and make it visible.
         Update the self.visible_quicklook_frame_slot variable
         '''
-        self.tp_quicklook_scrollframes[slot].tkraise()
+        for frame in self.tp_quicklook_scrollframes.values():
+            frame.place_forget()
+        self.tp_quicklook_scrollframes[slot].place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
         self.tp_visible_quicklook_frame_slot = slot
 
     def update_visible_quicklook_frame_ws(self, slot):
@@ -1553,7 +1559,9 @@ class application(tk.Tk):
         Use tkraise() to raise the selected slot's frame to the top and make it visible.
         Update the self.visible_quicklook_frame_slot variable
         '''
-        self.ws_quicklook_scrollframes[slot].tkraise()
+        for frame in self.ws_quicklook_scrollframes.values():
+            frame.place_forget()
+        self.ws_quicklook_scrollframes[slot].place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
         self.ws_visible_quicklook_frame_slot = slot
 
     def update_visible_optimize_frame(self, slot):
@@ -1562,7 +1570,9 @@ class application(tk.Tk):
         Use tkraise() to raise the selected slot's frame to the top and make it visible.
         Update the self.visible_optimize_frame_slot variable
         '''
-        self.optimize_scrollframes[slot].tkraise()
+        for frame in self.optimize_scrollframes.values():
+            frame.place_forget()
+        self.optimize_scrollframes[slot].place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
         self.visible_optimize_frame_slot = slot
 
 
@@ -3048,28 +3058,15 @@ class application(tk.Tk):
                 self.update_quicklook_equipment((slot, self.tp_quicklook_equipped_dict[slot]["item"]["Name2"], self.tp_quicklook_equipped_dict, "tp"))
                 self.update_quicklook_equipment((slot, self.ws_quicklook_equipped_dict[slot]["item"]["Name2"], self.ws_quicklook_equipped_dict, "ws"))
 
-        self.quicklook_scrollframes["main"].tkraise()
-        self.tp_quicklook_scrollframes["main"].tkraise()
-        self.ws_quicklook_scrollframes["main"].tkraise()
-        self.optimize_scrollframes["main"].tkraise()
-        self.visible_quicklook_frame_slot = "main"
-        self.visible_optimize_frame_slot = "main"
+        self.update_visible_quicklook_frame("main")
+        self.update_visible_quicklook_frame_tp("main")
+        self.update_visible_quicklook_frame_ws("main")
+        self.update_visible_optimize_frame("main")
         self.after(1500, self.poll_wsdist_bridge)
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     app = application()
-
-    # Tk on Windows can receive Configure events faster than it redraws a large
-    # widget tree while a window is dragged or resized. A tiny throttle lets the
-    # compositor catch up and avoids the visible jitter.
-    from time import sleep
-
-    def on_configure(event):
-        if event.widget == app:
-            sleep(0.005)
-
-    app.bind("<Configure>", on_configure)
     app.wait_visibility()
 
     app.mainloop()
