@@ -3,9 +3,9 @@ File containing calculations for real-world time (seconds) between attack rounds
     
 Author: Kastra (Asura server)
 '''
-from numba import njit
+from numba_compat import njit
 
-@njit
+@njit(cache=True)
 def get_delay_timing(delay1, delay2, dw, marts, magic_haste, ja_haste, gear_haste):
     #
     # Uses your modified delay to calculate seconds between attack rounds.

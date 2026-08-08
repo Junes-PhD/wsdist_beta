@@ -4,9 +4,9 @@ File containing calculations for PDIF values used in physical damage dealt.
 Author: Kastra (Asura server)
 '''
 import random
-from numba import njit
+from numba_compat import njit
 
-@njit
+@njit(cache=True)
 def get_pdif_melee(player_attack, wpn_type_skill, pdl_trait, pdl_gear=0, enemy_defense=1300, crit_rate=0): # Values defined in this line use the Python format for: "Use these values as defaults if the user doesn't provide them"
     #
     # Calculate PDIF for physical melee hits using the process described on BG wiki
@@ -76,7 +76,7 @@ def get_pdif_melee(player_attack, wpn_type_skill, pdl_trait, pdl_gear=0, enemy_d
     return(pdif, crit)
 
 
-@njit
+@njit(cache=True)
 def get_avg_pdif_melee(player_attack, wpn_type_skill, pdl_trait, pdl_gear=0, enemy_defense=1300, crit_rate=0): # Values defined in this line use the Python format for: "Use these values as defaults if the user doesn't provide them"
     #
     # Calculate PDIF for physical melee hits using the process described on BG wiki, but assuming the average random value is drawn.
@@ -145,7 +145,7 @@ def get_avg_pdif_melee(player_attack, wpn_type_skill, pdl_trait, pdl_gear=0, ene
 
 
 
-@njit
+@njit(cache=True)
 def get_pdif_ranged(player_ranged_attack, wpn_type_skill, pdl_trait, pdl_gear, enemy_defense=1300, crit_rate=0):
 
     pdif_base_cap = 3.5 if wpn_type_skill=="Marksmanship" else 3.25
@@ -187,7 +187,7 @@ def get_pdif_ranged(player_ranged_attack, wpn_type_skill, pdl_trait, pdl_gear, e
 
     return(pdif, crit)
 
-@njit
+@njit(cache=True)
 def get_avg_pdif_ranged(player_ranged_attack, wpn_type_skill, pdl_trait, pdl_gear, enemy_defense=1300, crit_rate=0):
 
     pdif_base_cap = 3.5 if wpn_type_skill=="Marksmanship" else 3.25

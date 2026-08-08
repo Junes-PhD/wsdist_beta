@@ -8,7 +8,7 @@ A proper calculation would be needed (with hundreds of terms added) after we det
     
 Author: Kastra (Asura server)
 '''
-from numba import njit
+from numba_compat import njit
 import numpy as np
 import random
 
@@ -178,7 +178,7 @@ import random
 
 #     return(main_hits, sub_hits)
 
-@njit
+@njit(cache=True)
 def get_ma_rate3(main_job, nhits, qa, ta, da, oa_list, fua_list, dual_wield, hitrate_matrix, ranged_hitrate2, daken, kickattacks, zanshin, zanhasso, zanshin_hitrate, zanshin_oa2, striking_flourish=False, ternary_flourish=False, tp_round=False,):
     #
     # Calculate the expected number of attacks on a given attack round (nhits=1) or weapon skill (nhits=nhits).

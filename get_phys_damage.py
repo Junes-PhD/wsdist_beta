@@ -3,9 +3,9 @@ File containing calculations for physical damage dealt.
     
 Author: Kastra (Asura server)
 '''
-from numba import njit
+from numba_compat import njit
 
-@njit
+@njit(cache=True)
 def get_phys_damage(wpn_dmg, fstr_wpn, wsc, pdif, ftp, crit, crit_dmg, wsd, ws_bonus, ws_trait, n, sneak_attack_bonus=0, trick_attack_bonus=0, climactic_flourish_bonus=0,striking_flourish_bonus=0,ternary_flourish_bonus=0):
     #
     # Calculate physical damage dealt for a single attack.
@@ -19,7 +19,7 @@ def get_phys_damage(wpn_dmg, fstr_wpn, wsc, pdif, ftp, crit, crit_dmg, wsd, ws_b
     phys = int(  ((wpn_dmg + fstr_wpn + wsc)*ftp*(1+wsd*(n==0))*(1+ws_bonus)*(1+ws_trait)) + sneak_attack_bonus*(n==0) + trick_attack_bonus*(n==0) + climactic_flourish_bonus*(n==0) + striking_flourish_bonus*(n==0) + ternary_flourish_bonus*(n==0)) * pdif * (1 + crit*min(crit_dmg,1.0)) # "crit" = True/False
     return(phys)
 
-@njit
+@njit(cache=True)
 def get_avg_phys_damage(wpn_dmg, fstr_wpn, wsc, pdif, ftp, crit_rate, crit_dmg, wsd, ws_bonus, ws_trait, sneak_attack_bonus=0, trick_attack_bonus=0 ,climactic_flourish_bonus=0, striking_flourish_bonus=0,ternary_flourish_bonus=0):
     #
     # Calculate average physical damage dealt for a single attack.

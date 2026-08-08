@@ -14,7 +14,11 @@ from create_player import *
 import numpy as np
 from actions import *
 import sys
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import redirect_stdout
 from datetime import datetime # For timestamping new sets to put on BG Wiki
+from itertools import product
+from io import StringIO
 
 # Use an external gear.py file
 # https://stackoverflow.com/questions/47350078/importing-external-module-in-single-file-exe-created-with-pyinstaller
@@ -141,16 +145,55 @@ def format_bgwiki(ws_name, tp, player, best_metric):
     """
     print(bgwiki_text)
 
-def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, ):
+def _prepare_candidates(check_gear, main_job, ws_type):
+    """Copy and discard candidates the current main job cannot equip."""
+    candidates = {
+        slot: [item for item in items if main_job in item.get("Jobs", ())]
+        for slot, items in check_gear.items()
+    }
+    if ws_type == "melee" and main_job not in ("rng", "cor"):
+        candidates["ranged"] = [
+            item for item in candidates["ranged"]
+            if item.get("Type") not in ("Crossbow", "Gun", "Bow")
+        ]
+        candidates["ammo"] = [
+            item for item in candidates["ammo"]
+            if item.get("Type") not in ("Bolt", "Bullet", "Arrow")
+            and "antitail" not in item.get("Name2", "").lower()
+        ]
+    return candidates
+
+
+def estimate_candidate_checks(check_gear, main_job, ws_type="None"):
+    """Estimate raw one/two-slot candidates in one optimizer pass."""
+    candidates = _prepare_candidates(check_gear, main_job.lower(), ws_type)
+    counts = [len(items) for items in candidates.values()]
+    return sum(counts) + sum(
+        left * right for index, left in enumerate(counts) for right in counts[index + 1:]
+    )
+
+
+def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, seed=None, n_iter=10, return_details=False):
     #
     # Build a valid gear set, test it, and return the best set found.
     #
     # action_type = "ranged attack", "weapon skill", "tp round", "spell cast"
     #
-    n_iter = 10
     fitn = 2
 
+    main_job = main_job.lower()
+    sub_job = sub_job.lower()
     verbose_swaps = abilities.get("Verbose Swaps", False)
+    damage_taken_item_cache = {}
+    rng = np.random.default_rng(seed) if seed is not None else np.random
+    # Keep caller-owned selections stable and remove impossible candidates once,
+    # before the hot loop. Formula evaluation is unchanged for every valid set.
+    check_gear = {slot: list(items) for slot, items in check_gear.items()}
+    starting_gearset = starting_gearset.copy()
+
+    def duplicate_allowed(item):
+        count = item.get("Accessible Count")
+        return item.get("Name", "Empty") == "Empty" or count is None or int(count) >= 2
 
     ws_dict = {"Katana": ["Blade: Retsu", "Blade: Teki", "Blade: To", "Blade: Chi", "Blade: Ei", "Blade: Jin", "Blade: Ten", "Blade: Ku", "Blade: Yu", "Blade: Metsu", "Blade: Kamu", "Blade: Hi", "Blade: Shun", "Zesho Meppo",],
         "Great Katana": ["Tachi: Enpi", "Tachi: Goten", "Tachi: Kagero", "Tachi: Jinpu", "Tachi: Koki","Tachi: Yukikaze", "Tachi: Gekko", "Tachi: Kasha", "Tachi: Ageha","Tachi: Kaiten", "Tachi: Rana", "Tachi: Fudo", "Tachi: Shoha", "Tachi: Mumei"],
@@ -215,28 +258,28 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                     "Maru Kala":"Varga Purnikawa",
                     }
 
-    # If testing a melee WS, only check instruments in the "ranged" slot.
-    # This does not apply to RNG or COR who might want savage blade sets to test gun/bow options
-    if ws_type=="melee" and main_job not in ["rng", "cor"]:
-        check_gear["ranged"] = [k for k in check_gear["ranged"] if k["Type"] not in ["Crossbow", "Gun", "Bow"]]
-        check_gear["ammo"] = [k for k in check_gear["ammo"] if k["Type"] not in ["Bolt", "Bullet", "Arrow"] and "antitail" not in k["Name2"]]
+    check_gear = _prepare_candidates(check_gear, main_job, ws_type)
+    for items in check_gear.values():
+        rng.shuffle(items)
 
     # Rather than start with an empty slot, randomly build a set from the selected gear so we likely start with some accuracy+ and avoid getting stuck.
     # Do not adjust slots that are not being checked.
     for slot in starting_gearset:
 
         # Unequip gear you can't wear if it's already equipped, even if the slot is "frozen"
-        if main_job.lower() not in starting_gearset[slot]["Jobs"]:
+        if main_job not in starting_gearset[slot]["Jobs"]:
             starting_gearset[slot] = Empty
 
         frozen_slot = (len(check_gear[slot]) == 0)
         if not frozen_slot:
-            starting_gearset[slot] = np.random.choice(check_gear[slot])
+            starting_gearset[slot] = rng.choice(check_gear[slot])
             
             # Avoid wearing two rare items in initial gearset to prevent "unphysical" sets.
-            if slot == "ring2" and (starting_gearset["ring1"]["Name2"] == starting_gearset["ring2"]["Name2"]):
+            if slot == "ring2" and (starting_gearset["ring1"]["Name2"] == starting_gearset["ring2"]["Name2"]
+                                     and not duplicate_allowed(starting_gearset["ring2"])):
                 starting_gearset["ring2"] = Empty
-            if slot == "ear2" and (starting_gearset["ear1"]["Name2"] == starting_gearset["ear2"]["Name2"]):
+            if slot == "ear2" and (starting_gearset["ear1"]["Name2"] == starting_gearset["ear2"]["Name2"]
+                                    and not duplicate_allowed(starting_gearset["ear2"])):
                 starting_gearset["ear2"] = Empty
 
 
@@ -246,6 +289,10 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     jse_ears1 = [k + " Earring +1" for k in ["Hattori", "Heathen's", "Lethargy", "Ebers", "Wicce", "Peltast's", "Boii", "Bhikku", "Skulker's", "Chevalier's", "Nukumi", "Fili", "Amini", "Kasuga", "Beckoner's", "Hashishin", "Chasseur's", "Karagoz", "Maculele", "Arbatel", "Azimuth", "Erilaz"]]
     jse_ears2 = [k + " Earring +2" for k in ["Hattori", "Heathen's", "Lethargy", "Ebers", "Wicce", "Peltast's", "Boii", "Bhikku", "Skulker's", "Chevalier's", "Nukumi", "Fili", "Amini", "Kasuga", "Beckoner's", "Hashishin", "Chasseur's", "Karagoz", "Maculele", "Arbatel", "Azimuth", "Erilaz"]]
     jse_ears = jse_ears1+jse_ears2
+    one_handed = ("Axe", "Club", "Dagger", "Sword", "Katana")
+    two_handed = ("Great Sword", "Great Katana", "Great Axe", "Polearm", "Scythe", "Staff")
+    archery_ws = ("Empyreal Arrow", "Flaming Arrow", "Namas Arrow", "Jishnu's Radiance", "Apex Arrow", "Refulgent Arrow", "Sidewinder", "Blast Arrow", "Piercing Arrow")
+    marksmanship_ws = ("Last Stand", "Hot Shot", "Leaden Salute", "Wildfire", "Coronach", "Trueflight", "Detonator", "Blast Shot", "Slug Shot", "Split Shot")
 
     pdt = 200 # How much PDT the set has
     mdt = 200
@@ -259,56 +306,78 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
     pdt_thresh_temp = 200 # How much PDT the current new set must have to be accepted. The starting values are high to ensure that the code enters the loop to begin with.
     mdt_thresh_temp = 200
+    best_output = None
+    best_metric = None
 
 
     while pdt > pdt_thresh or mdt > mdt_thresh:
         # print(f"\nChecking conditions: PDT:{pdt_thresh_temp},  MDT:{mdt_thresh_temp}")
 
-        # Reset some variables between PDT/MDT iterations.
-
-        best_metric = 0.0001 # Metric used to find the best set. This part of the code exclusively looks for "highest number".
-
         for z in range(n_iter):
             print(f"Current iteration: {z+1}")
             
-            converged_set = best_set.copy() # The loop is considered converged if the set after a full iteration is the same as this set (no improvements were found).
+            # Every candidate in this pass is compared to this immutable baseline.
+            # This makes a full one/two-slot neighborhood pass independent of the
+            # order in which slot pairs happen to be evaluated.
+            converged_set = best_set.copy()
+            base_damage_taken_totals = damage_taken_totals(
+                converged_set, buffs, damage_taken_item_cache
+            )
+            base_pdt, base_mdt = damage_taken_from_totals(
+                base_damage_taken_totals, converged_set["main"], abilities
+            )
+
+            if base_pdt <= pdt_thresh_temp and base_mdt <= mdt_thresh_temp:
+                base_player = create_player(main_job, sub_job, master_level, converged_set, buffs, abilities)
+                if action_type == "weapon skill":
+                    decimals = 1
+                    nondecimals = 8
+                    metric_base, best_output = average_ws(base_player, enemy, ws_name, min_tp, ws_type, input_metric)
+                elif action_type == "spell cast":
+                    decimals = 1
+                    nondecimals = 8
+                    metric_base, best_output = cast_spell(base_player, enemy, spell_name, spell_type, input_metric)
+                elif action_type == "attack round":
+                    decimals = 3
+                    nondecimals = 8
+                    metric_base, best_output, _ = average_attack_round(base_player, enemy, 0, min_tp, input_metric)
+                else:
+                    raise ValueError(f"Unknown action_type ({action_type})")
+                invert = best_output[-1]
+                best_metric = max(0.0001, metric_base ** invert)
+            else:
+                # The current set no longer meets the tightened PDT/MDT gate, so
+                # the first valid neighbor establishes the new baseline.
+                best_metric = 0.0001
 
             # A list of items in each slot that are within some % of the best item in that slot.
             swaps = {"ammo":[],"head":[],"neck":[],"ear1":[],"ear2":[],"body":[],"hands":[],"ring1":[],"ring2":[],"waist":[],"legs":[],"feet":[]}
 
-            # Randomize the order that we check gear slots in
+            # Randomize slot order per pass. Item order is randomized once per
+            # restart; reshuffling it for every pair only consumed CPU.
             check_slots = np.array([k for k in check_gear])
-            np.random.shuffle(check_slots)
+            rng.shuffle(check_slots)
 
             # For now, the code will only support two simultaneous swaps. Adding a third requires only adding a new for loop, but it adds a significant amount of computation time.
+            found_feasible_neighbor = False
             for i1, slot1 in enumerate(check_slots): 
-                for i2, slot2 in enumerate(check_slots):
-
-                    # Do not check duplicate sets.
-                    if i2 < i1:
-                        continue
+                for slot2 in check_slots[i1:]:
                     
                     # Only check single item swaps if fitn==1
                     if fitn==1:
-                        if i2 != i1:
+                        if slot2 != slot1:
                             continue
 
-                    test_set = best_set.copy()
+                    test_set = converged_set.copy()
                     
-                    # Randomize the order that the gear in each slot is checked.
-                    np.random.shuffle(check_gear[slot1])
-                    np.random.shuffle(check_gear[slot2])
+                    if slot1 == slot2:
+                        item_pairs = ((item, item) for item in check_gear[slot1])
+                    else:
+                        item_pairs = product(check_gear[slot1], check_gear[slot2])
 
-                    for j1,item1 in enumerate(check_gear[slot1]):
-                        for j2,item2 in enumerate(check_gear[slot2]):
+                    for item1, item2 in item_pairs:
 
-                            if (slot1==slot2) and (item1!=item2): # Do not try to equip two different items in the same slot.
-                                continue
-
-                            if (main_job not in item1["Jobs"]) or (main_job not in item2["Jobs"]): # Do not equip items your main job can not use.
-                                continue
-
-                            if (item1==best_set[slot1]) or (item2==best_set[slot2]): # If an item is already equipped in one of the slots, then skip the iteration. I let the "item1==item2" cases handle single-item swaps.
+                            if (item1==converged_set[slot1]) or (item2==converged_set[slot2]): # Do not retest the baseline set.
                                 continue
 
                             # Equip the items and check that the test_set is valid.
@@ -316,22 +385,20 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             test_set[slot2] = item2
 
 
-                            if (test_set["ring1"]==test_set["ring2"]) and (test_set["ring1"]["Name"]!="Empty"): # Do not try to equip a second unique ring (unless the item is "Empty").
+                            if (test_set["ring1"]==test_set["ring2"]) and (test_set["ring1"]["Name"]!="Empty") and not duplicate_allowed(test_set["ring1"]):
                                 continue
-                            if (test_set["ear1"]==test_set["ear2"]) and (test_set["ear1"]["Name"]!="Empty"): # Do not try to equip a second unique earring (unless the item is "Empty").
+                            if (test_set["ear1"]==test_set["ear2"]) and (test_set["ear1"]["Name"]!="Empty") and not duplicate_allowed(test_set["ear1"]):
                                 continue
-                            if (test_set["main"]==test_set["sub"]) and (test_set["main"]["Name"]!="Empty"): # Do not try to equip a unique weapon (unless the item is "Empty").
+                            if (test_set["main"]==test_set["sub"]) and (test_set["main"]["Name"]!="Empty") and not duplicate_allowed(test_set["main"]):
                                 continue
                             #print("test1")
 
                             # Do not test 1-handed weapons with grips.
-                            one_handed = ["Axe", "Club", "Dagger", "Sword", "Katana"]
                             if (test_set["main"]["Skill Type"] in one_handed) and (test_set["sub"]["Type"] == "Grip"):
                                 continue
                             #print("test2")
 
                             # Do not allow 2-handed weapons with shields or 1-handed weapons.
-                            two_handed = ["Great Sword", "Great Katana", "Great Axe", "Polearm", "Scythe", "Staff"]
                             if (test_set["main"]["Skill Type"] in two_handed) and (test_set["sub"]["Type"]=="Weapon" or test_set["sub"]["Type"]=="Shield"):
                                 continue
                             #print("test3")
@@ -342,15 +409,13 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
                             #print("test4")
 
-                            archery = ["Empyreal Arrow", "Flaming Arrow", "Namas Arrow","Jishnu's Radiance","Apex Arrow","Refulgent Arrow","Sidewinder","Blast Arrow","Piercing Arrow"]
-                            marksmanship = ["Last Stand","Hot Shot","Leaden Salute","Wildfire","Coronach","Trueflight", "Detonator","Blast Shot","Slug Shot","Split Shot"]
-                            if (action_type=="weapon skill") and (ws_name in archery+marksmanship):
+                            if (action_type=="weapon skill") and (ws_name in archery_ws + marksmanship_ws):
                                 # If using a ranged weapon skill, ensure that the weapon and ammo type match the weapon skill.
 
-                                if (ws_name in archery) and (test_set["ranged"]["Skill Type"]!="Archery" or test_set["ammo"]["Type"]!="Arrow"):
+                                if (ws_name in archery_ws) and (test_set["ranged"]["Skill Type"]!="Archery" or test_set["ammo"]["Type"]!="Arrow"):
                                     continue
                                 
-                                if (ws_name in marksmanship) and (test_set["ranged"]["Skill Type"]!="Marksmanship" or test_set["ammo"]["Type"] not in ["Bolt", "Bullet"]):
+                                if (ws_name in marksmanship_ws) and (test_set["ranged"]["Skill Type"]!="Marksmanship" or test_set["ammo"]["Type"] not in ["Bolt", "Bullet"]):
                                     continue
 
                                 if (test_set["ranged"]["Type"]=="Crossbow") and (test_set["ammo"]["Type"]!="Bolt"):
@@ -426,22 +491,28 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
 
 
-                            # Sets thats survive this long are valid and satisfy the temporary PDT/MDT requirements. We can now test the set.
-                            player = create_player(main_job, sub_job, master_level, test_set, buffs, abilities)
-
-
-                            # Don't even test the set if the DT requirement is not met in both PDT and MDT
-                            pdt = player.stats.get("PDT",0) + player.stats.get("DT",0)
-                            mdt = player.stats.get("MDT",0) + player.stats.get("DT",0)
-                            pdt = -50 if pdt < -50 else pdt # Apply the 50% cap.
-                            mdt = -50 if mdt < -50 else mdt
-                            pdt += player.stats.get("PDT2",0) + player.stats.get("DT2",0)
-                            mdt += player.stats.get("MDT2",0) + player.stats.get("DT2",0)
-                            # for slot in test_set:   # TODO: Loop through gear and add MDT/PDT instead of creating a player class
-                            #     pdt += test_set[slot].get("PDT2",0) # PDT2 breaks the cap.
-                            #     mdt += test_set[slot].get("MDT2",0)
+                            # Only one or two slots differ from the immutable
+                            # baseline, so update its PDT/MDT totals by delta.
+                            candidate_totals = base_damage_taken_totals.copy()
+                            changed_items = {slot1: item1, slot2: item2}
+                            for changed_slot, changed_item in changed_items.items():
+                                previous_values = damage_taken_item_values(
+                                    converged_set[changed_slot], damage_taken_item_cache
+                                )
+                                next_values = damage_taken_item_values(
+                                    changed_item, damage_taken_item_cache
+                                )
+                                for index, (previous, next_value) in enumerate(zip(previous_values, next_values)):
+                                    candidate_totals[index] += next_value - previous
+                            pdt, mdt = damage_taken_from_totals(
+                                candidate_totals, test_set["main"], abilities
+                            )
                             if pdt > pdt_thresh_temp or mdt > mdt_thresh_temp:
                                 continue
+                            found_feasible_neighbor = True
+
+                            # Sets that survive this long are valid and satisfy the temporary PDT/MDT requirements.
+                            player = create_player(main_job, sub_job, master_level, test_set, buffs, abilities)
 
 
                             # Prepare to test the set.
@@ -473,22 +544,23 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             if (metric > best_metric):
                                 if item1==item2:
                                     print(f"[{slot1:<15s}]: [{best_set[slot1]['Name2']} ->  {item1['Name2']}   [{best_metric**invert:>{nondecimals}.{decimals}f} -> {metric**invert:>{nondecimals}.{decimals}f}]") if verbose_swaps else None
-                                    best_set[slot1] = item1
                                 else:
                                     print(f"[{slot1:<6s} & {slot2:<6s}]: [{best_set[slot1]['Name2']} & {best_set[slot2]['Name2']}] -> [{item1['Name2']} & {item2['Name2']}] [{best_metric**invert:>{nondecimals}.{decimals}f} -> {metric**invert:>{nondecimals}.{decimals}f}]") if verbose_swaps else None
-                                    best_metric = metric
-                                    best_set[slot1] = item1
-                                    best_set[slot2] = item2
+                                best_set = test_set.copy()
                                 best_metric = metric
                                 best_output = output
     
                             elif (item1==item2):
-                                try:
-                                    if (best_metric%metric / best_metric < (float(next_best_percent)/100)) and (slot1 not in ["main","sub","ranged","back"]):
-                                        swaps[slot1].append([item1["Name2"],metric**invert])
-                                except:
-                                    # print(f"Error on \"{item1['Name2']}\" - Metric = {metric}  - Best Metric = {best_metric}")
-                                    pass
+                                relative_difference = (best_metric - metric) / best_metric
+                                if (relative_difference <= float(next_best_percent) / 100
+                                        and slot1 not in ["main", "sub", "ranged", "back"]):
+                                    swaps[slot1].append([item1["Name2"], metric**invert, relative_difference])
+
+            if (base_pdt > pdt_thresh_temp or base_mdt > mdt_thresh_temp) and not found_feasible_neighbor:
+                raise ValueError(
+                    "Optimizer could not reach the requested PDT/MDT requirements from the current search neighborhood. "
+                    "Try more selected defensive gear or additional restarts."
+                )
 
             if best_set==converged_set: # If no improvement is found after one full iteration.
                 # best_player = create_player(main_job, sub_job, master_level, best_set, buffs, abilities)
@@ -497,18 +569,11 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                 # print(best_output)
                 break # Break out of the main loop and check PDT/MDT conditions.
 
-        best_player0 = create_player(main_job, sub_job, master_level, best_set, buffs, abilities) # TODO: Loop through gear and add MDT/PDT instead of creating a player class
 
-        pdt = best_player0.stats.get("PDT",0) + best_player0.stats.get("DT",0)
-        mdt = best_player0.stats.get("MDT",0) + best_player0.stats.get("DT",0)
-        pdt = -50 if pdt < -50 else pdt
-        mdt = -50 if mdt < -50 else mdt
-        pdt += best_player0.stats.get("PDT2",0) + best_player0.stats.get("DT2",0)
-        mdt += best_player0.stats.get("MDT2",0) + best_player0.stats.get("DT2",0)
+        if best_output is None:
+            raise ValueError("No valid gear set satisfies the current PDT/MDT requirements.")
 
-        # for slot in best_set:
-        #     pdt += best_set[slot].get("PDT2",0)
-        #     mdt += best_set[slot].get("MDT2",0)
+        pdt, mdt = calculate_damage_taken(best_set, buffs, abilities, damage_taken_item_cache)
 
 
         # Compare the pdt and mdt values from this iteration with the previous iteration.
@@ -530,6 +595,9 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         
         print(f"Current best set: PDT:{pdt},  MDT:{mdt}")
 
+
+    if pdt > pdt_thresh or mdt > mdt_thresh:
+        raise ValueError("Optimizer could not find a set satisfying the requested PDT/MDT requirements.")
 
     # At this point, we've found the best conditional set.
 
@@ -567,14 +635,94 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         print(f"\nList of potential swaps within {next_best_percent}% of the best set ({float(best_metric)**invert:<{nondecimals}.{decimals}f}):")
         for slot in swaps:
             for swap in swaps[slot]:
-                line = f"{slot:<6s} {swap[0]:<50s} {float(swap[1]):<{nondecimals}.{decimals}f} {best_metric%swap[1]**invert/best_metric*100:>5.1f}%"
+                line = f"{slot:<6s} {swap[0]:<50s} {float(swap[1]):<{nondecimals}.{decimals}f} {swap[2] * 100:>5.1f}%"
                 print(line)
 
     # Print additional output formatted for BG Wiki item sets.
     if False:
         format_bgwiki(header, (min_tp), best_player, best_metric)
 
+    if return_details:
+        return best_player, best_output, best_metric
     return(best_player, best_output)
+
+
+def _build_set_restart_worker(request):
+    """Run one independent optimizer restart in a process-safe top-level worker."""
+    output_buffer = StringIO()
+    try:
+        with redirect_stdout(output_buffer):
+            player, output, metric = build_set(*request["args"], **request["kwargs"])
+    except Exception as error:
+        return {
+            "seed": request["seed"],
+            "error": str(error),
+            "log": output_buffer.getvalue(),
+        }
+    else:
+        return {
+            "player": player,
+            "output": output,
+            "metric": metric,
+            "seed": request["seed"],
+            "log": output_buffer.getvalue(),
+        }
+
+
+def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, restarts=1, workers=0, seed=None, n_iter=10, return_details=False):
+    """Run independent seeded searches and return the best valid result.
+
+    ``workers=0`` selects up to one process per restart while leaving one CPU
+    core free. A single restart runs in-process, preserving the prior UI path.
+    """
+    restarts = max(1, int(restarts))
+    workers = int(workers)
+    seed_sequence = np.random.SeedSequence(seed)
+    restart_seeds = [int(value) for value in seed_sequence.generate_state(restarts)]
+    shared_args = (
+        main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name,
+        action_type, min_tp, check_gear, starting_gearset, pdt_requirement,
+        mdt_requirement, input_metric, print_swaps, next_best_percent,
+    )
+    requests = [
+        {
+            "args": shared_args,
+            "kwargs": {"seed": restart_seed, "n_iter": n_iter, "return_details": True},
+            "seed": restart_seed,
+        }
+        for restart_seed in restart_seeds
+    ]
+
+    if restarts == 1:
+        results = [_build_set_restart_worker(requests[0])]
+    else:
+        max_workers = workers
+        if max_workers <= 0:
+            max_workers = min(restarts, max(1, (os.cpu_count() or 2) - 1))
+        max_workers = min(restarts, max_workers)
+        if max_workers == 1:
+            results = [_build_set_restart_worker(request) for request in requests]
+        else:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                results = list(executor.map(_build_set_restart_worker, requests))
+
+    successful_results = [result for result in results if "error" not in result]
+    if not successful_results:
+        errors = "; ".join(
+            f"seed {result['seed']}: {result['error']}" for result in results
+        )
+        raise ValueError(f"All optimizer restarts failed. {errors}")
+
+    winner = max(successful_results, key=lambda result: result["metric"])
+    print(winner["log"], end="")
+    if restarts > 1:
+        print(
+            f"Selected restart {results.index(winner) + 1}/{restarts} "
+            f"(seed {winner['seed']}; metric {winner['metric']:.6f})."
+        )
+    if return_details:
+        return winner["player"], winner["output"], winner["metric"], winner["seed"]
+    return winner["player"], winner["output"]
 
 if __name__ == "__main__":
 

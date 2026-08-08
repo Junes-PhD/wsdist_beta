@@ -7,9 +7,9 @@ Black Magic has not been tested properly yet, but is likely correct.
     
 Author: Kastra (Asura server)
 '''
-from numba import njit
+from numba_compat import njit
 
-@njit
+@njit(cache=True)
 def get_mv_ninjutsu(tier, dINT):
     #
     # Determine the M and V values to use based on dINT and ninjutsu skill

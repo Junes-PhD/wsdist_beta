@@ -5,6 +5,7 @@ Author: Kastra (Asura server)
 '''
 from get_dint_m_v import *
 import numpy as np
+from numba_compat import njit
 
 def get_enspell_damage(enhancing_magic_skill, enspell_damage_percent, enspell_damage):
     '''
@@ -201,7 +202,7 @@ def quickdraw(rng_dmg, ammo_dmg, element, gearset, player_matk, player_magic_dam
 
 #     return(d)
 
-@njit
+@njit(cache=True)
 def get_dstat_macc(player_stat, enemy_stat):
     #
     # Calculate the magic accuracy obtained from player stats vs enemy stats.
@@ -251,7 +252,7 @@ def get_dstat_macc(player_stat, enemy_stat):
 
     return(dstat_macc)
 
-@njit
+@njit(cache=True)
 def get_magic_hit_rate(player_macc, enemy_meva=0):
     #
     # https://www.bg-wiki.com/ffxi/Magic_Hit_Rate
@@ -288,7 +289,7 @@ def get_resist_state(magic_hit_rate):
 
     return(resist_state)
 
-@njit
+@njit(cache=True)
 def get_resist_state_average(magic_hit_rate):
     #
     # Estimate the average resist coefficient using magic hit rate

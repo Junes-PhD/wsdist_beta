@@ -3,9 +3,9 @@ File containing calculations for fSTR calculation.
     
 Author: Kastra (Asura server)
 '''
-from numba import njit
+from numba_compat import njit
 
-@njit
+@njit(cache=True)
 def get_fstr(dmg, player_str, enemy_vit):
     #
     # Calculate fSTR for melee attacks using the equation from BG wiki
@@ -37,7 +37,7 @@ def get_fstr(dmg, player_str, enemy_vit):
 
     return(fstr)
 
-@njit
+@njit(cache=True)
 def get_fstr2(rng_dmg, player_str, enemy_vit):
     #
     # Calculate fSTR for ranged attacks using the equation from BG wiki

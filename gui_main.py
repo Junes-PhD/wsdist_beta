@@ -10,11 +10,14 @@ Author: Kastra (Asura server)
 
 import numpy as np
 import os, sys
+import multiprocessing
+import queue
+import threading
 sys.path.append(os.path.dirname(sys.executable))
 
 import tkinter as tk
 from tkinter import ttk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image
 
 from idlelib.tooltip import Hovertip # https://stackoverflow.com/questions/3221956/how-do-i-display-tooltips-in-tkinter
@@ -23,6 +26,12 @@ import pickle
 
 import importlib
 
+
+def resource_path(*parts):
+    """Return a path to a source-tree or PyInstaller-bundled resource."""
+    root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, *parts)
+
 # Import other code related to this project.
 import enemies as enemies_pyfile
 import gear as gear_pyfile
@@ -30,6 +39,8 @@ import create_player as create_player_pyfile
 import actions as actions_pyfile
 import buffs as buffs_pyfile
 import wsdist as wsdist_pyfile
+from wsdist_bridge import BridgeStore
+from lac_profile import write_reload_request, write_set
 import fancy_plot as fancy_plot_pyfile
 from lumo_scrollablelabelframe import ScrollableLabelFrame # TODO: Replace with ChatGPT's virtual_frames
 from gpt_manage_defaults import *
@@ -37,6 +48,227 @@ from gpt_manage_defaults import *
 from virtual_frames import VirtualCheckboxFrame, VirtualRadioFrame
 
 class application(tk.Tk):
+
+    def _set_optimizer_busy(self, busy):
+        state = "disabled" if busy else "normal"
+        for button in getattr(self, "optimizer_action_buttons", []):
+            button.configure(state=state)
+        self.config(cursor="watch" if busy else "")
+        self.update_idletasks()
+
+    def _start_optimizer(self, optimizer_args, optimizer_kwargs):
+        """Run the CPU-bound optimizer away from Tk's event loop."""
+        if getattr(self, "_optimizer_running", False):
+            return
+
+        self._optimizer_running = True
+        self._optimizer_results = queue.Queue()
+        self._set_optimizer_busy(True)
+
+        def run_optimizer():
+            try:
+                result = wsdist_pyfile.optimize_set(*optimizer_args, **optimizer_kwargs)
+            except Exception as error:
+                self._optimizer_results.put(("error", error))
+            else:
+                self._optimizer_results.put(("success", result))
+
+        self._optimizer_thread = threading.Thread(
+            target=run_optimizer, name="wsdist-optimizer", daemon=True
+        )
+        self._optimizer_thread.start()
+        self.after(100, self._poll_optimizer)
+
+    def _poll_optimizer(self):
+        try:
+            status, result = self._optimizer_results.get_nowait()
+        except queue.Empty:
+            self.after(100, self._poll_optimizer)
+            return
+
+        self._optimizer_running = False
+        self._set_optimizer_busy(False)
+        if status == "error":
+            messagebox.showerror("WSDist optimizer", str(result))
+            return
+
+        self.best_player, _, _, winning_seed = result
+        print(f"Optimizer completed with winning seed {winning_seed}.")
+        self.equip_best_set_button.configure(state="active")
+
+    def _bridge_character_label(self, data):
+        character = data.get("character", {})
+        return f"{character.get('name', '?')} ({character.get('key', '?')})"
+
+    def _install_bridge_items(self):
+        if not self.bridge_store.data:
+            return
+        character = self.bridge_store.data.get("character", {})
+        character_name = character.get("name") or character.get("key") or "unknown"
+        eligible_count = sum(1 for item in self.bridge_store.catalog.values() if item.get("Eligible"))
+        self.bridge_status_value.set(
+            f"WSDist bridge: {character_name} | {len(self.bridge_store.catalog)} variants | "
+            f"{eligible_count} modeled/accessible candidates"
+        )
+        # Keep the original model as a fallback for food and profile-only gear,
+        # while making the character-scoped records available to every existing
+        # picker and simulator path that uses gear_pyfile.all_gear.
+        gear_pyfile.all_gear.update(self.bridge_store.catalog)
+        self.all_equipment_dict = self.bridge_store.equipment_dict()
+        for slot, items in self.all_equipment_dict.items():
+            names = sorted({item.get("Name2", item.get("Name", "Empty")) for item in items})
+            for frames in (getattr(self, "quicklook_scrollframes", {}),
+                           getattr(self, "tp_quicklook_scrollframes", {}),
+                           getattr(self, "ws_quicklook_scrollframes", {}),
+                           getattr(self, "optimize_scrollframes", {})):
+                if slot in frames:
+                    frames[slot].master_data = names
+                    if hasattr(frames[slot], "selection_state"):
+                        old_selection = frames[slot].selection_state
+                        frames[slot].selection_state = {name: old_selection.get(name, False) for name in names}
+                    frames[slot].set_visible_data(names)
+        self.update_job("main static")
+        self.update_job("sub")
+
+    def choose_wsdist_bridge(self):
+        directory = filedialog.askdirectory(title="Select Ashita installation directory")
+        if not directory:
+            return
+        self.bridge_store.set_root(directory)
+        paths = self.bridge_store.discover()
+        if not paths:
+            messagebox.showwarning("WSDist", "No GearSetBuilder bridge files were found under this Ashita installation.")
+            return
+        if len(paths) == 1:
+            selected = paths[0]
+        else:
+            selected = filedialog.askopenfilename(title="Select character bridge", initialdir=str(paths[0].parent),
+                                                  filetypes=[("WSDist bridge", "wsdist_bridge.json")])
+            if not selected:
+                return
+        try:
+            data = self.bridge_store.load(selected)
+            self._install_bridge_items()
+            messagebox.showinfo("WSDist", f"Loaded {self._bridge_character_label(data)} with "
+                                f"{len(self.bridge_store.catalog)} owned item variants.")
+        except Exception as error:
+            messagebox.showerror("WSDist bridge", str(error))
+
+    def refresh_wsdist_bridge(self):
+        if self.bridge_store.bridge_path is None:
+            return self.choose_wsdist_bridge()
+        try:
+            data = self.bridge_store.load(self.bridge_store.bridge_path)
+            self._install_bridge_items()
+            messagebox.showinfo("WSDist", f"Refreshed {self._bridge_character_label(data)}.")
+        except Exception as error:
+            messagebox.showerror("WSDist bridge", str(error))
+
+    def _profile_set_choices(self):
+        choices = []
+        for profile in self.bridge_store.profile_records():
+            for profile_set in profile.get("sets", []):
+                choices.append((str(profile.get("job", "")), profile_set))
+        return choices
+
+    def import_luashitacast_set(self):
+        if not self.bridge_store.data:
+            messagebox.showwarning("WSDist", "Load a WSDist bridge first.")
+            return
+        choices = self._profile_set_choices()
+        if not choices:
+            messagebox.showwarning("WSDist", "The selected character has no readable job sets.")
+            return
+        window = tk.Toplevel(self)
+        window.title("Import LuAshitacast set")
+        window.transient(self)
+        jobs = sorted({job for job, _ in choices})
+        job_value = tk.StringVar(value=jobs[0])
+        set_value = tk.StringVar()
+        destination_value = tk.StringVar(value="Quick Look")
+        ttk.Label(window, text="Job:").grid(row=0, column=0, padx=6, pady=6, sticky="w")
+        job_combo = ttk.Combobox(window, textvariable=job_value, values=jobs, state="readonly", width=12)
+        job_combo.grid(row=0, column=1, padx=6, pady=6)
+        ttk.Label(window, text="Set:").grid(row=1, column=0, padx=6, pady=6, sticky="w")
+        set_combo = ttk.Combobox(window, textvariable=set_value, state="readonly", width=32)
+        set_combo.grid(row=1, column=1, padx=6, pady=6)
+        ttk.Label(window, text="Destination:").grid(row=2, column=0, padx=6, pady=6, sticky="w")
+        ttk.Combobox(window, textvariable=destination_value, values=["Quick Look", "TP", "WS"],
+                     state="readonly", width=12).grid(row=2, column=1, padx=6, pady=6)
+
+        def update_sets(*_):
+            names = [profile_set.get("name", "") for job, profile_set in choices if job == job_value.get()]
+            set_combo["values"] = names
+            if names:
+                set_value.set(names[0])
+        job_combo.bind("<<ComboboxSelected>>", update_sets)
+        update_sets()
+
+        def import_selected():
+            selected = next((item for job, item in choices if job == job_value.get() and item.get("name") == set_value.get()), None)
+            if selected is None:
+                return
+            destination = {"Quick Look": (self.quicklook_equipped_dict, "quicklook"),
+                           "TP": (self.tp_quicklook_equipped_dict, "tp"),
+                           "WS": (self.ws_quicklook_equipped_dict, "ws")}[destination_value.get()]
+            missing = []
+            for lac_slot, profile_item in selected.get("slots", {}).items():
+                if not profile_item:
+                    continue
+                slot = lac_slot.lower()
+                if slot not in destination[0]:
+                    continue
+                item = self.bridge_store.resolve_profile_item(profile_item)
+                if item is None or not item.get("Model Complete", True):
+                    missing.append(lac_slot)
+                    continue
+                gear_pyfile.all_gear[item["Name2"]] = item
+                self.update_quicklook_equipment((slot, item["Name2"], destination[1]))
+            window.destroy()
+            if missing:
+                messagebox.showwarning("WSDist", "Imported with unresolved slots: " + ", ".join(missing))
+
+        ttk.Button(window, text="Import", command=import_selected).grid(row=3, column=0, columnspan=2, pady=8)
+
+    def save_luashitacast_set(self, source_name="quicklook"):
+        if not self.bridge_store.data or self.bridge_store.bridge_path is None:
+            messagebox.showwarning("WSDist", "Load a WSDist bridge first.")
+            return
+        source = {"quicklook": self.quicklook_equipped_dict, "tp": self.tp_quicklook_equipped_dict,
+                  "ws": self.ws_quicklook_equipped_dict}[source_name]
+        job = self.jobs_dict.get(self.main_job_value.get(), self.main_job_value.get()).upper()
+        profile = next((item for item in self.bridge_store.profile_records() if str(item.get("job", "")).upper() == job), None)
+        if profile is None:
+            messagebox.showerror("WSDist", f"No character-specific {job}.lua profile was published.")
+            return
+        set_name = simpledialog.askstring("LuAshitacast set", f"Set name for {source_name.upper()} equipment:", parent=self)
+        if not set_name:
+            return
+        existing = any(item.get("name") == set_name for item in profile.get("sets", []))
+        if existing and not messagebox.askyesno("Overwrite set", f"Replace {set_name} in {job}.lua?", parent=self):
+            return
+        equipment = {slot: value.get("item") for slot, value in source.items()}
+        try:
+            path = self.bridge_store.profile_path(job)
+            backup, new_hash = write_set(path, set_name, equipment,
+                                         expected_hash=str(profile.get("source_hash", "")), overwrite=existing)
+            profile["source_hash"] = new_hash
+            request = {"schema_version": 1, "character_key": self.bridge_store.data.get("character", {}).get("key"),
+                       "job": job, "profile": path.name, "profile_hash": new_hash, "set": set_name}
+            write_reload_request(self.bridge_store.bridge_path.parent, request)
+            messagebox.showinfo("WSDist", f"Saved {set_name} to {path.name}.\nBackup: {backup.name}\n"
+                                "GearSetBuilder will request /lac load when this is the active job.")
+        except Exception as error:
+            messagebox.showerror("LuAshitacast write", str(error))
+
+    def poll_wsdist_bridge(self):
+        try:
+            if self.bridge_store.bridge_path and self.bridge_store.bridge_path.exists():
+                if self.bridge_store.bridge_path.stat().st_mtime > self.bridge_store.bridge_mtime() + 0.001:
+                    if messagebox.askyesno("WSDist", "GearSetBuilder published newer character data. Reload it now?"):
+                        self.refresh_wsdist_bridge()
+        finally:
+            self.after(1500, self.poll_wsdist_bridge)
 
     def reload_gear_pyfile(self,):
         '''
@@ -61,6 +293,8 @@ class application(tk.Tk):
         The outfile file is a dictionary with keys being jobs and values being dictionaries containing the relevant GUI parameters to be loaded for each job.
         '''
         main_job = self.main_job_value.get()
+        bridge_key = self.bridge_store.data.get("character", {}).get("key", "default") if hasattr(self, "bridge_store") else "default"
+        profile_key = f"{bridge_key}|{main_job}"
 
         state = {}
         for w in walk_widgets(self): # Get a list of ALL widgets in the GUI
@@ -71,16 +305,24 @@ class application(tk.Tk):
                 state[key] = value # key and value are both string representations of the widget and its value.
 
         for slot in self.quicklook_equipped_dict:
-            state[f"quicklook_{slot}_item"] = self.quicklook_equipped_dict[slot]["item"]["Name2"]
-            state[f"tp_quicklook_{slot}_item"] = self.tp_quicklook_equipped_dict[slot]["item"]["Name2"]
-            state[f"ws_quicklook_{slot}_item"] = self.ws_quicklook_equipped_dict[slot]["item"]["Name2"]
+            state[f"quicklook_{slot}_item"] = self.quicklook_equipped_dict[slot]["item"].get("Bridge Key", self.quicklook_equipped_dict[slot]["item"]["Name2"])
+            state[f"tp_quicklook_{slot}_item"] = self.tp_quicklook_equipped_dict[slot]["item"].get("Bridge Key", self.tp_quicklook_equipped_dict[slot]["item"]["Name2"])
+            state[f"ws_quicklook_{slot}_item"] = self.ws_quicklook_equipped_dict[slot]["item"].get("Bridge Key", self.ws_quicklook_equipped_dict[slot]["item"]["Name2"])
 
         self.states["default"] = state
         self.states[main_job] = state
+        self.states[profile_key] = state
 
         with open("defaults.pkl", "wb") as f:
             pickle.dump(self.states, f)
         print(f"File updated: defaults.pkl (default, {main_job})")
+
+    def _resolve_saved_item(self, value):
+        if hasattr(self, "bridge_store") and value in self.bridge_store.by_key:
+            item = self.bridge_store.by_key[value]
+            gear_pyfile.all_gear[item["Name2"]] = item
+            return item
+        return gear_pyfile.all_gear[value]
 
     def load_defaults(self, type="default"):
         '''
@@ -92,7 +334,9 @@ class application(tk.Tk):
         try:
             main_job = self.main_job_value.get()
 
-            selection = "default" if type=="default" else main_job
+            bridge_key = self.bridge_store.data.get("character", {}).get("key", "default") if hasattr(self, "bridge_store") else "default"
+            profile_key = f"{bridge_key}|{main_job}"
+            selection = "default" if type=="default" else (profile_key if profile_key in self.states else main_job)
             if len(self.states[selection]) == 0:
                 print(f"No defaults profile found for {selection}")
                 return
@@ -108,7 +352,7 @@ class application(tk.Tk):
             # Build the quicklook equipment.
             for slot in self.quicklook_equipped_dict:
                 try:
-                    saved_item = gear_pyfile.all_gear[state[f"quicklook_{slot}_item"]]
+                    saved_item = self._resolve_saved_item(state[f"quicklook_{slot}_item"])
                     self.quicklook_equipped_dict[slot]["item"] = saved_item
                     self.quicklook_equipped_dict[slot]["icon"] = self.get_equipment_icon(saved_item["Name"])
                     self.quicklook_equipped_dict[slot]["button"].config(image = self.quicklook_equipped_dict[slot]["icon"])
@@ -118,7 +362,7 @@ class application(tk.Tk):
                     print(err)
 
                 try:
-                    saved_item = gear_pyfile.all_gear[state[f"tp_quicklook_{slot}_item"]]
+                    saved_item = self._resolve_saved_item(state[f"tp_quicklook_{slot}_item"])
                     self.tp_quicklook_equipped_dict[slot]["item"] = saved_item
                     self.tp_quicklook_equipped_dict[slot]["icon"] = self.get_equipment_icon(saved_item["Name"])
                     self.tp_quicklook_equipped_dict[slot]["button"].config(image = self.tp_quicklook_equipped_dict[slot]["icon"])
@@ -128,7 +372,7 @@ class application(tk.Tk):
                     print(err)
 
                 try:
-                    saved_item = gear_pyfile.all_gear[state[f"ws_quicklook_{slot}_item"]]
+                    saved_item = self._resolve_saved_item(state[f"ws_quicklook_{slot}_item"])
                     self.ws_quicklook_equipped_dict[slot]["item"] = saved_item
                     self.ws_quicklook_equipped_dict[slot]["icon"] = self.get_equipment_icon(saved_item["Name"])
                     self.ws_quicklook_equipped_dict[slot]["button"].config(image = self.ws_quicklook_equipped_dict[slot]["icon"])
@@ -209,8 +453,19 @@ class application(tk.Tk):
 
     def get_equipment_icon(self, item_name="Empty"):
         try:
-            item_id = self.item_id_dict["id"][self.item_id_dict["name"]==item_name.lower()][0]
-            icon = tk.PhotoImage(file=f"icons32/{item_id}.png")
+            if isinstance(item_name, dict):
+                item_id = item_name.get("Item ID", item_name.get("item_id", 0))
+                item_name = item_name.get("Name", "Empty")
+            else:
+                dynamic = gear_pyfile.all_gear.get(item_name, {})
+                item_id = dynamic.get("Item ID", 0)
+                if not item_id:
+                    dynamic = next((value for value in gear_pyfile.all_gear.values()
+                                    if value.get("Name", "").lower() == str(item_name).lower()), {})
+                    item_id = dynamic.get("Item ID", 0)
+            if not item_id:
+                item_id = self.item_id_dict["id"][self.item_id_dict["name"]==item_name.lower()][0]
+            icon = tk.PhotoImage(file=resource_path("icons32", f"{item_id}.png"))
         except Exception as err:
             print(f"Missing icon image file for \"{item_name}\"")
             # print(err)
@@ -566,17 +821,16 @@ class application(tk.Tk):
         elif type=="tp":
             equipped_gear_dict = self.tp_quicklook_equipped_dict
         elif type=="ws":
-            equipped_gear_dict = self.quicklook_equipped_dict
+            equipped_gear_dict = self.ws_quicklook_equipped_dict
 
         output_string = "new_set = {\n"
         for gear_slot in self.quicklook_equipped_dict:
-            item_name = self.item_id_dict["name2"][self.item_id_dict["name"]==equipped_gear_dict[gear_slot]['item']['Name'].lower()][0]
-            item_name = " ".join(k.capitalize() for k in item_name.split())
+            item_name = equipped_gear_dict[gear_slot]['item'].get('Name', 'Empty')
             output_string = output_string + f"    {gear_slot}=\"{item_name}\",\n"
         output_string = output_string + "}"
 
-        app.clipboard_clear()
-        app.clipboard_append(output_string)
+        self.clipboard_clear()
+        self.clipboard_append(output_string)
 
     def update_quicklook_equipment(self, selection):
         '''
@@ -592,7 +846,13 @@ class application(tk.Tk):
         equipped_items_dict: The equipment dictionary to be modified by the selection
         source:              A way to track which part of the code called this function to avoid TP/WS sets affecting quicklook tab.
         '''
-        slot, new_item_name, source = selection
+        # Older callers passed the destination equipment dictionary as a
+        # fourth tuple value.  VirtualRadioFrame emits the newer compact
+        # (slot, item, source) form; accept both while callers migrate.
+        if len(selection) == 4:
+            slot, new_item_name, _legacy_equipment_dict, source = selection
+        else:
+            slot, new_item_name, source = selection
 
         if source == "quicklook":
             equipped_items_dict = self.quicklook_equipped_dict
@@ -1066,12 +1326,33 @@ class application(tk.Tk):
                         "optimize tp":    ["attack round", self.tp_metric_value.get()],
                     }
 
-            self.best_player, _ = wsdist_pyfile.build_set(main_job, sub_job, master_level, active_buffs, special_toggles_dict, enemy, ws_name, spell_name, actions[trigger][0],
-                                                            tp_entry_value, check_gear_dict, starting_gearset, 
-                                                            self.pdt_requirements_value.get(), self.mdt_requirements_value.get(), actions[trigger][1],
-                                                            self.show_similar_results_checkbox_value.get(), self.show_similar_results_entry_value.get(),
-                                                        )
-            self.equip_best_set_button.configure(state="active")
+            try:
+                restarts = max(1, self.optimizer_restarts_value.get())
+                workers = max(0, self.optimizer_workers_value.get())
+                seed_text = self.optimizer_seed_value.get().strip()
+                seed = int(seed_text) if seed_text else None
+            except ValueError:
+                messagebox.showerror("WSDist optimizer", "Optimizer seed must be a whole number or blank.")
+                return
+            estimated_checks = wsdist_pyfile.estimate_candidate_checks(
+                check_gear_dict, main_job, ws_type
+            )
+            print(
+                f"Running optimizer with {restarts} restart(s); workers: "
+                f"{'Auto' if workers == 0 else workers}; approximately "
+                f"{estimated_checks:,} raw candidates per pass."
+            )
+            optimizer_args = (
+                main_job, sub_job, master_level, active_buffs, special_toggles_dict, enemy,
+                ws_name, spell_name, actions[trigger][0], tp_entry_value, check_gear_dict,
+                starting_gearset, self.pdt_requirements_value.get(),
+                self.mdt_requirements_value.get(), actions[trigger][1],
+                self.show_similar_results_checkbox_value.get(), self.show_similar_results_entry_value.get(),
+            )
+            self._start_optimizer(
+                optimizer_args,
+                {"restarts": restarts, "workers": workers, "seed": seed, "return_details": True},
+            )
 
         elif trigger == "run dps simulations":
 
@@ -1429,6 +1710,7 @@ class application(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        self.bridge_store = BridgeStore()
 
         # Bind the "q" key to close the application.
         self.bind_all("q", lambda e: self.destroy())
@@ -1439,13 +1721,19 @@ class application(tk.Tk):
         self.title("Kastra FFXI Damage Simulator  (2026 May 21a)") # pyinstaller --exclude-module gear --exclude-module enemies --clean --onefile --icon=icons32/23937.ico gui_main.py
         self.geometry("700x850")
         self.resizable(False, False)
-        self.app_icon = tk.PhotoImage(file="icons32/23937.png") # hat
-        self.iconphoto(True, self.app_icon)
+        app_icon_path = resource_path("icons32", "23937.png")
+        if os.path.isfile(app_icon_path):
+            self.app_icon = tk.PhotoImage(file=app_icon_path)
+            self.iconphoto(True, self.app_icon)
 
         # Define the GUI tabs as a "notebook" of pages
         # https://www.pythontutorial.net/tkinter/tkinter-notebook/
+        self.bridge_status_value = tk.StringVar(value="WSDist bridge: not loaded")
+        ttk.Label(self, textvariable=self.bridge_status_value, anchor="w").pack(
+            side="bottom", fill="x", padx=5, pady=(0, 2)
+        )
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(expand=True, fill="both")
+        self.notebook.pack(side="top", expand=True, fill="both")
 
         inputs_tab = ttk.Frame(self.notebook)
         self.notebook.add(inputs_tab, text="Quicklook")
@@ -1462,6 +1750,13 @@ class application(tk.Tk):
         self.menu_bar = tk.Menu(self)
         self.file_menu = tk.Menu(self.menu_bar, tearoff=False)
         self.file_menu.add_command(label="Save Defaults", command=self.save_defaults)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Load WSDist character bridge...", command=self.choose_wsdist_bridge)
+        self.file_menu.add_command(label="Refresh WSDist character bridge", command=self.refresh_wsdist_bridge)
+        self.file_menu.add_command(label="Import LuAshitacast set...", command=self.import_luashitacast_set)
+        self.file_menu.add_command(label="Save Quick Look to LuAshitacast...", command=lambda: self.save_luashitacast_set("quicklook"))
+        self.file_menu.add_command(label="Save TP set to LuAshitacast...", command=lambda: self.save_luashitacast_set("tp"))
+        self.file_menu.add_command(label="Save WS set to LuAshitacast...", command=lambda: self.save_luashitacast_set("ws"))
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Reload gear.py", command=self.reload_gear_pyfile)
         self.file_menu.add_separator()
@@ -1491,7 +1786,7 @@ class application(tk.Tk):
         ===============================================
         '''
 
-        item_tmp = np.loadtxt("item_list.csv", delimiter=";", skiprows=1, dtype=str, unpack=True)
+        item_tmp = np.loadtxt(resource_path("item_list.csv"), delimiter=";", skiprows=1, dtype=str, unpack=True)
         self.item_id_dict = {"id":item_tmp[0], "name":item_tmp[1], "name2":item_tmp[2]}
 
         self.all_equipment_dict = {
@@ -2293,6 +2588,10 @@ class application(tk.Tk):
         self.tp_metric_value = tk.StringVar(value="Time to WS")
         self.ws_metric_value = tk.StringVar(value="Damage Dealt")
         self.spell_metric_value = tk.StringVar(value="Damage Dealt")
+        self.optimizer_restarts_value = tk.IntVar(value=3)
+        self.optimizer_workers_value = tk.IntVar(value=0)
+        self.optimizer_seed_value = tk.StringVar(value="")
+        self.optimizer_action_buttons = []
 
         tp_metrics = ["Time to WS", "Damage dealt", "TP return", "DPS"]
         spell_metrics = ["Damage dealt", "TP return"]
@@ -2335,6 +2634,24 @@ class application(tk.Tk):
         spell_metric_text.grid(row=4, column=0, pady=2, sticky="w")
         self.spell_metric_combobox = ttk.Combobox(optimize_frame_bottomleft, textvariable=self.spell_metric_value, values=spell_metrics, state="readonly", width=15)
         self.spell_metric_combobox.grid(row=4, column=1, pady=2, sticky="ew")
+
+        optimizer_restarts_text = ttk.Label(optimize_frame_bottomleft, text="Optimizer restarts", width=20, anchor="w")
+        optimizer_restarts_text.grid(row=5, column=0, pady=2, sticky="w")
+        optimizer_restarts_entry = ttk.Entry(optimize_frame_bottomleft, textvariable=self.optimizer_restarts_value, width=10, justify="center")
+        optimizer_restarts_entry.grid(row=5, column=1, pady=2, sticky="ew")
+        Hovertip(optimizer_restarts_entry, "Run independent seeded searches and keep the strongest result. 1 preserves a single search.", hover_delay=500)
+
+        optimizer_workers_text = ttk.Label(optimize_frame_bottomleft, text="Parallel workers", width=20, anchor="w")
+        optimizer_workers_text.grid(row=6, column=0, pady=2, sticky="w")
+        optimizer_workers_entry = ttk.Entry(optimize_frame_bottomleft, textvariable=self.optimizer_workers_value, width=10, justify="center")
+        optimizer_workers_entry.grid(row=6, column=1, pady=2, sticky="ew")
+        Hovertip(optimizer_workers_entry, "0 = Auto. Workers run restarts in separate processes; use 1 for serial execution.", hover_delay=500)
+
+        optimizer_seed_text = ttk.Label(optimize_frame_bottomleft, text="Optimizer seed", width=20, anchor="w")
+        optimizer_seed_text.grid(row=7, column=0, pady=2, sticky="w")
+        optimizer_seed_entry = ttk.Entry(optimize_frame_bottomleft, textvariable=self.optimizer_seed_value, width=10, justify="center")
+        optimizer_seed_entry.grid(row=7, column=1, pady=2, sticky="ew")
+        Hovertip(optimizer_seed_entry, "Optional. Reuse a printed winning seed to reproduce a single optimizer restart.", hover_delay=500)
 
 
         '''
@@ -2380,6 +2697,7 @@ class application(tk.Tk):
 
         optimize_spell_button = tk.Button(optimize_buttons_frame, text="Optimize Spell", image=self.pixel_image, compound=tk.CENTER, width=100, height=30, command=lambda event="optimize spell": self.quicklook(event))
         optimize_spell_button.grid(row=0, column=1, padx=1, pady=1)
+        self.optimizer_action_buttons = [optimize_ws_button, optimize_tp_button, optimize_spell_button]
 
         self.equip_best_set_button = tk.Button(optimize_buttons_frame, text="Equip best set", image=self.pixel_image, compound=tk.CENTER, width=100, height=30, command=lambda: self.equip_best_set(), state="disabled")
         self.equip_best_set_button.grid(row=1, column=1, padx=1, pady=1)
@@ -2736,18 +3054,11 @@ class application(tk.Tk):
         self.optimize_scrollframes["main"].tkraise()
         self.visible_quicklook_frame_slot = "main"
         self.visible_optimize_frame_slot = "main"
+        self.after(1500, self.poll_wsdist_bridge)
 
 if __name__ == "__main__":
-
+    multiprocessing.freeze_support()
     app = application()
-
-    # Sleep for 5 ms to prevent the lag that occurs when dragging/resizing a window with many widgets
-    # https://stackoverflow.com/questions/71884285/tkinter-root-window-mouse-drag-motion-becomes-slower
-    from time import sleep
-    def on_configure(e):
-        if e.widget == app:
-            sleep(0.01)
-    app.bind('<Configure>', on_configure)
     app.wait_visibility()
 
     app.mainloop()

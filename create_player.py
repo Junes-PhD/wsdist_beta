@@ -5,6 +5,85 @@ Author: Kastra (Asura server)
 '''
 from enemies import *
 
+
+_BASE_STATS_CACHE = {}
+_BASE_STATS_CACHE_LIMIT = 128
+_DAMAGE_TAKEN_STATS = ("PDT", "MDT", "DT", "PDT2", "MDT2", "DT2")
+
+
+def _freeze_cache_value(value):
+    """Return a stable, hashable representation of nested configuration data."""
+    if isinstance(value, dict):
+        return tuple(sorted((key, _freeze_cache_value(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_cache_value(item) for item in value)
+    if isinstance(value, set):
+        return tuple(sorted(_freeze_cache_value(item) for item in value))
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _gear_numeric_value(item, stat):
+    """Match add_gear_stats' handling of numeric and numeric-string values."""
+    value = item.get(stat, 0)
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def damage_taken_item_values(item, item_cache=None):
+    """Return the PDT/MDT-related values for one item, reusing cached parsing."""
+    if item_cache is not None:
+        cached = item_cache.get(id(item))
+        if cached is not None and cached[0] is item:
+            return cached[1]
+
+    values = tuple(_gear_numeric_value(item, stat) for stat in _DAMAGE_TAKEN_STATS)
+    if item_cache is not None:
+        item_cache[id(item)] = (item, values)
+    return values
+
+
+def damage_taken_totals(gearset, buffs=None, item_cache=None):
+    """Aggregate uncapped PDT/MDT terms for a gear set and its buffs."""
+    totals = [0] * len(_DAMAGE_TAKEN_STATS)
+    for item in gearset.values():
+        for index, value in enumerate(damage_taken_item_values(item, item_cache)):
+            totals[index] += value
+
+    for source in (buffs or {}).values():
+        for index, stat in enumerate(_DAMAGE_TAKEN_STATS):
+            totals[index] += _gear_numeric_value(source, stat)
+    return totals
+
+
+def damage_taken_from_totals(totals, main_item, abilities=None):
+    """Apply PDT/MDT caps and main-hand aftermath to precomputed totals."""
+    values = dict(zip(_DAMAGE_TAKEN_STATS, totals))
+    abilities = abilities or {}
+    if abilities.get("Aftermath", 0) > 0 and main_item.get("Name") in ("Bravura", "Claustrum"):
+        values["DT"] -= 20
+
+    pdt = max(-50, values["PDT"] + values["DT"])
+    mdt = max(-50, values["MDT"] + values["DT"])
+    pdt += values["PDT2"] + values["DT2"]
+    mdt += values["MDT2"] + values["DT2"]
+    return pdt, mdt
+
+
+def calculate_damage_taken(gearset, buffs=None, abilities=None, item_cache=None):
+    """Calculate the exact PDT/MDT values used by the optimizer's condition gate."""
+    return damage_taken_from_totals(
+        damage_taken_totals(gearset, buffs, item_cache), gearset["main"], abilities
+    )
+
+
 class create_enemy:
     #
     # Create an enemy class so that we may modify its stats more easily.
@@ -214,7 +293,12 @@ class create_player:
         # Add stats from buffs and job abilities.
         #
         # Add buffs from Food, COR, BRD, GEO, and WHM first.
-        ignore_stats = ["Name","Name2","Type","DMG","Delay","Jobs","Skill Type","Rank"]
+        ignore_stats = [
+            "Name", "Name2", "Type", "DMG", "Delay", "Jobs", "Skill Type", "Rank",
+            # Character-bridge metadata is stored alongside numeric gear stats.
+            "Item ID", "Bridge Key", "Accessible Count", "Total Count", "Model Complete",
+            "Eligible", "LAC", "Slots", "Augments",
+        ]
         for source in self.buffs:
             for stat in self.buffs[source]:
                 if stat not in ignore_stats:
@@ -663,15 +747,24 @@ class create_player:
                 if stat not in ignore_stats:
                     # A list of combat skills to ignore when seen in the main or sub slots. These skills apply only to their respective slots on weapons so we create a new stat for them.
                     ignore_main_sub_skills = ["Hand-to-Hand Skill","Dagger Skill","Sword Skill","Great Sword Skill","Axe Skill","Great Axe Skill","Scythe Skill","Polearm Skill","Katana Skill","Great Katana Skill","Club Skill","Staff Skill","Evasion Skill","Divine Magic Skill","Elemental Magic Skill","Dark Magic Skill","Ninjutsu Skill","Summoning Magic Skill","Blue Magic Skill","Magic Accuracy Skill"]
+                    raw_value = self.gearset[slot][stat]
+                    if stat == "WSC":
+                        self.stats[stat] = self.stats.get(stat,[]) + [raw_value]
+                        continue
+                    if not isinstance(raw_value, (int, float)):
+                        try:
+                            raw_value = float(raw_value)
+                        except (TypeError, ValueError):
+                            # Ignore effect-only/string metadata that cannot
+                            # contribute to numeric player stats.
+                            continue
                     if not (slot in ["main","sub"] and stat in ignore_main_sub_skills):
                         if stat in ["FUA","OA8","OA7","OA6","OA5","OA4","OA3","OA2","EnSpell Damage","EnSpell Damage%"] and slot in ["main", "sub"]: # OAX stats apply only to the weapon they are attached to.
-                            self.stats[f"{stat} {slot}"] = self.stats.get(f"{stat} {slot}",0) + self.gearset[slot][stat]
-                        elif stat=="WSC":
-                            self.stats[stat] = self.stats.get(stat,[]) + [self.gearset[slot][stat]]
+                            self.stats[f"{stat} {slot}"] = self.stats.get(f"{stat} {slot}",0) + raw_value
                         else:
-                            self.stats[stat] = self.stats.get(stat,0) + self.gearset[slot][stat]
+                            self.stats[stat] = self.stats.get(stat,0) + raw_value
                     else:
-                        self.stats[f"{slot} {stat}"] = self.stats.get(f"{slot} {stat}",0) + self.gearset[slot][stat]
+                        self.stats[f"{slot} {stat}"] = self.stats.get(f"{slot} {stat}",0) + raw_value
 
         # Count the number of set-bonus gear equipped.
         mummu_count = 0 # Mummu +2 gives DEX/AGI/VIT/CHR
@@ -740,6 +833,17 @@ class create_player:
         #
         # Include base stats (without any gear or buffs) to the <stats> dictionary.
         #
+        cache_key = (
+            self.main_job,
+            self.sub_job,
+            self.master_level,
+            _freeze_cache_value(self.abilities),
+        )
+        cached_stats = _BASE_STATS_CACHE.get(cache_key)
+        if cached_stats is not None:
+            self.stats.update(cached_stats)
+            return
+
         # ===========================================================================
         # ===========================================================================
         # Add base parameters for Lv99 <main_job> and <sub_job> with <master_level> master levels.
@@ -996,7 +1100,10 @@ class create_player:
         if self.main_job == "nin":
             self.stats["Store TP"] = self.stats.get("Store TP",0) + 10 # Kakka: Ichi
             self.stats["Subtle Blow"] = self.stats.get("Subtle Blow",0) + 10 # Myoshu: Ichi
-            
+
+        if len(_BASE_STATS_CACHE) >= _BASE_STATS_CACHE_LIMIT:
+            _BASE_STATS_CACHE.clear()
+        _BASE_STATS_CACHE[cache_key] = self.stats.copy()
 
 
 
