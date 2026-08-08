@@ -14,7 +14,7 @@ from create_player import *
 import numpy as np
 from actions import *
 import sys
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import redirect_stdout
 from datetime import datetime # For timestamping new sets to put on BG Wiki
 from itertools import product
@@ -173,7 +173,7 @@ def estimate_candidate_checks(check_gear, main_job, ws_type="None"):
     )
 
 
-def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, seed=None, n_iter=10, return_details=False):
+def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, seed=None, n_iter=10, return_details=False, progress_callback=None):
     #
     # Build a valid gear set, test it, and return the best set found.
     #
@@ -186,6 +186,12 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     verbose_swaps = abilities.get("Verbose Swaps", False)
     damage_taken_item_cache = {}
     rng = np.random.default_rng(seed) if seed is not None else np.random
+
+    def report_progress(message):
+        if progress_callback is not None:
+            progress_callback(message)
+
+    report_progress(f"Search started (seed {seed if seed is not None else 'random'}).")
     # Keep caller-owned selections stable and remove impossible candidates once,
     # before the hot loop. Formula evaluation is unchanged for every valid set.
     check_gear = {slot: list(items) for slot, items in check_gear.items()}
@@ -315,6 +321,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
         for z in range(n_iter):
             print(f"Current iteration: {z+1}")
+            report_progress(f"Iteration {z + 1}/{n_iter}.")
             
             # Every candidate in this pass is compared to this immutable baseline.
             # This makes a full one/two-slot neighborhood pass independent of the
@@ -594,6 +601,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         mdt_thresh_temp = mdt - 1 if mdt-1 > mdt_thresh else mdt_thresh
         
         print(f"Current best set: PDT:{pdt},  MDT:{mdt}")
+        report_progress(f"Current best PDT:{pdt:g}, MDT:{mdt:g}.")
 
 
     if pdt > pdt_thresh or mdt > mdt_thresh:
@@ -643,24 +651,31 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         format_bgwiki(header, (min_tp), best_player, best_metric)
 
     if return_details:
+        report_progress("Search completed.")
         return best_player, best_output, best_metric
+    report_progress("Search completed.")
     return(best_player, best_output)
 
 
-def _build_set_restart_worker(request):
+def _build_set_restart_worker(request, progress_callback=None):
     """Run one independent optimizer restart in a process-safe top-level worker."""
     output_buffer = StringIO()
     try:
+        build_kwargs = request["kwargs"].copy()
+        if progress_callback is not None:
+            build_kwargs["progress_callback"] = progress_callback
         with redirect_stdout(output_buffer):
-            player, output, metric = build_set(*request["args"], **request["kwargs"])
+            player, output, metric = build_set(*request["args"], **build_kwargs)
     except Exception as error:
         return {
+            "index": request["index"],
             "seed": request["seed"],
             "error": str(error),
             "log": output_buffer.getvalue(),
         }
     else:
         return {
+            "index": request["index"],
             "player": player,
             "output": output,
             "metric": metric,
@@ -669,7 +684,7 @@ def _build_set_restart_worker(request):
         }
 
 
-def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, restarts=1, workers=0, seed=None, n_iter=10, return_details=False):
+def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, restarts=1, workers=0, seed=None, n_iter=10, return_details=False, progress_callback=None):
     """Run independent seeded searches and return the best valid result.
 
     ``workers=0`` selects up to one process per restart while leaving one CPU
@@ -689,22 +704,53 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
             "args": shared_args,
             "kwargs": {"seed": restart_seed, "n_iter": n_iter, "return_details": True},
             "seed": restart_seed,
+            "index": index,
         }
-        for restart_seed in restart_seeds
+        for index, restart_seed in enumerate(restart_seeds, start=1)
     ]
 
+    def notify(message):
+        if progress_callback is not None:
+            progress_callback(message)
+
+    def run_serial(request):
+        notify(f"Restart {request['index']}/{restarts} started (seed {request['seed']}).")
+        callback = lambda message: notify(f"Restart {request['index']}: {message}")
+        result = _build_set_restart_worker(request, callback)
+        if "error" in result:
+            notify(f"Restart {request['index']} failed: {result['error']}")
+        else:
+            notify(f"Restart {request['index']}/{restarts} completed.")
+        return result
+
     if restarts == 1:
-        results = [_build_set_restart_worker(requests[0])]
+        results = [run_serial(requests[0])]
     else:
         max_workers = workers
         if max_workers <= 0:
             max_workers = min(restarts, max(1, (os.cpu_count() or 2) - 1))
         max_workers = min(restarts, max_workers)
         if max_workers == 1:
-            results = [_build_set_restart_worker(request) for request in requests]
+            results = [run_serial(request) for request in requests]
         else:
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                results = list(executor.map(_build_set_restart_worker, requests))
+                for request in requests:
+                    notify(f"Restart {request['index']}/{restarts} started (seed {request['seed']}).")
+                futures = {
+                    executor.submit(_build_set_restart_worker, request): request
+                    for request in requests
+                }
+                results = []
+                for future in as_completed(futures):
+                    request = futures[future]
+                    result = future.result()
+                    results.append(result)
+                    if "error" in result:
+                        notify(f"Restart {request['index']} failed: {result['error']}")
+                    else:
+                        notify(f"Restart {request['index']}/{restarts} completed.")
+
+    results.sort(key=lambda result: result["index"])
 
     successful_results = [result for result in results if "error" not in result]
     if not successful_results:
@@ -716,8 +762,12 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
     winner = max(successful_results, key=lambda result: result["metric"])
     print(winner["log"], end="")
     if restarts > 1:
+        notify(
+            f"Selected restart {winner['index']}/{restarts} "
+            f"(seed {winner['seed']}; metric {winner['metric']:.6f})."
+        )
         print(
-            f"Selected restart {results.index(winner) + 1}/{restarts} "
+            f"Selected restart {winner['index']}/{restarts} "
             f"(seed {winner['seed']}; metric {winner['metric']:.6f})."
         )
     if return_details:

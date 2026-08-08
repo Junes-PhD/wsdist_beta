@@ -56,6 +56,15 @@ class application(tk.Tk):
         self.config(cursor="watch" if busy else "")
         self.update_idletasks()
 
+    def _append_optimizer_status(self, message):
+        status_text = getattr(self, "optimizer_status_text", None)
+        if status_text is None:
+            return
+        status_text.configure(state="normal")
+        status_text.insert("end", f"{message}\n")
+        status_text.see("end")
+        status_text.configure(state="disabled")
+
     def _start_optimizer(self, optimizer_args, optimizer_kwargs):
         """Run the CPU-bound optimizer away from Tk's event loop."""
         if getattr(self, "_optimizer_running", False):
@@ -63,6 +72,14 @@ class application(tk.Tk):
 
         self._optimizer_running = True
         self._optimizer_results = queue.Queue()
+        self._optimizer_events = queue.Queue()
+        if self.optimizer_status_text is not None:
+            self.optimizer_status_text.configure(state="normal")
+            self.optimizer_status_text.delete("1.0", "end")
+            self.optimizer_status_text.configure(state="disabled")
+        optimizer_kwargs = optimizer_kwargs.copy()
+        optimizer_kwargs["progress_callback"] = self._optimizer_events.put
+        self._append_optimizer_status("Starting optimizer...")
         self._set_optimizer_busy(True)
 
         def run_optimizer():
@@ -80,6 +97,11 @@ class application(tk.Tk):
         self.after(100, self._poll_optimizer)
 
     def _poll_optimizer(self):
+        while True:
+            try:
+                self._append_optimizer_status(self._optimizer_events.get_nowait())
+            except queue.Empty:
+                break
         try:
             status, result = self._optimizer_results.get_nowait()
         except queue.Empty:
@@ -89,10 +111,12 @@ class application(tk.Tk):
         self._optimizer_running = False
         self._set_optimizer_busy(False)
         if status == "error":
+            self._append_optimizer_status(f"Optimizer failed: {result}")
             messagebox.showerror("WSDist optimizer", str(result))
             return
 
         self.best_player, _, _, winning_seed = result
+        self._append_optimizer_status(f"Completed. Winning seed: {winning_seed}.")
         print(f"Optimizer completed with winning seed {winning_seed}.")
         self.equip_best_set_button.configure(state="active")
 
@@ -2683,6 +2707,8 @@ class application(tk.Tk):
         optimize_frame_bottomright.grid_propagate(False)
         optimize_frame_bottomright.columnconfigure(0, weight=1) 
 
+        self.optimizer_status_text = None
+
         self.show_similar_results_checkbox_value = tk.BooleanVar(value=False)
         self.show_similar_results_entry_value = tk.IntVar(value=2)
         
@@ -2698,8 +2724,21 @@ class application(tk.Tk):
         show_similar_results_entry.grid(row=0, column=1)
 
 
+        status_frame = ttk.LabelFrame(optimize_frame_bottomright, text="Optimizer status", padding=3)
+        status_frame.grid(row=1, column=0, padx=2, pady=(8, 2), sticky="ew")
+        status_frame.columnconfigure(0, weight=1)
+        self.optimizer_status_text = tk.Text(
+            status_frame, height=5, width=38, wrap="word", state="disabled",
+            relief="sunken", borderwidth=1,
+        )
+        self.optimizer_status_text.grid(row=0, column=0, sticky="nsew")
+        status_scrollbar = ttk.Scrollbar(status_frame, orient="vertical", command=self.optimizer_status_text.yview)
+        status_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.optimizer_status_text.configure(yscrollcommand=status_scrollbar.set)
+        self._append_optimizer_status("Ready.")
+
         optimize_buttons_frame = ttk.Frame(optimize_frame_bottomright)
-        optimize_buttons_frame.grid(row=1, column=0, pady=10)
+        optimize_buttons_frame.grid(row=2, column=0, pady=5)
 
 
 
