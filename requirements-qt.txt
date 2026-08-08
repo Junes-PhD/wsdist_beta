@@ -1,0 +1,2 @@
+# Install the existing requirements.txt first, then this Qt UI dependency.
+PyQt6>=6.9

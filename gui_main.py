@@ -510,8 +510,16 @@ class application(tk.Tk):
         if configured_dir:
             icon_dirs.append(configured_dir)
 
+        # GearSetBuilder exports Ashita resource icons beside the selected
+        # character bridge. This keeps the Python app independent of the
+        # Ashita installation's absolute path.
+        bridge_path = getattr(getattr(self, "bridge_store", None), "bridge_path", None)
+        if bridge_path is not None:
+            icon_dirs.append(os.path.join(os.path.dirname(str(bridge_path)), "icons32"))
+
         app_dir = os.path.dirname(os.path.abspath(__file__))
         icon_dirs.extend([
+            resource_path("icons32"),
             os.path.join(app_dir, "equipviewer", "icons"),
             os.path.join(app_dir, "icons"),
             # Development checkout layout: GitHub/Windower/Lua/addons/equipviewer/icons.

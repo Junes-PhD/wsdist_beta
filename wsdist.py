@@ -14,7 +14,7 @@ from create_player import *
 import numpy as np
 from actions import *
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, wait
 from contextlib import redirect_stdout
 from datetime import datetime # For timestamping new sets to put on BG Wiki
 from itertools import product
@@ -24,6 +24,8 @@ from io import StringIO
 # https://stackoverflow.com/questions/47350078/importing-external-module-in-single-file-exe-created-with-pyinstaller
 import sys
 import os
+import threading
+import time
 sys.path.append(os.path.dirname(sys.executable))
 from gear import *
 
@@ -716,7 +718,26 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
     def run_serial(request):
         notify(f"Restart {request['index']}/{restarts} started (seed {request['seed']}).")
         callback = lambda message: notify(f"Restart {request['index']}: {message}")
-        result = _build_set_restart_worker(request, callback)
+        stop_heartbeat = threading.Event()
+        started_at = time.monotonic()
+
+        def heartbeat():
+            while not stop_heartbeat.wait(5.0):
+                elapsed = time.monotonic() - started_at
+                notify(
+                    f"Restart {request['index']}/{restarts} active "
+                    f"({elapsed:.0f}s elapsed; search is still progressing)."
+                )
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat, name=f"optimizer-heartbeat-{request['index']}", daemon=True
+        )
+        heartbeat_thread.start()
+        try:
+            result = _build_set_restart_worker(request, callback)
+        finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=1.0)
         if "error" in result:
             notify(f"Restart {request['index']} failed: {result['error']}")
         else:
@@ -741,14 +762,27 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
                     for request in requests
                 }
                 results = []
-                for future in as_completed(futures):
-                    request = futures[future]
-                    result = future.result()
-                    results.append(result)
-                    if "error" in result:
-                        notify(f"Restart {request['index']} failed: {result['error']}")
-                    else:
-                        notify(f"Restart {request['index']}/{restarts} completed.")
+                pending = set(futures)
+                started_at = {future: time.monotonic() for future in pending}
+                while pending:
+                    done, pending = wait(pending, timeout=5.0)
+                    if not done:
+                        now = time.monotonic()
+                        for future in sorted(pending, key=lambda value: futures[value]["index"]):
+                            request = futures[future]
+                            elapsed = now - started_at[future]
+                            notify(
+                                f"Restart {request['index']}/{restarts} active "
+                                f"({elapsed:.0f}s elapsed; worker is still progressing)."
+                            )
+                    for future in done:
+                        request = futures[future]
+                        result = future.result()
+                        results.append(result)
+                        if "error" in result:
+                            notify(f"Restart {request['index']} failed: {result['error']}")
+                        else:
+                            notify(f"Restart {request['index']}/{restarts} completed.")
 
     results.sort(key=lambda result: result["index"])
 
