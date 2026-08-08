@@ -2,6 +2,12 @@
  
 GUI application for simulating damage dealt with various spells and abilities using user-defined gear sets.
 
+The repository archive `_reference/ffxiah_items.tgz` can be used as a local
+FFXIAH reference when adding or reviewing gear: it contains item IDs, names,
+descriptions, slot/job restrictions, weapon skills, and source stats. Use it to
+enrich bridge or catalog records for newly exported GearSetBuilder unknown
+items, while leaving effect-only or unresolved descriptions marked incomplete.
+
 You may run the code with as a simple Python file:
 
     python gui_main.py
