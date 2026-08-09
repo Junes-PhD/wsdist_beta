@@ -23,7 +23,7 @@ import zipfile
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QFontMetrics, QIcon, QPixmap
+from PyQt6.QtGui import QAction, QColor, QFontMetrics, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -2863,7 +2863,9 @@ class MainWindow(QMainWindow):
         controls.addStretch(1)
         layout.addLayout(controls)
 
-        self.profile_report_status = QLabel("Load a character bridge to inspect its LuAshitacast profiles.")
+        self.profile_report_status = QLabel(
+            "Load a character bridge to inspect its LuAshitacast profiles."
+        )
         self.profile_report_status.setWordWrap(True)
         layout.addWidget(self.profile_report_status)
         weapon_sets = QGroupBox("Profile weapon overlays")
@@ -2887,11 +2889,27 @@ class MainWindow(QMainWindow):
 
         self.profile_report_table = QTableWidget(0, 9)
         self.profile_report_table.setHorizontalHeaderLabels(
-            ["Effective set", "Type", "Matched WS", "Layers / weapons", "TP DPS", "Time to WS", "WS Damage", "Total DPS", "Status"]
+            ["Effective set", "Role", "Weapon skill", "Weapons / layers",
+             "TP DPS", "TP time (s)", "WS damage", "Cycle DPS", "Status"]
         )
         self.profile_report_table.setAlternatingRowColors(True)
         self.profile_report_table.setSortingEnabled(True)
         self.profile_report_table.horizontalHeader().setStretchLastSection(True)
+        self.profile_report_table.setMinimumHeight(230)
+        self.profile_report_table.itemSelectionChanged.connect(self._profile_report_row_selected)
+        self.profile_report_summary = QLabel(
+            "Run the profile report to compare TP speed, WS damage, and full-cycle DPS."
+        )
+        self.profile_report_summary.setWordWrap(True)
+        self.profile_report_summary.setObjectName("sectionTitle")
+        layout.addWidget(self.profile_report_summary)
+        report_note = QLabel(
+            "TP DPS is damage during the TP phase. Cycle DPS includes TP time, WS damage, "
+            "and the weapon-skill delay. Sort by a column to compare sets; blocked rows "
+            "remain visible with their reason in Status."
+        )
+        report_note.setWordWrap(True)
+        layout.addWidget(report_note)
         self.profile_diagnostic_table = QTableWidget(0, 6)
         self.profile_diagnostic_table.setHorizontalHeaderLabels(
             ["Raw set", "Role", "Variant", "Slots", "Model status", "Notes"]
@@ -3454,6 +3472,7 @@ class MainWindow(QMainWindow):
     def _profile_report_done(self, rows: list[dict]):
         self.cancel_profile_report_button.setEnabled(False)
         self.character_combo.setEnabled(bool(self.character_paths))
+        self._profile_report_rows = list(rows)
         self.profile_report_table.setSortingEnabled(False)
         self.profile_report_table.setRowCount(0)
         for row in rows:
@@ -3473,12 +3492,56 @@ class MainWindow(QMainWindow):
                 cell = NumericTableWidgetItem(value, numeric) if 4 <= column <= 7 else QTableWidgetItem(value)
                 if row.get("error"):
                     cell.setToolTip(row["error"])
+                    cell.setForeground(QColor("#b42318"))
+                elif column == 8:
+                    cell.setForeground(QColor("#137333"))
+                if column == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, row)
                 self.profile_report_table.setItem(index, column, cell)
         self.profile_report_table.setSortingEnabled(True)
         errors = sum(1 for row in rows if row.get("error"))
         self.profile_report_status.setText(
             f"Report complete: {len(rows) - errors}/{len(rows)} sets evaluated" +
             (f"; {errors} blocked/error rows are listed in Status." if errors else ".")
+        )
+        valid = [row for row in rows if not row.get("error")]
+        best_cycle = max(valid, key=lambda row: float(row.get("total_dps") or 0), default=None)
+        best_ws = max(valid, key=lambda row: float(row.get("ws_damage") or 0), default=None)
+        if best_cycle is None:
+            self.profile_report_summary.setText(
+                "No complete result rows are available. Open Raw-set diagnostics for the blocking reason."
+            )
+        else:
+            summary = (
+                f"Best cycle DPS: {best_cycle['name']} ({float(best_cycle['total_dps']):,.1f})"
+            )
+            if best_ws is not None:
+                summary += (
+                    f"  ·  Best WS damage: {best_ws['name']} "
+                    f"({float(best_ws['ws_damage']):,.0f})"
+                )
+            self.profile_report_summary.setText(summary)
+
+    def _profile_report_row_selected(self):
+        indexes = self.profile_report_table.selectedIndexes()
+        if not indexes:
+            return
+        row_index = indexes[0].row()
+        item = self.profile_report_table.item(row_index, 0)
+        row = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if not isinstance(row, dict):
+            return
+        if row.get("error"):
+            self.profile_report_summary.setText(
+                f"{row['name']} is blocked: {row['error']}"
+            )
+            return
+        self.profile_report_summary.setText(
+            f"Selected: {row['name']}  ·  {row['category']}  ·  "
+            f"TP DPS {float(row.get('tp_dps') or 0):,.1f}  ·  "
+            f"TP time {float(row.get('time_to_ws') or 0):,.2f}s  ·  "
+            f"WS damage {float(row.get('ws_damage') or 0):,.0f}  ·  "
+            f"Cycle DPS {float(row.get('total_dps') or 0):,.1f}"
         )
 
     def _profile_report_failed(self, message: str):
