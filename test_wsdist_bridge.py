@@ -10,10 +10,20 @@ from lac_profile import (
     bridge_hash, parse_set_entries, prepare_managed_update, prepare_set_renames,
     serialize_set, write_set,
 )
-from wsdist_bridge import BridgeStore, hoxne_stat_bonus
+from wsdist_bridge import BridgeStore, _gear_record, hoxne_stat_bonus
 
 
 class BridgeTests(unittest.TestCase):
+    def test_transferability_preserves_exclusive_flags(self):
+        record = {
+            "item_id": 99, "name": "Transfer Test", "slots_mask": 1 << 4,
+            "jobs_mask": 1 << 1, "accessible_count": 1, "model_complete": True,
+            "resource_flags": 0x2000,
+        }
+        item = _gear_record(record)
+        self.assertTrue(item["Exclusive"])
+        self.assertFalse(item["Transferable"])
+
     def bridge(self):
         return {
             "schema_version": 1,

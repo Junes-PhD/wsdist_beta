@@ -24,6 +24,36 @@ def empty_gearset():
 
 
 class CombatRegressionTests(unittest.TestCase):
+    @staticmethod
+    def _test_weapon(name, weapon_type, skill):
+        item = dict(Empty)
+        item.update(
+            Name=name, Name2=name, Type=weapon_type, **{"Skill Type": skill},
+            Jobs=all_jobs, Delay=240, DMG=100,
+        )
+        return item
+
+    def test_fencer_only_applies_to_single_handed_weapon_with_shield(self):
+        sword = self._test_weapon("Test Sword", "Weapon", "Sword")
+        shield = self._test_weapon("Test Shield", "Shield", "None")
+        dagger = self._test_weapon("Test Dagger", "Weapon", "Dagger")
+        h2h = self._test_weapon("Test H2H", "Weapon", "Hand-to-Hand")
+
+        shield_set = empty_gearset()
+        shield_set["main"], shield_set["sub"] = sword, shield
+        dual_set = empty_gearset()
+        dual_set["main"], dual_set["sub"] = sword, dagger
+        h2h_set = empty_gearset()
+        h2h_set["main"] = h2h
+
+        shield_player = create_player("war", "nin", 50, shield_set, {}, {})
+        dual_player = create_player("war", "nin", 50, dual_set, {}, {})
+        h2h_player = create_player("mnk", "war", 50, h2h_set, {}, {})
+
+        self.assertGreater(shield_player.stats.get("TP Bonus", 0), 0)
+        self.assertEqual(dual_player.stats.get("TP Bonus", 0), 0)
+        self.assertEqual(h2h_player.stats.get("TP Bonus", 0), 0)
+
     def test_player_construction_does_not_mutate_input_gear(self):
         gearset = empty_gearset()
         gearset["main"] = Sagitta

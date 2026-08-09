@@ -402,6 +402,20 @@ def item_name(item: dict) -> str:
     return str(item.get("Name2") or item.get("Name") or "Empty")
 
 
+def _normalized_item_name(value) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _blacklist_matches(item: dict, blacklist: set[str]) -> bool:
+    if not blacklist or item_name(item) == "Empty":
+        return False
+    names = {
+        _normalized_item_name(item.get("Name")),
+        _normalized_item_name(item.get("Name2")),
+    }
+    return bool(names & blacklist)
+
+
 def item_tooltip(item: dict) -> str:
     ignored = {"Name", "Name2", "Jobs", "Slots", "Bridge Key", "Eligible"}
     lines = [str(item.get("Name") or item_name(item))]
@@ -806,7 +820,8 @@ class TopSetsDialog(QDialog):
         controls.addWidget(QLabel("Load set"))
         self.load_combo = QComboBox()
         for result in self.results:
-            self.load_combo.addItem(f"Set {result.get('rank', '?')}")
+            label = result.get("label") or f"Set {result.get('rank', '?')}"
+            self.load_combo.addItem(str(label))
         controls.addWidget(self.load_combo)
         load_quick = QPushButton("Load into Quick Look")
         load_tpws = QPushButton("Load into TP / WS Sets")
@@ -827,7 +842,8 @@ class TopSetsDialog(QDialog):
         for result in self.results:
             metric = float(result.get("metric") or 0)
             worse = 0.0 if top_metric <= 0 else max(0.0, (top_metric - metric) / abs(top_metric) * 100)
-            group = QGroupBox(f"Set {result.get('rank', '?')}  ·  {worse:.2f}% below top")
+            label = result.get("label") or f"Set {result.get('rank', '?')}"
+            group = QGroupBox(f"{label}  ·  {worse:.2f}% below top")
             pair_tp = result.get("tp_player")
             pair_ws = result.get("ws_player")
             if pair_tp is not None and pair_ws is not None:
@@ -890,6 +906,60 @@ class TopSetsDialog(QDialog):
             cell_layout.addLayout(text_layout, 1)
             row, column = divmod(index, columns)
             grid.addWidget(cell, row, column)
+
+
+class GearBlacklistDialog(QDialog):
+    """Edit the account-wide item-name blacklist used by every character."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Global gear blacklist")
+        self.resize(560, 480)
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Blacklisted base names are hidden from every character's gear pickers "
+            "and optimizer candidates. Augmented variants are covered by their base name."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        row = QHBoxLayout()
+        self.entry = QLineEdit()
+        self.entry.setPlaceholderText("Item name, e.g. Example Breastplate")
+        add = QPushButton("Add")
+        add.clicked.connect(self._add)
+        self.entry.returnPressed.connect(self._add)
+        row.addWidget(self.entry, 1)
+        row.addWidget(add)
+        layout.addLayout(row)
+        self.items = QListWidget()
+        self.items.addItems(sorted(parent.gear_blacklist))
+        layout.addWidget(self.items, 1)
+        remove = QPushButton("Remove selected")
+        remove.clicked.connect(lambda: self.items.takeItem(self.items.currentRow()))
+        layout.addWidget(remove, 0, Qt.AlignmentFlag.AlignLeft)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _add(self):
+        value = self.entry.text().strip()
+        if not value:
+            return
+        normalized = _normalized_item_name(value)
+        if not any(self.items.item(index).text() == normalized for index in range(self.items.count())):
+            self.items.addItem(normalized)
+        self.entry.clear()
+
+    def _save(self):
+        values = {
+            _normalized_item_name(self.items.item(index).text())
+            for index in range(self.items.count())
+        }
+        self.parent().set_gear_blacklist(values)
+        self.accept()
 
 
 class WeaponSkillRankingDialog(QDialog):
@@ -1157,6 +1227,8 @@ class MainWindow(QMainWindow):
         self._optimizer_status_timer.timeout.connect(self._refresh_optimizer_status)
         self._optimizer_run_cards: dict[int, dict] = {}
         self.top_sets_dialog: TopSetsDialog | None = None
+        self.gear_blacklist: set[str] = self._load_gear_blacklist()
+        self.shared_catalog: dict[str, dict] = {}
         self.candidates = {slot: {"Empty"} for slot in SLOTS}
         self._build_ui()
         self._restore_settings()
@@ -1188,6 +1260,8 @@ class MainWindow(QMainWindow):
         select_root.triggered.connect(self.choose_bridge_root)
         refresh = QAction("Refresh selected character", self)
         refresh.triggered.connect(self.refresh_bridge)
+        blacklist = QAction("Gear blacklist...", self)
+        blacklist.triggered.connect(self.open_gear_blacklist)
         legacy = QAction("About legacy interface", self)
         legacy.triggered.connect(lambda: QMessageBox.information(
             self, "Legacy interface",
@@ -1195,9 +1269,36 @@ class MainWindow(QMainWindow):
         ))
         close = QAction("Exit", self)
         close.triggered.connect(self.close)
-        file_menu.addActions([select_root, refresh, legacy])
+        file_menu.addActions([select_root, refresh, blacklist, legacy])
         file_menu.addSeparator()
         file_menu.addAction(close)
+
+    def _load_gear_blacklist(self) -> set[str]:
+        raw = self.settings.value("global_gear_blacklist", "")
+        try:
+            values = raw if isinstance(raw, list) else json.loads(str(raw or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            values = []
+        return {
+            _normalized_item_name(value) for value in values
+            if _normalized_item_name(value)
+        }
+
+    def set_gear_blacklist(self, values: set[str]) -> None:
+        self.gear_blacklist = {
+            _normalized_item_name(value) for value in values if _normalized_item_name(value)
+        }
+        self.settings.setValue("global_gear_blacklist", json.dumps(sorted(self.gear_blacklist)))
+        self._reset_invalid_equipment()
+        for slot in SLOTS:
+            self._update_candidate_button(slot)
+        self.statusBar().showMessage(
+            f"Global gear blacklist updated ({len(self.gear_blacklist)} item names).", 5000
+        )
+
+    def open_gear_blacklist(self):
+        dialog = GearBlacklistDialog(self)
+        dialog.exec()
 
     def _build_inputs(self) -> QWidget:
         content = QWidget()
@@ -1297,6 +1398,7 @@ class MainWindow(QMainWindow):
         self.ws_set = GearSetEditor("Weapon-skill equipment", self)
         self.quick_set.changed.connect(self._gear_changed)
         self.tabs.addTab(self._quick_tab(), "Quick Look")
+        self.tabs.addTab(self._quick_abilities_tab(), "JA")
         self.tabs.addTab(self._optimizer_tab(), "Optimizer")
         self.tabs.addTab(self._sets_tab(), "TP / WS Sets")
         self.tabs.addTab(self._buffs_tab(), "Buffs")
@@ -1348,10 +1450,7 @@ class MainWindow(QMainWindow):
         self.quick_stats_scroll.setMinimumHeight(220)
         self.quick_stats_scroll.setMaximumHeight(390)
         totals_layout.addWidget(self.quick_stats_scroll)
-        self.quick_ability_tabs = QTabWidget()
-        self.quick_ability_tabs.addTab(totals, "Totals")
-        self.quick_ability_tabs.addTab(self._quick_abilities_tab(), "Job abilities")
-        layout.addWidget(self.quick_ability_tabs, 1)
+        layout.addWidget(totals, 1)
         return tab
 
     def _quick_abilities_tab(self) -> QWidget:
@@ -1800,6 +1899,13 @@ class MainWindow(QMainWindow):
         )
         self.exclude_under_119.toggled.connect(self._candidate_filter_changed)
         grid.addWidget(self.exclude_under_119, 5, 0, 1, 4)
+        self.include_shared_gear = QCheckBox("Include transferable gear from other characters")
+        self.include_shared_gear.setToolTip(
+            "Opt-in: add only non-Ex gear exported as transferable by GearSetBuilder "
+            "from the other discovered characters."
+        )
+        self.include_shared_gear.toggled.connect(self._shared_gear_changed)
+        grid.addWidget(self.include_shared_gear, 6, 0, 1, 4)
         preset_row = QHBoxLayout()
         self.candidate_preset_combo = QComboBox()
         self.candidate_preset_combo.setMinimumWidth(180)
@@ -1815,7 +1921,7 @@ class MainWindow(QMainWindow):
         preset_row.addWidget(load_candidates)
         preset_row.addWidget(save_candidates)
         preset_row.addWidget(delete_candidates)
-        grid.addLayout(preset_row, 6, 0, 1, 4)
+        grid.addLayout(preset_row, 7, 0, 1, 4)
         top.addWidget(candidates, 1)
 
         options = QGroupBox("Search")
@@ -1859,6 +1965,9 @@ class MainWindow(QMainWindow):
             combo.setCurrentText(default_stat)
             self.substat_combos.append(combo)
         self.optimize_action.currentTextChanged.connect(self._refresh_optimizer_metrics)
+        self.substat_base_action.currentTextChanged.connect(
+            lambda _text: self._refresh_optimizer_metrics(self.optimize_action.currentText())
+        )
         self.optimize_action.currentTextChanged.connect(self._refresh_combined_options)
         self.pdt = QSpinBox()
         self.pdt.setRange(0, 50)
@@ -1995,7 +2104,12 @@ class MainWindow(QMainWindow):
             "Attack round": ["Time to WS", "Damage dealt", "TP return", "DPS"],
             "Spell": ["Damage dealt", "TP return"],
             "Combined TP + WS": ["Combined DPS"],
-            "Sub-stat optimization": ["Damage dealt"],
+            "Sub-stat optimization": {
+                "Weapon skill": ["Damage dealt", "TP return", "Magic accuracy"],
+                "Attack round": ["Time to WS", "Damage dealt", "TP return", "DPS"],
+                "Spell": ["Damage dealt", "TP return"],
+                "Combined TP + WS": ["Combined DPS"],
+            }.get(self.substat_base_action.currentText(), ["Damage dealt"]),
         }[action]
         current = self.metric_combo.currentText()
         self.metric_combo.clear()
@@ -2823,6 +2937,8 @@ class MainWindow(QMainWindow):
                     )
                 if item is None:
                     missing.append(str(profile_slot))
+                elif _blacklist_matches(item, self.gear_blacklist):
+                    missing.append(f"{profile_slot} (blacklisted)")
                 else:
                     gearset[slot] = item
                     if item.get("Model Complete") is False:
@@ -3249,7 +3365,7 @@ class MainWindow(QMainWindow):
         for item in [gear.Empty, *self.equipment.get(slot, [])]:
             jobs = [str(value).lower() for value in item.get("Jobs", gear.all_jobs)]
             name = item_name(item)
-            if job not in jobs or name in seen:
+            if job not in jobs or name in seen or _blacklist_matches(item, self.gear_blacklist):
                 continue
             seen.add(name)
             result.append(item)
@@ -3303,9 +3419,59 @@ class MainWindow(QMainWindow):
             self._update_candidate_button(slot)
         self.statusBar().showMessage("Removed optimizer candidates under item level 119 where metadata was available.", 5000)
 
+    def _shared_gear_changed(self, enabled: bool):
+        self._refresh_shared_gear()
+        self._reset_invalid_equipment()
+        for editor in (self.quick_set, self.tp_set, self.ws_set):
+            editor.refresh_icons()
+        self.statusBar().showMessage(
+            "Transferable gear sharing enabled." if enabled else "Transferable gear sharing disabled.",
+            4000,
+        )
+
+    def _refresh_shared_gear(self):
+        """Merge transferable inventory from other bridge characters when enabled."""
+        self.shared_catalog = {}
+        if not getattr(self, "include_shared_gear", None) or not self.include_shared_gear.isChecked():
+            if self.bridge_store.data:
+                self.equipment = self.bridge_store.equipment_dict()
+            return
+        if not self.bridge_store.bridge_path or not self.bridge_store.ashita_root:
+            return
+        current_path = self.bridge_store.bridge_path.resolve()
+        combined = self.bridge_store.equipment_dict()
+        known = {item_name(item) for values in combined.values() for item in values}
+        for label, path in self.character_paths.items():
+            if path.resolve() == current_path:
+                continue
+            try:
+                store = BridgeStore(self.bridge_store.ashita_root)
+                store.set_hoxne_mastery_rank(self.hoxne_mastery_rank.value())
+                store.load(path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            for item in store.catalog.values():
+                if not item.get("Eligible") or not item.get("Transferable", False):
+                    continue
+                name = item_name(item)
+                if name in known or _blacklist_matches(item, self.gear_blacklist):
+                    continue
+                shared = deepcopy(item)
+                shared["Shared Only"] = True
+                shared["Shared Characters"] = [label]
+                self.shared_catalog[name] = shared
+                known.add(name)
+                for slot in shared.get("Slots", ()):
+                    if slot in combined:
+                        combined[slot].append(shared)
+        for slot in combined:
+            combined[slot].sort(key=lambda item: item_name(item).casefold())
+        self.equipment = combined
+
     def _capture_candidate_state(self) -> dict:
         return {
             "exclude_under_119": bool(self.exclude_under_119.isChecked()),
+            "include_shared_gear": bool(self.include_shared_gear.isChecked()),
             "candidates": {slot: sorted(values) for slot, values in self.candidates.items()},
         }
 
@@ -3347,6 +3513,10 @@ class MainWindow(QMainWindow):
         self.exclude_under_119.blockSignals(True)
         self.exclude_under_119.setChecked(bool(state.get("exclude_under_119", False)))
         self.exclude_under_119.blockSignals(False)
+        self.include_shared_gear.blockSignals(True)
+        self.include_shared_gear.setChecked(bool(state.get("include_shared_gear", False)))
+        self.include_shared_gear.blockSignals(False)
+        self._refresh_shared_gear()
         self._candidate_filter_changed(self.exclude_under_119.isChecked())
         for slot in SLOTS:
             self._update_candidate_button(slot)
@@ -3457,6 +3627,7 @@ class MainWindow(QMainWindow):
             self.icons.set_bridge_icon_dir(path.parent / "icons32")
             gear.all_gear.update(self.bridge_store.catalog)
             self.equipment = self.bridge_store.equipment_dict()
+            self._refresh_shared_gear()
             self.settings.setValue("character", label)
             eligible = sum(1 for item in self.bridge_store.catalog.values() if item.get("Eligible"))
             character = data.get("character", {}).get("name", label)
@@ -3640,6 +3811,8 @@ class MainWindow(QMainWindow):
                     values = saved_candidates.get(slot, [])
                     self.candidates[slot] = set(values) if isinstance(values, list) else {"Empty"}
             self.exclude_under_119.setChecked(bool(candidate_state.get("exclude_under_119", False)))
+            self.include_shared_gear.setChecked(bool(candidate_state.get("include_shared_gear", False)))
+            self._refresh_shared_gear()
             self._candidate_filter_changed(self.exclude_under_119.isChecked())
         for slot in SLOTS:
             self._update_candidate_button(slot)
@@ -3732,6 +3905,7 @@ class MainWindow(QMainWindow):
         self.bridge_store.set_hoxne_mastery_rank(rank)
         gear.all_gear.update(self.bridge_store.catalog)
         self.equipment = self.bridge_store.equipment_dict()
+        self._refresh_shared_gear()
         for editor in (self.quick_set, self.tp_set, self.ws_set):
             changed = False
             for slot in SLOTS:
@@ -3951,7 +4125,7 @@ class MainWindow(QMainWindow):
                 args = common + (
                     self.ws_combo.currentText(), self.spell_combo.currentText(), action_type,
                     self.tp_value.value(), check_gear, dict(self.quick_set.items),
-                    pdt_requirement, mdt_requirement, "Damage dealt", False, 2,
+                    pdt_requirement, mdt_requirement, self.metric_combo.currentText(), False, 2,
                     [
                         {"target": stat, "loss_percent": self.substat_loss_percent.value()}
                         for stat in selected_substats
@@ -4163,7 +4337,19 @@ class MainWindow(QMainWindow):
         progress = sum(fractions) / max(1, len(fractions))
         self.optimizer_progress_value.setText(f"Approx. progress: {progress * 100:.1f}%")
         elapsed = time.monotonic() - (self._optimizer_started_at or time.monotonic())
-        if progress > 0.001 and elapsed > 1:
+        ranking_states = [state for state in states if state.get("ranking_total")]
+        ranking_state = ranking_states[0] if ranking_states else None
+        ranking_done = int(ranking_state.get("ranking_completed", 0)) if ranking_state else 0
+        ranking_total = int(ranking_state.get("ranking_total", 0)) if ranking_state else 0
+        if ranking_state and ranking_done > 0 and elapsed > 1:
+            # Ranking work is intentionally sequential (one optimizer call per
+            # WS/TP cell), so use the measured mean cell time rather than the
+            # generic optimizer fraction, which assumes equal search runs.
+            remaining = elapsed / ranking_done * max(0, ranking_total - ranking_done)
+            self.optimizer_eta_value.setText(
+                f"Estimated time remaining: {self._format_duration(remaining)}"
+            )
+        elif progress > 0.001 and elapsed > 1:
             remaining = elapsed * (1 - progress) / progress
             self.optimizer_eta_value.setText(
                 f"Estimated time remaining: {self._format_duration(remaining)}"
@@ -4193,6 +4379,25 @@ class MainWindow(QMainWindow):
             self.optimizer_phase_value.setText(f"Current phase: {run_label} · {phase}")
 
     def _update_optimizer_run_state(self, message: str):
+        ranking = re.search(r"WS ranking (\d+)/(\d+):\s*(.+)", message, re.I)
+        if ranking:
+            current, total = map(int, ranking.groups()[:2])
+            state = self._optimizer_run_state.setdefault(
+                1,
+                {
+                    "index": 1,
+                    "total": 1,
+                    "started_at": self._optimizer_started_at or time.monotonic(),
+                    "improvement": "none yet",
+                },
+            )
+            state["ranking_completed"] = max(0, current - 1)
+            state["ranking_total"] = max(1, total)
+            state["fraction"] = min(1.0, (current - 1) / max(1, total))
+            state["phase"] = f"ranking WS {current - 1}/{total}"
+            state["updated"] = time.monotonic()
+            self._refresh_optimizer_status()
+            return
         match = re.search(r"Search run (\d+)(?:/(\d+))?", message)
         if not match:
             return
@@ -4423,7 +4628,7 @@ class MainWindow(QMainWindow):
         if destination == "tpws":
             self.tp_set.set_gearset(tp_player.gearset)
             self.ws_set.set_gearset(ws_player.gearset)
-            self.tabs.setCurrentIndex(2)
+            self.tabs.setCurrentIndex(3)
             self.statusBar().showMessage("Loaded selected result into TP / WS sets", 5000)
         else:
             self.quick_set.set_gearset(tp_player.gearset)
@@ -4437,7 +4642,7 @@ class MainWindow(QMainWindow):
         self.ws_set.set_gearset(player.gearset)
         self.ws_combo.setCurrentText(str(entry.get("ws_name") or "None"))
         self.tp_value.setValue(int(entry.get("tp") or 1000))
-        self.tabs.setCurrentIndex(2)
+        self.tabs.setCurrentIndex(3)
         self.statusBar().showMessage(
             f"Loaded {entry.get('ws_name')} optimized WS set", 5000
         )

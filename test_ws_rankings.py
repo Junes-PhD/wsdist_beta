@@ -53,6 +53,10 @@ class WeaponSkillRankingTests(unittest.TestCase):
         ])
         self.assertEqual(result[5][-1]["stat"], "Defense")
         self.assertEqual(result[5][-1]["damage_floor"], 850.0)
+        self.assertEqual(
+            [entry["label"] for entry in result[4]],
+            ["Best damage set", "Sub-stat optimized"],
+        )
 
     def test_ranks_each_tp_tier_independently(self):
         damages = {

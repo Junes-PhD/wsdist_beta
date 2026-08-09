@@ -1853,7 +1853,10 @@ def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
         progress_callback=progress_callback, progress_queue=progress_queue,
         stop_event=stop_event,
     )
-    current_player, current_output, damage_metric, winning_seed, _ = baseline
+    baseline_player, baseline_output, baseline_metric, baseline_seed, _ = baseline
+    current_player, current_output, damage_metric, winning_seed = (
+        baseline_player, baseline_output, baseline_metric, baseline_seed
+    )
     damage_floor = float(damage_metric) * (
         1.0 - max(0.0, min(100.0, float(substat_specs[0].get("loss_percent", 15.0)))) / 100.0
     )
@@ -1896,10 +1899,30 @@ def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
 
     if progress_callback is not None:
         progress_callback("Sub-stat optimization complete.")
-    top_results = [{
-        "rank": 1, "player": current_player, "output": current_output,
-        "metric": damage_metric, "seed": winning_seed, "index": 1,
-    }]
+    # Keep the unconstrained damage winner visible alongside the final
+    # secondary-stat result.  This makes the trade-off auditable in the
+    # existing "Show best sets" dialog instead of silently replacing the
+    # damage set.
+    top_results = [
+        {
+            "rank": 1,
+            "label": "Best damage set",
+            "player": baseline_player,
+            "output": baseline_output,
+            "metric": baseline_metric,
+            "seed": baseline_seed,
+            "index": 1,
+        },
+        {
+            "rank": 2,
+            "label": "Sub-stat optimized",
+            "player": current_player,
+            "output": current_output,
+            "metric": damage_metric,
+            "seed": winning_seed,
+            "index": 2,
+        },
+    ]
     if return_details:
         result = current_player, current_output, damage_metric, winning_seed, top_results, summary
         return result if return_top_results else result[:4]

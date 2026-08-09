@@ -171,6 +171,19 @@ def _gear_record(record: dict, *, eligible: bool = True, hoxne_mastery_rank: int
         "Slots": slots,
         "Augments": deepcopy(record.get("augments") or []),
     })
+    resource_flags = int(record.get("resource_flags") or record.get("Resource Flags") or 0)
+    exclusive = bool(record.get("exclusive", record.get("Exclusive", False)))
+    transferable = record.get("transferable", record.get("Transferable"))
+    if transferable is None:
+        # The SDK's no-delivery/no-trade bits are the conservative Ex test;
+        # unknown legacy records remain non-transferable for cross-character
+        # sharing, while the owning character can still use them normally.
+        transferable = False
+    result.update({
+        "Resource Flags": resource_flags,
+        "Exclusive": exclusive or bool(resource_flags & 0x6000),
+        "Transferable": bool(transferable) and not bool(resource_flags & 0x6000),
+    })
     # Newer GearSetBuilder exports may include item-level metadata.  Preserve
     # it for optional optimizer filtering without feeding it into any damage
     # formulas.
