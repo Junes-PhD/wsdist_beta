@@ -1899,6 +1899,12 @@ def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
 
     if progress_callback is not None:
         progress_callback("Sub-stat optimization complete.")
+    targets = [spec["target"] for spec in specs]
+
+    def stat_values(player):
+        modeled = _substat_player(player)
+        return {target: float(_substat_value(modeled, target)) for target in targets}
+
     # Keep the unconstrained damage winner visible alongside the final
     # secondary-stat result.  This makes the trade-off auditable in the
     # existing "Show best sets" dialog instead of silently replacing the
@@ -1912,6 +1918,8 @@ def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
             "metric": baseline_metric,
             "seed": baseline_seed,
             "index": 1,
+            "substats": stat_values(baseline_player),
+            "substat_targets": targets,
         },
         {
             "rank": 2,
@@ -1921,6 +1929,8 @@ def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
             "metric": damage_metric,
             "seed": winning_seed,
             "index": 2,
+            "substats": stat_values(current_player),
+            "substat_targets": targets,
         },
     ]
     if return_details:

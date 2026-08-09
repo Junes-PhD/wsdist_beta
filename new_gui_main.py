@@ -834,6 +834,53 @@ class TopSetsDialog(QDialog):
         controls.addWidget(load_tpws)
         controls.addStretch(1)
         layout.addLayout(controls)
+        substat_results = [result for result in self.results if result.get("substats")]
+        if substat_results:
+            baseline = next(
+                (result for result in substat_results
+                 if result.get("label") == "Best damage set"),
+                substat_results[0],
+            )
+            targets = []
+            for result in substat_results:
+                for target in result.get("substat_targets", result.get("substats", {})):
+                    if target not in targets:
+                        targets.append(target)
+            comparison = QGroupBox("Secondary-stat comparison")
+            comparison_layout = QVBoxLayout(comparison)
+            comparison_note = QLabel(
+                "Values are compared using the same modeled player stats as each set. "
+                "Delta is relative to the best-damage set."
+            )
+            comparison_note.setWordWrap(True)
+            comparison_layout.addWidget(comparison_note)
+            table = QTableWidget(len(targets), 3)
+            table.setHorizontalHeaderLabels([
+                "Secondary stat", "Best damage set", "Sub-stat optimized / delta"
+            ])
+            table.verticalHeader().setVisible(False)
+            table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            optimized = next(
+                (result for result in substat_results
+                 if result.get("label") == "Sub-stat optimized"),
+                substat_results[-1],
+            )
+            baseline_values = baseline.get("substats", {})
+            optimized_values = optimized.get("substats", {})
+            for row, target in enumerate(targets):
+                base_value = float(baseline_values.get(target, 0.0))
+                optimized_value = float(optimized_values.get(target, 0.0))
+                table.setItem(row, 0, QTableWidgetItem(str(target)))
+                table.setItem(row, 1, QTableWidgetItem(f"{base_value:,.1f}"))
+                table.setItem(
+                    row, 2,
+                    QTableWidgetItem(
+                        f"{optimized_value:,.1f}  ({optimized_value - base_value:+,.1f})"
+                    ),
+                )
+            table.resizeColumnsToContents()
+            comparison_layout.addWidget(table)
+            layout.addWidget(comparison)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         content = QWidget()
