@@ -45,6 +45,25 @@ SKILL_NAMES = {
     6: "Great Axe", 7: "Scythe", 8: "Polearm", 9: "Katana", 10: "Great Katana",
     11: "Club", 12: "Staff", 13: "Archery", 14: "Marksmanship", 15: "Throwing",
 }
+BASE_PARAMETERS = ("STR", "DEX", "VIT", "AGI", "INT", "MND", "CHR")
+
+
+def hoxne_stat_bonus(mastery_rank: int) -> int:
+    """Return Hoxne Earring's all-parameter bonus for Mastery Rank 1-10."""
+    rank = max(1, min(10, int(mastery_rank)))
+    return rank * 10 - 40 if rank <= 4 else (rank - 4) * 5
+
+
+def _apply_hoxne_mastery_rank(item: dict, mastery_rank: int) -> dict:
+    """Replace the bridge's static Hoxne estimate with the chosen character rank."""
+    if str(item.get("Name") or "").casefold() != "hoxne earring":
+        return item
+    adjusted = item.copy()
+    for parameter in BASE_PARAMETERS:
+        adjusted[parameter] = hoxne_stat_bonus(mastery_rank)
+    suffix = f"MR{max(1, min(10, int(mastery_rank))):02d}"
+    adjusted["Name2"] = f"Hoxne Earring {suffix}"
+    return adjusted
 
 
 def bridge_hash(text: str) -> str:
@@ -126,7 +145,7 @@ def _accessible_count(record: dict) -> int:
                if location.get("available") is True or location.get("source") == "accessible")
 
 
-def _gear_record(record: dict, *, eligible: bool = True) -> dict:
+def _gear_record(record: dict, *, eligible: bool = True, hoxne_mastery_rank: int = 5) -> dict:
     slots = _slot_names(int(record.get("slots_mask") or 0))
     item_id = int(record.get("item_id") or 0)
     stats = (deepcopy(BASE_ITEM_MODELS[item_id])
@@ -152,7 +171,18 @@ def _gear_record(record: dict, *, eligible: bool = True) -> dict:
         "Slots": slots,
         "Augments": deepcopy(record.get("augments") or []),
     })
-    return result
+    # Newer GearSetBuilder exports may include item-level metadata.  Preserve
+    # it for optional optimizer filtering without feeding it into any damage
+    # formulas.
+    for key in ("item_level", "Item Level", "itemLevel", "ilvl", "ILvl"):
+        if record.get(key) not in (None, ""):
+            result["Item Level"] = record[key]
+            break
+    for key in ("description", "help_text", "help", "Description", "Help Text"):
+        if record.get(key) not in (None, ""):
+            result["Description"] = str(record[key])
+            break
+    return _apply_hoxne_mastery_rank(result, hoxne_mastery_rank)
 
 
 def _with_ffxiah_model(record: dict) -> dict:
@@ -232,6 +262,13 @@ class BridgeStore:
         self.by_key: dict[str, dict] = {}
         self.by_slot: dict[str, list[dict]] = {slot: [] for slot in SLOTS}
         self.characters: list[dict] = []
+        self.hoxne_mastery_rank = 5
+
+    def set_hoxne_mastery_rank(self, mastery_rank: int) -> None:
+        """Set the character's Hoxne rank and rebuild an already-loaded catalog."""
+        self.hoxne_mastery_rank = max(1, min(10, int(mastery_rank)))
+        if self.data:
+            self._build_catalog()
 
     def set_root(self, root: str | os.PathLike) -> None:
         selected = Path(root).expanduser().resolve()
@@ -274,7 +311,7 @@ class BridgeStore:
         if bridge.parent.parent != self._root().resolve():
             raise ValueError("Bridge file is outside the selected GearSetBuilder directory.")
         self.data = json.loads(bridge.read_text(encoding="utf-8"))
-        if int(self.data.get("schema_version", 0)) != 1:
+        if int(self.data.get("schema_version", 0)) not in (1, 2):
             raise ValueError("Unsupported WSDist bridge schema.")
         self.bridge_path = bridge
         self.loaded_mtime = bridge.stat().st_mtime
@@ -294,7 +331,9 @@ class BridgeStore:
         self.by_slot = {slot: [] for slot in SLOTS}
         for record in self.data.get("items", []):
             record = _with_ffxiah_model(record)
-            item = _with_builtin_model(record, _gear_record(record))
+            item = _with_builtin_model(
+                record, _gear_record(record, hoxne_mastery_rank=self.hoxne_mastery_rank)
+            )
             if not item["Bridge Key"]:
                 continue
             self.by_key[item["Bridge Key"]] = item
@@ -333,11 +372,31 @@ class BridgeStore:
             if sorted(map(str, record.get("augments") or [])) != sorted(map(str, item.get("augments") or [])):
                 continue
             record = _with_ffxiah_model(record)
-            return _with_builtin_model(record, _gear_record(record, eligible=False))
+            return _with_builtin_model(
+                record,
+                _gear_record(record, eligible=False, hoxne_mastery_rank=self.hoxne_mastery_rank),
+            )
+        # Schema v2 profile records carry the exact resolved stats and LAC
+        # augment identity even when that item is no longer in accessible
+        # inventory.  Prefer that record over a same-name curated fallback.
+        if item.get("stats") or item.get("base_stats") or item.get("augment_stats"):
+            embedded = deepcopy(item)
+            embedded.setdefault("key", str(item.get("key") or f"profile|{name.casefold()}"))
+            embedded.setdefault("name", name)
+            embedded.setdefault("model_complete", bool(item.get("stats")))
+            return _with_builtin_model(
+                embedded,
+                _gear_record(
+                    embedded, eligible=False,
+                    hoxne_mastery_rank=self.hoxne_mastery_rank,
+                ),
+            )
         # Profile-only gear can still use the curated WSDist model.
         for candidate in gear_pyfile.all_gear.values():
             if str(candidate.get("Name") or "").lower() == name.lower():
-                return candidate
+                return _apply_hoxne_mastery_rank(
+                    deepcopy(candidate), self.hoxne_mastery_rank
+                )
         return None
 
     def profile_records(self) -> list[dict]:

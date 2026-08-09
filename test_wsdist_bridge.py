@@ -6,8 +6,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lac_profile import bridge_hash, parse_set_entries, serialize_set, write_set
-from wsdist_bridge import BridgeStore
+from lac_profile import (
+    bridge_hash, parse_set_entries, prepare_managed_update, prepare_set_renames,
+    serialize_set, write_set,
+)
+from wsdist_bridge import BridgeStore, hoxne_stat_bonus
 
 
 class BridgeTests(unittest.TestCase):
@@ -56,6 +59,29 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(store.by_slot["sub"][0]["Type"], "Shield")
             self.assertEqual(store.by_slot["sub"][0]["Name"], "Aegis")
 
+    def test_hoxne_rank_replaces_static_bridge_stats(self):
+        bridge = self.bridge()
+        bridge["items"].append({
+            "key": "26120|hoxne", "item_id": 26120, "name": "Hoxne Earring",
+            "slots_mask": 1 << 11, "jobs_mask": (1 << 23) - 2,
+            "accessible_count": 1, "total_count": 1,
+            "stats": {stat: 5 for stat in ("STR", "DEX", "VIT", "AGI", "INT", "MND", "CHR")},
+            "model_complete": True, "lac": {"Name": "Hoxne Earring"},
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "config" / "addons" / "gearsetbuilder" / "tester_123" / "wsdist_bridge.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(bridge), encoding="utf-8")
+            store = BridgeStore(root)
+            store.load(path)
+            store.set_hoxne_mastery_rank(9)
+            hoxne = store.by_key["26120|hoxne"]
+            self.assertEqual(hoxne["Name2"], "Hoxne Earring MR09")
+            self.assertTrue(all(hoxne[stat] == 25 for stat in ("STR", "DEX", "VIT", "AGI", "INT", "MND", "CHR")))
+        self.assertEqual(hoxne_stat_bonus(1), -30)
+        self.assertEqual(hoxne_stat_bonus(10), 30)
+
     def test_discover_characters_returns_readable_selector_labels(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -89,6 +115,56 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("AugPath = 'A'", text)
         self.assertIn("AugRank = 15", text)
         self.assertIn("STR +10", text)
+
+    def test_schema_two_uses_exact_embedded_profile_stats(self):
+        bridge = self.bridge()
+        bridge["schema_version"] = 2
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "config" / "addons" / "gearsetbuilder" / "tester_123" / "wsdist_bridge.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(bridge), encoding="utf-8")
+            store = BridgeStore(root)
+            store.load(path)
+            item = store.resolve_profile_item({
+                "item_id": 99999, "name": "Profile-only Hat",
+                "key": "99999|profile|hat", "slots_mask": 1 << 4,
+                "jobs_mask": (1 << 23) - 2, "stats": {"STR": 42},
+                "model_complete": True, "lac": {"Name": "Profile-only Hat"},
+            })
+            self.assertEqual(item["STR"], 42)
+            self.assertEqual(item["Name"], "Profile-only Hat")
+
+    def test_managed_pair_adds_safe_indexed_wsdist_cycle(self):
+        source = (
+            "local sets = { Tp_Default = { Head = 'Old' }, Savage_Default = {}, };\n"
+            "profile.OnLoad = function()\n"
+            "  gcdisplay.CreateCycle('MeleeSet', {[1] = 'Default', [2] = 'Hybrid', [3] = 'Acc'});\n"
+            "end\nreturn profile;\n"
+        )
+        updated = prepare_managed_update(source, {
+            "Tp_WSDist": {"head": {"Name": "New TP"}},
+            "Savage_WSDist": {"body": {"Name": "New WS"}},
+        })
+        self.assertIn("[4] = 'WSDist'", updated)
+        self.assertIn("['Tp_WSDist']", updated)
+        self.assertIn("['Savage_WSDist']", updated)
+        parse_set_entries(updated)
+
+    def test_guided_rename_updates_static_and_dynamic_references(self):
+        source = (
+            "local sets = { Savage_Default = {}, Savage_Acc = {}, };\n"
+            "gFunc.EquipSet(sets.Savage_Default);\n"
+            "gFunc.EquipSet('Savage_' .. gcdisplay.GetCycle('MeleeSet'));\n"
+            "return profile;\n"
+        )
+        updated = prepare_set_renames(source, {
+            "Savage_Default": "SavageBlade_Default",
+            "Savage_Acc": "SavageBlade_Acc",
+        })
+        self.assertIn("sets['SavageBlade_Default']", updated)
+        self.assertIn("'SavageBlade_' ..", updated)
+        self.assertNotIn("Savage_Default", updated)
 
     def test_limbus_base_stats_do_not_inherit_rank_30_models(self):
         records = []

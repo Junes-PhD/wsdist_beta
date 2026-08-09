@@ -244,6 +244,145 @@ def write_set(profile_path: Path, set_name: str, equipment: dict[str, dict], *, 
     return backup, bridge_hash(updated)
 
 
+def prepare_managed_update(source: str, sets: dict[str, dict[str, dict]], *,
+                           add_wsdist_cycle: bool = True) -> str:
+    """Return a validated profile update for an atomic managed-set write."""
+    updated = source
+    for set_name, equipment in sets.items():
+        _, entries, close_index = parse_set_entries(updated)
+        matches = [entry for entry in entries if entry.name == set_name]
+        if len(matches) > 1:
+            raise RuntimeError(f"Profile contains duplicate top-level set name: {set_name}")
+        replacement = serialize_set(set_name, equipment) + ","
+        if matches:
+            entry = matches[0]
+            trailing = 1 if entry.end < len(updated) and updated[entry.end] == "," else 0
+            updated = updated[:entry.start] + replacement + updated[entry.end + trailing:]
+        else:
+            updated = updated[:close_index] + "\n    " + replacement + "\n" + updated[close_index:]
+
+    if add_wsdist_cycle and "'WSDist'" not in updated and '"WSDist"' not in updated:
+        cycle_pattern = re.compile(
+            r"(gcdisplay\.CreateCycle\(\s*['\"]MeleeSet['\"]\s*,\s*\{)(.*?)(\}\s*\)\s*;?)",
+            re.DOTALL,
+        )
+        match = cycle_pattern.search(updated)
+        if match:
+            body = match.group(2).rstrip()
+            separator = " " if body.endswith(",") else ", "
+            explicit = [int(value) for value in re.findall(r"\[(\d+)\]\s*=", body)]
+            field = f"[{max(explicit) + 1}] = 'WSDist'" if explicit else "'WSDist'"
+            replacement = match.group(1) + body + separator + field + match.group(3)
+            updated = updated[:match.start()] + replacement + updated[match.end():]
+        else:
+            initialize = re.search(r"^(?P<indent>\s*)gcinclude\.Initialize\(\)\s*;?", updated, re.MULTILINE)
+            if initialize is None:
+                raise RuntimeError(
+                    "Could not find a safe MeleeSet cycle or gcinclude.Initialize() insertion point."
+                )
+            indent = initialize.group("indent")
+            insertion = (
+                "\n" + indent + "gcdisplay.CreateCycle('MeleeSet', "
+                "{ 'Default', 'Hybrid', 'Acc', 'WSDist' });"
+            )
+            updated = updated[:initialize.end()] + insertion + updated[initialize.end():]
+    parse_set_entries(updated)
+    return updated
+
+
+def write_managed_sets(profile_path: Path, sets: dict[str, dict[str, dict]], *,
+                       expected_hash: str, backup_dir: Path | None = None) -> tuple[Path, str]:
+    """Write a TP/WS managed pair as one backed-up atomic transaction."""
+    profile_path = profile_path.resolve()
+    source = profile_path.read_text(encoding="utf-8")
+    if expected_hash and bridge_hash(source) != expected_hash:
+        raise RuntimeError("LuAshitacast profile changed since WSDist imported it; refresh before saving.")
+    updated = prepare_managed_update(source, sets)
+    backup_dir = backup_dir or profile_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / f"{profile_path.stem}_{__import__('datetime').datetime.now():%Y.%m.%d_%H.%M.%S_%f}.lua"
+    backup.write_text(source, encoding="utf-8", newline="")
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", newline="", dir=profile_path.parent,
+        prefix=profile_path.name + ".", suffix=".tmp", delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.write(updated)
+    os.replace(temporary, profile_path)
+    return backup, bridge_hash(updated)
+
+
+def prepare_set_renames(source: str, renames: dict[str, str]) -> str:
+    """Rename supported top-level sets and their common literal references."""
+    renames = {old: new for old, new in renames.items() if old and new and old != new}
+    if not renames:
+        return source
+    _, entries, _ = parse_set_entries(source)
+    existing = {entry.name for entry in entries}
+    for old, new in renames.items():
+        if old not in existing:
+            raise KeyError(f"Set does not exist: {old}")
+        if new in existing and new not in renames:
+            raise FileExistsError(f"Canonical set name already exists: {new}")
+    if len(set(renames.values())) != len(renames):
+        raise ValueError("Two source sets map to the same canonical name.")
+
+    updated = source
+    for entry in sorted((entry for entry in entries if entry.name in renames),
+                        key=lambda value: value.start, reverse=True):
+        prefix = updated[entry.start:entry.value_start]
+        equals = prefix.rfind("=")
+        if equals < 0:
+            raise ValueError(f"Could not rewrite set key: {entry.name}")
+        updated = (
+            updated[:entry.start] + "[" + _lua_quote(renames[entry.name]) + "] "
+            + prefix[equals:] + updated[entry.value_start:]
+        )
+
+    for old, new in sorted(renames.items(), key=lambda item: len(item[0]), reverse=True):
+        updated = re.sub(rf"\bsets\.{re.escape(old)}\b", f"sets[{_lua_quote(new)}]", updated)
+        for quote in ("'", '"'):
+            updated = updated.replace(f"sets[{quote}{old}{quote}]", f"sets[{_lua_quote(new)}]")
+            updated = updated.replace(f"{quote}{old}{quote}", _lua_quote(new))
+
+    # Dynamic handlers commonly concatenate a family prefix with MeleeSet.
+    family_changes = {}
+    for old, new in renames.items():
+        old_family = old.split("_", 1)[0]
+        new_family = new.split("_", 1)[0]
+        if old_family != new_family:
+            family_changes[old_family + "_"] = new_family + "_"
+    for old_prefix, new_prefix in family_changes.items():
+        updated = updated.replace(_lua_quote(old_prefix), _lua_quote(new_prefix))
+
+    parse_set_entries(updated)
+    for old in renames:
+        if re.search(rf"\bsets\.{re.escape(old)}\b|sets\[['\"]{re.escape(old)}['\"]\]", updated):
+            raise RuntimeError(f"Unresolved reference remains for renamed set: {old}")
+    return updated
+
+
+def write_renamed_profile(profile_path: Path, renames: dict[str, str], *,
+                          expected_hash: str, backup_dir: Path | None = None) -> tuple[Path, str]:
+    profile_path = profile_path.resolve()
+    source = profile_path.read_text(encoding="utf-8")
+    if expected_hash and bridge_hash(source) != expected_hash:
+        raise RuntimeError("LuAshitacast profile changed since WSDist imported it; refresh before saving.")
+    updated = prepare_set_renames(source, renames)
+    backup_dir = backup_dir or profile_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / f"{profile_path.stem}_{__import__('datetime').datetime.now():%Y.%m.%d_%H.%M.%S_%f}.lua"
+    backup.write_text(source, encoding="utf-8", newline="")
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", newline="", dir=profile_path.parent,
+        prefix=profile_path.name + ".", suffix=".tmp", delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.write(updated)
+    os.replace(temporary, profile_path)
+    return backup, bridge_hash(updated)
+
+
 def write_reload_request(bridge_dir: Path, request: dict) -> Path:
     bridge_dir.mkdir(parents=True, exist_ok=True)
     target = bridge_dir / "wsdist_reload_request.json"
