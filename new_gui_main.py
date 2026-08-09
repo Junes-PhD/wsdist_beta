@@ -20,7 +20,7 @@ from pathlib import Path
 from PyQt6.QtCore import QSettings, QSize, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 import actions
+import buffs as buff_data
 import create_player
 import enemies
 import gear
@@ -74,6 +75,9 @@ ALL_WS_NAMES = sorted(
     key=len,
     reverse=True,
 )
+WS_SET_ALIASES = {
+    "aedge": "Aeolian Edge",
+}
 PROFILE_SLOT_MAP = {
     "main": "main", "sub": "sub", "range": "ranged", "ranged": "ranged",
     "ammo": "ammo", "head": "head", "body": "body", "hands": "hands",
@@ -81,11 +85,32 @@ PROFILE_SLOT_MAP = {
     "ear1": "ear1", "ear2": "ear2", "ring1": "ring1", "ring2": "ring2",
     "back": "back",
 }
+WEAPON_SLOTS = ("main", "sub", "ranged", "ammo")
+MAIN_WEAPON_SLOTS = ("main", "sub")
+RANGED_WEAPON_SLOTS = ("ranged", "ammo")
 
 
 def _profile_ws_name(set_name: str) -> str | None:
     lowered = set_name.casefold()
-    return next((name for name in ALL_WS_NAMES if name.casefold() in lowered), None)
+    compact = re.sub(r"[^a-z0-9]+", "", lowered)
+    matched = next(
+        (name for name in ALL_WS_NAMES
+         if re.sub(r"[^a-z0-9]+", "", name.casefold()) in compact),
+        None,
+    )
+    if matched:
+        return matched
+    tokens = set(re.split(r"[^a-z0-9]+", lowered))
+    for alias, name in WS_SET_ALIASES.items():
+        if alias in tokens:
+            return name
+    # Many profiles shorten a WS set to its distinctive first word, such as
+    # Savage_Default or Leaden_Acc. Use that only when it identifies one WS.
+    candidates = {
+        name for name in ALL_WS_NAMES
+        if name.casefold().split()[0] in tokens
+    }
+    return next(iter(candidates)) if len(candidates) == 1 else None
 
 
 def _profile_category(set_name: str) -> str | None:
@@ -97,6 +122,30 @@ def _profile_category(set_name: str) -> str | None:
     if tokens & {"dt", "pdt", "mdt", "damage", "taken", "idle"}:
         return "DT"
     return None
+
+
+def _with_weapon_overlays(payload: dict, main_weapon: dict | None,
+                          ranged_weapon: dict | None) -> dict:
+    """Apply explicitly-selected weapon-set slots over a profile armor set.
+
+    LuAshitacast profiles commonly equip a TP/WS armor set and then a separate
+    main/sub or ranged/ammo set.  Only slots explicitly named by those sets are
+    overlaid, so missing slots remain the armor set's values.
+    """
+    combined = dict(payload["gearset"])
+    for overlay, allowed_slots in ((main_weapon, MAIN_WEAPON_SLOTS),
+                                   (ranged_weapon, RANGED_WEAPON_SLOTS)):
+        if not overlay:
+            continue
+        specified = overlay.get("specified_slots", set())
+        for slot in allowed_slots:
+            if slot in specified:
+                combined[slot] = overlay["gearset"][slot]
+    result = dict(payload)
+    result["gearset"] = combined
+    labels = [entry["name"] for entry in (main_weapon, ranged_weapon) if entry]
+    result["weapon_setup"] = " + ".join(labels) if labels else "As listed"
+    return result
 
 
 def _base_equipment() -> dict[str, list[dict]]:
@@ -388,9 +437,17 @@ class OptimizeThread(QThread):
             self.failed.emit(str(error))
 
 
-def _report_enemy(raw_enemy: dict):
-    enemy = create_player.create_enemy(raw_enemy)
-    enemy.stats["Base Defense"] = raw_enemy["Defense"]
+def _report_enemy(raw_enemy: dict, debuffs: dict | None = None):
+    """Create an enemy after applying the same debuff model as the legacy UI."""
+    source = dict(raw_enemy)
+    base_defense = source["Defense"]
+    for stat, value in (debuffs or {}).items():
+        if stat == "Defense":
+            source[stat] *= 1 - value
+        else:
+            source[stat] = source.get(stat, 0) - value
+    enemy = create_player.create_enemy(source)
+    enemy.stats["Base Defense"] = base_defense
     enemy.stats["Defense"] = max(1, enemy.stats["Defense"])
     enemy.stats["Magic Defense"] = max(-50, enemy.stats["Magic Defense"])
     enemy.stats["Magic Damage Taken"] = enemy.stats.pop("Magic DT%")
@@ -404,11 +461,12 @@ def _evaluate_profile_set(payload: dict, context: dict) -> dict:
             context["main_job"], context["sub_job"], context["master_level"],
             gearset=payload["gearset"], buffs=context["buffs"], abilities=context["abilities"],
         )
-        enemy = _report_enemy(context["enemy"])
+        enemy = _report_enemy(context["enemy"], context.get("debuffs"))
         row = {
             "name": payload["name"], "category": payload["category"] or "WS",
             "ws_name": payload["ws_name"] or "", "tp_dps": "", "time_to_ws": "",
-            "ws_damage": "", "total_dps": "", "error": "",
+            "ws_damage": "", "total_dps": "", "weapon_setup": payload.get("weapon_setup", "As listed"),
+            "error": "",
             "_tp_damage": None, "_tp_return": None, "_attack_time": None,
         }
         if payload["category"] is not None:
@@ -444,7 +502,8 @@ def _evaluate_profile_set(payload: dict, context: dict) -> dict:
         return {
             "name": payload["name"], "category": payload["category"] or "WS",
             "ws_name": payload["ws_name"] or "", "tp_dps": "", "time_to_ws": "",
-            "ws_damage": "", "total_dps": "", "error": str(error),
+            "ws_damage": "", "total_dps": "", "weapon_setup": payload.get("weapon_setup", "As listed"),
+            "error": str(error),
             "_tp_damage": None, "_tp_return": None, "_attack_time": None,
         }
 
@@ -575,6 +634,9 @@ class MainWindow(QMainWindow):
         form.addRow("Weapon skill", self.ws_combo)
         form.addRow("Spell", self.spell_combo)
         self.main_job.currentTextChanged.connect(self._refresh_job_data)
+        self.sub_job.currentTextChanged.connect(self.refresh_quick_stats)
+        self.master_level.valueChanged.connect(self.refresh_quick_stats)
+        self.aftermath.valueChanged.connect(self.refresh_quick_stats)
         layout.addWidget(player)
 
         enemy_box = QGroupBox("Enemy")
@@ -616,6 +678,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._quick_tab(), "Quick Look")
         self.tabs.addTab(self._optimizer_tab(), "Optimizer")
         self.tabs.addTab(self._sets_tab(), "TP / WS Sets")
+        self.tabs.addTab(self._buffs_tab(), "Buffs")
         self.tabs.addTab(self._advanced_tab(), "Advanced")
         self.tabs.addTab(self._profile_report_tab(), "LAC Report")
         layout.addWidget(self.tabs, 1)
@@ -641,7 +704,134 @@ class MainWindow(QMainWindow):
         self.result_label = QLabel("Select equipment, then evaluate an action.")
         self.result_label.setObjectName("sectionTitle")
         layout.addWidget(self.result_label)
+        totals = QGroupBox("Quick Look totals")
+        totals_layout = QVBoxLayout(totals)
+        totals_header = QHBoxLayout()
+        totals_header.addWidget(QLabel(
+            "Uses the selected gear, Buffs tab, and Advanced switches. Haste values use the engine's source caps."
+        ))
+        totals_header.addStretch(1)
+        refresh_totals = QPushButton("Refresh totals")
+        refresh_totals.clicked.connect(self.refresh_quick_stats)
+        totals_header.addWidget(refresh_totals)
+        totals_layout.addLayout(totals_header)
+        self.quick_stats = QPlainTextEdit()
+        self.quick_stats.setReadOnly(True)
+        self.quick_stats.setMinimumHeight(180)
+        self.quick_stats.setMaximumHeight(220)
+        totals_layout.addWidget(self.quick_stats)
+        layout.addWidget(totals)
         return tab
+
+    @staticmethod
+    def _quick_stat_value(value, *, percent: bool = False) -> str:
+        if percent:
+            return f"{float(value) * 100:.1f}%"
+        value = float(value)
+        return f"{value:,.1f}" if value % 1 else f"{value:,.0f}"
+
+    @staticmethod
+    def _pdif_base_cap(skill_type: str, *, ranged: bool = False) -> float | None:
+        if ranged:
+            return 3.5 if skill_type == "Marksmanship" else 3.25 if skill_type == "Archery" else None
+        if skill_type in {"Katana", "Dagger", "Sword", "Axe", "Club"}:
+            return 3.25
+        if skill_type in {"Great Katana", "Hand-to-Hand"}:
+            return 3.5
+        if skill_type in {"Great Sword", "Staff", "Great Axe", "Polearm"}:
+            return 3.75
+        if skill_type == "Scythe":
+            return 4.0
+        return None
+
+    def _quick_stats_text(self, player, enemy) -> str:
+        stats = player.stats
+        gear_haste = min(float(stats.get("Gear Haste", 0)), 0.25)
+        magic_haste = min(float(stats.get("Magic Haste", 0)), 448 / 1024)
+        ja_haste = min(float(stats.get("JA Haste", 0)), 0.25)
+        total_haste = gear_haste + magic_haste + ja_haste
+        pdt_total = max(-50, stats.get("PDT", 0) + stats.get("DT", 0))
+        mdt_total = max(-50, stats.get("MDT", 0) + stats.get("DT", 0))
+
+        def number(name: str) -> str:
+            return self._quick_stat_value(stats.get(name, 0))
+
+        def percent(name: str) -> str:
+            return self._quick_stat_value(stats.get(name, 0) / 100, percent=True)
+
+        main_skill = player.gearset["main"].get("Skill Type", "None")
+        sub_skill = player.gearset["sub"].get("Skill Type", "None")
+        main_hit_cap = 0.99 if main_skill in {"Axe", "Club", "Dagger", "Sword", "Katana", "Hand-to-Hand"} else 0.95
+        sub_hit_cap = 0.99 if sub_skill == "Hand-to-Hand" else 0.95
+        main_hit = actions.get_hit_rate(stats.get("Accuracy1", 0), enemy.stats["Evasion"], main_hit_cap)
+        dual_wield = player.gearset["sub"].get("Type") == "Weapon" or main_skill == "Hand-to-Hand"
+        sub_hit = actions.get_hit_rate(stats.get("Accuracy2", 0), enemy.stats["Evasion"], sub_hit_cap) if dual_wield else 0
+        ranged_accuracy = stats.get("Ranged Accuracy", 0) + 100 * (stats.get("Daken", 0) > 0)
+        ranged_cap = 0.99 if player.abilities.get("Sharpshot", False) else 0.95
+        ranged_hit = actions.get_hit_rate(ranged_accuracy, enemy.stats["Evasion"], ranged_cap)
+
+        pdl_gear = stats.get("PDL", 0) / 100
+        pdl_trait = stats.get("PDL Trait", 0) / 100
+        main_base_cap = self._pdif_base_cap(main_skill)
+        main_ratio = stats.get("Attack1", 0) / max(1, enemy.stats["Defense"])
+        main_pdif_cap = (main_base_cap + pdl_trait) * (1 + pdl_gear) if main_base_cap else None
+        ranged_skill = player.gearset["ranged"].get("Skill Type", "None")
+        if ranged_skill == "None":
+            ranged_skill = player.gearset["ammo"].get("Skill Type", "None")
+        ranged_base_cap = self._pdif_base_cap(ranged_skill, ranged=True)
+        ranged_ratio = stats.get("Ranged Attack", 0) / max(1, enemy.stats["Defense"])
+        ranged_pdif_cap = (ranged_base_cap + pdl_trait) * (1 + pdl_gear) if ranged_base_cap else None
+
+        def ratio_to_cap(ratio: float, cap: float | None) -> str:
+            if cap is None:
+                return "N/A"
+            return f"{ratio:.2f} / {cap:.2f} ({ratio / cap * 100:.1f}% of cap)"
+
+        return "\n".join((
+            "HASTE / DELAY",
+            f"Total haste (source capped): {self._quick_stat_value(total_haste, percent=True)}    "
+            f"Gear: {self._quick_stat_value(gear_haste, percent=True)}    "
+            f"Magic: {self._quick_stat_value(magic_haste, percent=True)}    "
+            f"JA: {self._quick_stat_value(ja_haste, percent=True)}    "
+            f"Delay reduction: {self._quick_stat_value(stats.get('Delay Reduction', 0), percent=True)}",
+            "",
+            "ATTRIBUTES",
+            f"STR {number('STR'):>7}    DEX {number('DEX'):>7}    VIT {number('VIT'):>7}    "
+            f"AGI {number('AGI'):>7}    INT {number('INT'):>7}    MND {number('MND'):>7}    CHR {number('CHR'):>7}",
+            "",
+            "OFFENSE",
+            f"Main Acc {number('Accuracy1'):>7}    Off-hand Acc {number('Accuracy2'):>7}    "
+            f"Main Atk {number('Attack1'):>7}    Off-hand Atk {number('Attack2'):>7}    "
+            f"Rng Acc {number('Ranged Accuracy'):>7}    Rng Atk {number('Ranged Attack'):>7}",
+            f"Magic Acc {number('Magic Accuracy'):>7}    Magic Atk {number('Magic Attack'):>7}    "
+            f"Magic Dmg {number('Magic Damage'):>7}    Store TP {number('Store TP'):>7}",
+            f"Hit rate  Main {self._quick_stat_value(main_hit, percent=True):>7}    "
+            f"Off-hand {self._quick_stat_value(sub_hit, percent=True):>7}    "
+            f"Ranged/Daken {self._quick_stat_value(ranged_hit, percent=True):>7}",
+            "",
+            "pDIF / PDL",
+            f"PDL gear {self._quick_stat_value(pdl_gear, percent=True):>7}    "
+            f"PDL trait {self._quick_stat_value(pdl_trait, percent=True):>7}    "
+            f"Main cRatio / pDIF cap: {ratio_to_cap(main_ratio, main_pdif_cap)}",
+            f"Ranged cRatio / pDIF cap: {ratio_to_cap(ranged_ratio, ranged_pdif_cap)}",
+            "",
+            "DEFENSE / MULTI-ATTACK",
+            f"DT {percent('DT'):>7}    PDT {percent('PDT'):>7}    MDT {percent('MDT'):>7}    "
+            f"Total PDT {self._quick_stat_value(pdt_total / 100, percent=True):>7}    "
+            f"Total MDT {self._quick_stat_value(mdt_total / 100, percent=True):>7}",
+            f"Evasion {number('Evasion'):>7}    Magic Evasion {number('Magic Evasion'):>7}    "
+            f"Magic Defense {number('Magic Defense'):>7}    DA {percent('DA'):>7}    "
+            f"TA {percent('TA'):>7}    QA {percent('QA'):>7}",
+        ))
+
+    def refresh_quick_stats(self, *_args):
+        if not hasattr(self, "quick_stats"):
+            return
+        try:
+            player, enemy, _buffs, _abilities = self._context()
+            self.quick_stats.setPlainText(self._quick_stats_text(player, enemy))
+        except Exception as error:
+            self.quick_stats.setPlainText(f"Unable to calculate totals: {error}")
 
     def _optimizer_tab(self) -> QWidget:
         tab = QWidget()
@@ -737,18 +927,200 @@ class MainWindow(QMainWindow):
         layout.addWidget(simulate)
         return tab
 
+    def _buffs_tab(self) -> QWidget:
+        """Build the structured equivalent of the legacy Active Buffs pane."""
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        note = QLabel(
+            "Enable only buffs currently active. These controls feed the existing "
+            "calculation engine; Advanced JSON remains available for uncommon cases."
+        )
+        note.setWordWrap(True)
+        outer.addWidget(note)
+        content = QWidget()
+        grid = QGridLayout(content)
+
+        whm = QGroupBox("White Magic and food")
+        whm_form = QFormLayout(whm)
+        self.whm_enabled = QCheckBox("Enable White Magic")
+        self.shell_v = QCheckBox("Shell V")
+        self.dia_combo = QComboBox()
+        self.dia_combo.addItems(["None", "Dia", "Dia II", "Dia III"])
+        self.haste_combo = QComboBox()
+        self.haste_combo.addItems(["None", "Haste", "Haste II"])
+        self.boost_combo = QComboBox()
+        self.boost_combo.addItems(["None", *[f"Boost-{stat}" for stat in (
+            "STR", "DEX", "VIT", "AGI", "MND", "INT", "CHR",
+        )]])
+        self.storm_combo = QComboBox()
+        self.storm_combo.addItems(["None", *buff_data.storm_spells])
+        self.enhancing_skill = QSpinBox()
+        self.enhancing_skill.setRange(0, 999)
+        self.enhancing_skill.setValue(500)
+        self.food_combo = QComboBox()
+        self.food_combo.addItems(["None", *sorted(gear.all_food)])
+        whm_form.addRow(self.whm_enabled)
+        whm_form.addRow(self.shell_v)
+        whm_form.addRow("Dia", self.dia_combo)
+        whm_form.addRow("Haste", self.haste_combo)
+        whm_form.addRow("Boost", self.boost_combo)
+        whm_form.addRow("Storm", self.storm_combo)
+        whm_form.addRow("Enhancing skill", self.enhancing_skill)
+        whm_form.addRow("Food", self.food_combo)
+        grid.addWidget(whm, 0, 0)
+
+        bard = QGroupBox("Bard songs")
+        bard_form = QFormLayout(bard)
+        self.bard_enabled = QCheckBox("Enable Bard songs")
+        self.song_bonus = QSpinBox()
+        self.song_bonus.setRange(0, 9)
+        self.song_bonus.setPrefix("Songs +")
+        self.song_combos = []
+        bard_form.addRow(self.bard_enabled)
+        bard_form.addRow("Instrument bonus", self.song_bonus)
+        song_names = ["None", *buff_data.brd]
+        for index in range(5):
+            combo = QComboBox()
+            combo.addItems(song_names)
+            combo.currentTextChanged.connect(lambda _text, current=combo: self._clear_duplicate_combo(
+                current, self.song_combos
+            ))
+            self.song_combos.append(combo)
+            bard_form.addRow(f"Song {index + 1}", combo)
+        self.marcato = QCheckBox("Marcato (song 1)")
+        self.soul_voice = QCheckBox("Soul Voice")
+        self.marcato.toggled.connect(lambda enabled: enabled and self.soul_voice.setChecked(False))
+        self.soul_voice.toggled.connect(lambda enabled: enabled and self.marcato.setChecked(False))
+        bard_form.addRow(self.marcato)
+        bard_form.addRow(self.soul_voice)
+        grid.addWidget(bard, 0, 1)
+
+        corsair = QGroupBox("Corsair rolls")
+        cor_form = QFormLayout(corsair)
+        self.cor_enabled = QCheckBox("Enable Corsair rolls")
+        self.roll_bonus = QSpinBox()
+        self.roll_bonus.setRange(0, 8)
+        self.roll_bonus.setPrefix("Rolls +")
+        cor_form.addRow(self.cor_enabled)
+        cor_form.addRow("Roll bonus", self.roll_bonus)
+        self.roll_combos = []
+        self.roll_potencies = []
+        roll_names = ["None", *[f"{name} Roll" for name in buff_data.cor]]
+        for index in range(4):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            potency = QComboBox()
+            potency.addItems(["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI"])
+            potency.setCurrentText("IX")
+            combo = QComboBox()
+            combo.addItems(roll_names)
+            combo.currentTextChanged.connect(lambda _text, current=combo: self._clear_duplicate_combo(
+                current, self.roll_combos
+            ))
+            row_layout.addWidget(potency)
+            row_layout.addWidget(combo, 1)
+            self.roll_potencies.append(potency)
+            self.roll_combos.append(combo)
+            cor_form.addRow(f"Roll {index + 1}", row)
+        self.crooked_cards = QCheckBox("Crooked Cards (rolls 1 and 3)")
+        self.cor_job_bonus = QCheckBox("COR job bonus")
+        self.light_shot = QCheckBox("Light Shot on Dia")
+        cor_form.addRow(self.crooked_cards)
+        cor_form.addRow(self.cor_job_bonus)
+        cor_form.addRow(self.light_shot)
+        grid.addWidget(corsair, 1, 0)
+
+        geo = QGroupBox("Geomancy bubbles")
+        geo_form = QFormLayout(geo)
+        self.geo_enabled = QCheckBox("Enable Geomancy")
+        self.geo_bonus = QSpinBox()
+        self.geo_bonus.setRange(0, 10)
+        self.geo_bonus.setPrefix("Geomancy +")
+        bubble_names = ["None", *sorted(set(buff_data.geo) | set(buff_data.geo_debuffs))]
+        self.indi_combo = QComboBox()
+        self.geo_combo = QComboBox()
+        self.entrust_combo = QComboBox()
+        for combo, prefix in ((self.indi_combo, "Indi-"), (self.geo_combo, "Geo-"),
+                              (self.entrust_combo, "Entrust-")):
+            combo.addItems(["None", *[prefix + name for name in bubble_names[1:]]])
+            combo.currentTextChanged.connect(self._clear_duplicate_bubbles)
+        self.geo_potency = QSpinBox()
+        self.geo_potency.setRange(0, 100)
+        self.geo_potency.setValue(100)
+        self.geo_potency.setSuffix("%")
+        self.blaze_of_glory = QCheckBox("Blaze of Glory (Geo only)")
+        self.bolster = QCheckBox("Bolster (Indi and Geo)")
+        self.blaze_of_glory.toggled.connect(lambda enabled: enabled and self.bolster.setChecked(False))
+        self.bolster.toggled.connect(lambda enabled: enabled and self.blaze_of_glory.setChecked(False))
+        geo_form.addRow(self.geo_enabled)
+        geo_form.addRow("Geomancy bonus", self.geo_bonus)
+        geo_form.addRow("Indi", self.indi_combo)
+        geo_form.addRow("Geo", self.geo_combo)
+        geo_form.addRow("Entrust", self.entrust_combo)
+        geo_form.addRow("Debuff potency", self.geo_potency)
+        geo_form.addRow(self.blaze_of_glory)
+        geo_form.addRow(self.bolster)
+        grid.addWidget(geo, 1, 1)
+
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+        for control in (
+            self.whm_enabled, self.shell_v, self.dia_combo, self.haste_combo,
+            self.boost_combo, self.storm_combo, self.enhancing_skill, self.food_combo,
+            self.bard_enabled, self.song_bonus, *self.song_combos, self.marcato,
+            self.soul_voice, self.cor_enabled, self.roll_bonus, *self.roll_combos,
+            *self.roll_potencies, self.crooked_cards, self.cor_job_bonus,
+            self.light_shot, self.geo_enabled, self.geo_bonus, self.indi_combo,
+            self.geo_combo, self.entrust_combo, self.geo_potency,
+            self.blaze_of_glory, self.bolster,
+        ):
+            if isinstance(control, QCheckBox):
+                control.toggled.connect(self.refresh_quick_stats)
+            elif isinstance(control, QSpinBox):
+                control.valueChanged.connect(self.refresh_quick_stats)
+            else:
+                control.currentTextChanged.connect(self.refresh_quick_stats)
+        return tab
+
+    @staticmethod
+    def _clear_duplicate_combo(current: QComboBox, combos: list[QComboBox]):
+        value = current.currentText()
+        if value == "None":
+            return
+        for combo in combos:
+            if combo is not current and combo.currentText() == value:
+                combo.setCurrentText("None")
+
+    def _clear_duplicate_bubbles(self, _value: str):
+        combos = (self.indi_combo, self.geo_combo, self.entrust_combo)
+        selected: set[str] = set()
+        for combo in combos:
+            value = combo.currentText().split("-", 1)[-1]
+            if value == "None":
+                continue
+            if value in selected:
+                combo.setCurrentText("None")
+            else:
+                selected.add(value)
+
     def _advanced_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         self.buffs_json = QPlainTextEdit("{}")
         self.abilities_json = QPlainTextEdit("{}")
-        layout.addWidget(QLabel("Buff sources (JSON object)"))
+        layout.addWidget(QLabel("Additional buff sources (JSON object)"))
         layout.addWidget(self.buffs_json, 1)
         layout.addWidget(QLabel("Abilities / special toggles (JSON object)"))
         layout.addWidget(self.abilities_json, 1)
         note = QLabel(
-            "These dictionaries feed the existing engine directly for buffs "
-            "and switches not yet promoted to dedicated controls."
+            "Additional sources are added to the structured Buffs tab. Use this "
+            "for buffs and switches not yet promoted to dedicated controls."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -774,9 +1146,25 @@ class MainWindow(QMainWindow):
         self.profile_report_status = QLabel("Load a character bridge to inspect its LuAshitacast profiles.")
         self.profile_report_status.setWordWrap(True)
         layout.addWidget(self.profile_report_status)
-        self.profile_report_table = QTableWidget(0, 7)
+        weapon_sets = QGroupBox("Profile weapon overlays")
+        weapon_form = QFormLayout(weapon_sets)
+        self.report_main_weapon_combo = QComboBox()
+        self.report_ranged_weapon_combo = QComboBox()
+        self.report_main_weapon_combo.currentIndexChanged.connect(self._profile_weapon_changed)
+        self.report_ranged_weapon_combo.currentIndexChanged.connect(self._profile_weapon_changed)
+        weapon_form.addRow("Main / sub weapon set", self.report_main_weapon_combo)
+        weapon_form.addRow("Ranged / ammo set", self.report_ranged_weapon_combo)
+        weapon_note = QLabel(
+            "Use these when the profile equips armor and weapons in separate sets. "
+            "Only explicitly listed weapon slots replace the armor set."
+        )
+        weapon_note.setWordWrap(True)
+        weapon_form.addRow(weapon_note)
+        layout.addWidget(weapon_sets)
+
+        self.profile_report_table = QTableWidget(0, 8)
         self.profile_report_table.setHorizontalHeaderLabels(
-            ["Set", "Type", "Matched WS", "TP DPS", "Time to WS", "WS Damage", "Total DPS"]
+            ["Set", "Type", "Matched WS", "Weapon setup", "TP DPS", "Time to WS", "WS Damage", "Total DPS"]
         )
         self.profile_report_table.setAlternatingRowColors(True)
         self.profile_report_table.setSortingEnabled(True)
@@ -821,14 +1209,14 @@ class MainWindow(QMainWindow):
             name = str(profile_set.get("name") or "Unnamed")
             category = _profile_category(name)
             ws_name = _profile_ws_name(name)
-            if category is None and ws_name is None:
-                continue
             gearset = {slot: gear.Empty for slot in SLOTS}
+            specified_slots = set()
             missing = []
             for profile_slot, item_ref in (profile_set.get("slots") or {}).items():
                 slot = PROFILE_SLOT_MAP.get(str(profile_slot).casefold())
                 if slot is None or not item_ref:
                     continue
+                specified_slots.add(slot)
                 item = self.bridge_store.resolve_profile_item(item_ref)
                 if item is None:
                     item_name_text = str(item_ref.get("name") or item_ref.get("Name") or "")
@@ -841,9 +1229,11 @@ class MainWindow(QMainWindow):
                     missing.append(str(profile_slot))
                 else:
                     gearset[slot] = item
+            if category is None and ws_name is None and not (specified_slots & set(WEAPON_SLOTS)):
+                continue
             payloads.append({
                 "name": name, "category": category, "ws_name": ws_name,
-                "gearset": gearset, "missing": missing,
+                "gearset": gearset, "specified_slots": specified_slots, "missing": missing,
             })
         return payloads
 
@@ -869,19 +1259,38 @@ class MainWindow(QMainWindow):
         payloads = self._profile_payloads()
         self.report_tp_combo.blockSignals(True)
         self.report_ws_set_combo.blockSignals(True)
+        self.report_main_weapon_combo.blockSignals(True)
+        self.report_ranged_weapon_combo.blockSignals(True)
+        current_main_weapon = self.report_main_weapon_combo.currentText()
+        current_ranged_weapon = self.report_ranged_weapon_combo.currentText()
         self.report_tp_combo.clear()
         self.report_ws_set_combo.clear()
+        self.report_main_weapon_combo.clear()
+        self.report_ranged_weapon_combo.clear()
+        self.report_main_weapon_combo.addItem("None (use gear set as listed)", None)
+        self.report_ranged_weapon_combo.addItem("None (use gear set as listed)", None)
         for payload in payloads:
             if payload["category"] is not None:
                 self.report_tp_combo.addItem(payload["name"], payload)
             if payload["ws_name"]:
                 self.report_ws_set_combo.addItem(payload["name"], payload)
+            if set(payload["specified_slots"]) & set(MAIN_WEAPON_SLOTS):
+                self.report_main_weapon_combo.addItem(payload["name"], payload)
+            if set(payload["specified_slots"]) & set(RANGED_WEAPON_SLOTS):
+                self.report_ranged_weapon_combo.addItem(payload["name"], payload)
+        if current_main_weapon:
+            self.report_main_weapon_combo.setCurrentText(current_main_weapon)
+        if current_ranged_weapon:
+            self.report_ranged_weapon_combo.setCurrentText(current_ranged_weapon)
         self.report_tp_combo.blockSignals(False)
         self.report_ws_set_combo.blockSignals(False)
+        self.report_main_weapon_combo.blockSignals(False)
+        self.report_ranged_weapon_combo.blockSignals(False)
         self._refresh_selected_report_sets()
-        if payloads:
+        reportable_count = sum(1 for payload in payloads if payload["category"] is not None or payload["ws_name"])
+        if reportable_count:
             self.profile_report_status.setText(
-                f"Found {len(payloads)} TP, DT, hybrid, or weapon-skill sets."
+                f"Found {reportable_count} TP, DT, hybrid, or weapon-skill sets. Select weapon overlays before running."
             )
         else:
             self.profile_report_status.setText(
@@ -897,36 +1306,149 @@ class MainWindow(QMainWindow):
             self.report_ws_name_combo.setCurrentText(payload["ws_name"])
         self.report_ws_name_combo.blockSignals(False)
 
-    def _report_context(self) -> dict:
-        buffs = self._json_object(self.buffs_json, "Buffs")
+    def _effective_profile_payload(self, payload: dict | None) -> dict | None:
+        if not payload:
+            return None
+        return _with_weapon_overlays(
+            payload, self.report_main_weapon_combo.currentData(),
+            self.report_ranged_weapon_combo.currentData(),
+        )
+
+    def _profile_weapon_changed(self, *_args):
+        self._refresh_selected_report_sets()
+        if self.profile_job_combo.currentText():
+            self.profile_report_status.setText(
+                "Weapon overlay changed. Run the report again to evaluate the selected setup."
+            )
+
+    @staticmethod
+    def _add_stats(target: dict, values: dict, multiplier: float = 1.0):
+        for stat, value in values.items():
+            target[stat] = target.get(stat, 0) + multiplier * value
+
+    def _structured_buffs(self) -> tuple[dict, dict]:
+        """Translate the Buffs tab to the legacy engine's source dictionaries."""
+        sources = {"brd": {}, "cor": {}, "geo": {}, "whm": {}, "food": {}}
+        debuffs: dict[str, float] = {}
+
+        if self.bard_enabled.isChecked():
+            bonus = self.song_bonus.value()
+            soul_voice = 2.0 if self.soul_voice.isChecked() else 1.0
+            for index, combo in enumerate(self.song_combos):
+                name = combo.currentText()
+                if name not in buff_data.brd:
+                    continue
+                marcato = 1.5 if index == 0 and self.marcato.isChecked() else 1.0
+                limit = buff_data.brd_song_limits[name]
+                for stat, values in buff_data.brd[name].items():
+                    amount = soul_voice * marcato * (values[0] + min(limit, bonus) * values[1])
+                    if "minuet" in name.casefold() and stat in {"Attack", "Ranged Attack"}:
+                        amount += 20
+                    sources["brd"][stat] = sources["brd"].get(stat, 0) + amount
+            for stat in ("Attack", "Ranged Attack"):
+                if stat in sources["brd"]:
+                    sources["brd"][stat] = int(sources["brd"][stat])
+
+        if self.cor_enabled.isChecked():
+            bonus = self.roll_bonus.value()
+            for index, (combo, potency) in enumerate(zip(self.roll_combos, self.roll_potencies)):
+                name = combo.currentText().removesuffix(" Roll")
+                if name not in buff_data.cor:
+                    continue
+                crooked = 1.2 if index in (0, 2) and self.crooked_cards.isChecked() else 1.0
+                for stat, values in buff_data.cor[name].items():
+                    job_bonus = values[2] if self.cor_job_bonus.isChecked() else 0
+                    amount = crooked * (values[0][potency.currentText()] + bonus * values[1] + job_bonus)
+                    sources["cor"][stat] = sources["cor"].get(stat, 0) + amount
+
+        if self.geo_enabled.isChecked():
+            for combo, slot in ((self.indi_combo, "indi"), (self.geo_combo, "geo"),
+                                (self.entrust_combo, "entrust")):
+                name = combo.currentText().split("-", 1)[-1]
+                if name == "None":
+                    continue
+                bonus = self.geo_bonus.value() if slot != "entrust" else 0
+                bolster = 2.0 if slot != "entrust" and self.bolster.isChecked() else 1.0
+                blaze = 1.5 if slot == "geo" and self.blaze_of_glory.isChecked() else 1.0
+                multiplier = bolster * blaze
+                if name in buff_data.geo:
+                    for stat, values in buff_data.geo[name].items():
+                        amount = multiplier * (values[0] + bonus * values[1])
+                        sources["geo"][stat] = sources["geo"].get(stat, 0) + amount
+                if name in buff_data.geo_debuffs:
+                    for stat, values in buff_data.geo_debuffs[name].items():
+                        amount = multiplier * (values[0] + bonus * values[1])
+                        amount *= self.geo_potency.value() / 100
+                        debuffs[stat] = debuffs.get(stat, 0) + amount
+
+        if self.whm_enabled.isChecked():
+            for name in (self.dia_combo.currentText(), self.haste_combo.currentText(),
+                         self.boost_combo.currentText(), self.storm_combo.currentText()):
+                if name in buff_data.whm:
+                    self._add_stats(sources["whm"], buff_data.whm[name])
+                if name in buff_data.whm_debuffs:
+                    self._add_stats(debuffs, buff_data.whm_debuffs[name])
+            if self.shell_v.isChecked():
+                self._add_stats(sources["whm"], buff_data.whm["Shell V"])
+            if self.cor_enabled.isChecked() and self.light_shot.isChecked() and self.dia_combo.currentText() in buff_data.whm_debuffs:
+                self._add_stats(debuffs, buff_data.cor_debuffs["Light Shot"])
+
+        food_name = self.food_combo.currentText()
+        if food_name in gear.all_food:
+            for stat, value in gear.all_food[food_name].items():
+                if stat not in {"Name", "Name2", "Type"}:
+                    key = "Food Attack" if stat == "Attack" else "Food Ranged Attack" if stat == "Ranged Attack" else stat
+                    sources["food"][key] = sources["food"].get(key, 0) + value
+        return sources, debuffs
+
+    @staticmethod
+    def _merge_buff_sources(structured: dict, custom: dict) -> dict:
+        merged = {source: dict(values) for source, values in structured.items()}
+        for source, values in custom.items():
+            if not isinstance(values, dict):
+                raise ValueError("Each additional buff source must be a JSON object of stats.")
+            target = merged.setdefault(str(source), {})
+            for stat, value in values.items():
+                if not isinstance(value, (int, float)):
+                    raise ValueError(f"Additional buff {source}.{stat} must be numeric.")
+                target[stat] = target.get(stat, 0) + value
+        return merged
+
+    def _report_context(self, use_profile_job: bool = False) -> dict:
+        structured, debuffs = self._structured_buffs()
+        buffs = self._merge_buff_sources(structured, self._json_object(self.buffs_json, "Additional buffs"))
         abilities = self._json_object(self.abilities_json, "Abilities")
         abilities.setdefault("Aftermath", self.aftermath.value())
-        abilities.setdefault("Enhancing Skill", 0)
+        abilities.setdefault("Enhancing Skill", self.enhancing_skill.value())
+        abilities.setdefault("Storm spell", self.storm_combo.currentText() if self.whm_enabled.isChecked() else "None")
         abilities.setdefault("Enemy Resist Rank", "100%")
         abilities.setdefault("99999", False)
+        main_job_name = self.profile_job_combo.currentText() if use_profile_job else self.main_job.currentText()
         return {
-            "main_job": JOBS[self.main_job.currentText()],
+            "main_job": JOBS[main_job_name],
             "sub_job": JOBS.get(self.sub_job.currentText(), "None"),
             "master_level": self.master_level.value(), "buffs": buffs,
             "abilities": abilities,
             "enemy": {name: spin.value() for name, spin in self.enemy_spins.items()},
-            "tp_value": self.tp_value.value(),
+            "debuffs": debuffs, "tp_value": self.tp_value.value(),
         }
 
     def run_profile_report(self):
         if self.report_thread and self.report_thread.isRunning():
             return
-        payloads = self._profile_payloads()
+        payloads = [payload for payload in self._profile_payloads()
+                    if payload["category"] is not None or payload["ws_name"]]
         if not payloads:
             QMessageBox.information(self, "LAC report", "No reportable sets were found for this profile.")
             return
         try:
-            context = self._report_context()
+            context = self._report_context(use_profile_job=True)
         except Exception as error:
             QMessageBox.critical(self, "LAC report", str(error))
             return
         self.profile_report_table.setRowCount(0)
         self.profile_report_status.setText("Running profile report…")
+        payloads = [self._effective_profile_payload(payload) for payload in payloads]
         self.report_thread = ProfileReportThread(payloads, context, self)
         self.report_thread.progress.connect(self.profile_report_status.setText)
         self.report_thread.succeeded.connect(self._profile_report_done)
@@ -947,7 +1469,8 @@ class MainWindow(QMainWindow):
             self.profile_report_table.insertRow(index)
             values = [
                 row["name"], row["category"], row["ws_name"] or "—",
-                self._report_value(row["tp_dps"]), self._report_value(row["time_to_ws"]),
+                row["weapon_setup"], self._report_value(row["tp_dps"]),
+                self._report_value(row["time_to_ws"]),
                 self._report_value(row["ws_damage"], 0), self._report_value(row["total_dps"]),
             ]
             for column, value in enumerate(values):
@@ -967,14 +1490,14 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "LAC report", message)
 
     def run_selected_profile_report(self):
-        tp_payload = self.report_tp_combo.currentData()
-        ws_payload = self.report_ws_set_combo.currentData()
+        tp_payload = self._effective_profile_payload(self.report_tp_combo.currentData())
+        ws_payload = self._effective_profile_payload(self.report_ws_set_combo.currentData())
         ws_name = self.report_ws_name_combo.currentText().strip()
         if not tp_payload or not ws_payload or not ws_name:
             QMessageBox.information(self, "LAC report", "Select a TP/DT/hybrid set, WS set, and weapon skill.")
             return
         try:
-            context = self._report_context()
+            context = self._report_context(use_profile_job=True)
             tp_row = _evaluate_profile_set(
                 {**tp_payload, "category": tp_payload["category"], "ws_name": None}, context
             )
@@ -1076,6 +1599,7 @@ class MainWindow(QMainWindow):
             for editor in (self.quick_set, self.tp_set, self.ws_set):
                 editor.refresh_icons()
             self._populate_profile_report()
+            self.refresh_quick_stats()
             self.statusBar().showMessage(f"Loaded {label}", 5000)
         except Exception as error:
             QMessageBox.critical(self, "Character bridge", str(error))
@@ -1101,6 +1625,7 @@ class MainWindow(QMainWindow):
             self.spell_combo.setCurrentText(current)
         self._reset_invalid_equipment()
         self._refresh_ws_choices()
+        self.refresh_quick_stats()
 
     def _gear_changed(self):
         for slot in SLOTS:
@@ -1109,6 +1634,7 @@ class MainWindow(QMainWindow):
                 self.candidates[slot].add(name)
                 self._update_candidate_button(slot)
         self._refresh_ws_choices()
+        self.refresh_quick_stats()
 
     def _refresh_ws_choices(self):
         current = self.ws_combo.currentText()
@@ -1145,24 +1671,16 @@ class MainWindow(QMainWindow):
         return value
 
     def _context(self, gearset: dict | None = None):
-        buffs = self._json_object(self.buffs_json, "Buffs")
-        abilities = self._json_object(self.abilities_json, "Abilities")
-        abilities.setdefault("Aftermath", self.aftermath.value())
-        abilities.setdefault("Enhancing Skill", 0)
-        abilities.setdefault("Enemy Resist Rank", "100%")
-        abilities.setdefault("99999", False)
+        context = self._report_context()
+        buffs = context["buffs"]
+        abilities = context["abilities"]
         player = create_player.create_player(
             JOBS[self.main_job.currentText()],
             JOBS.get(self.sub_job.currentText(), "None"),
             self.master_level.value(), gearset=gearset or self.quick_set.items,
             buffs=buffs, abilities=abilities,
         )
-        raw_enemy = {name: spin.value() for name, spin in self.enemy_spins.items()}
-        enemy = create_player.create_enemy(raw_enemy)
-        enemy.stats["Base Defense"] = raw_enemy["Defense"]
-        enemy.stats["Defense"] = max(1, enemy.stats["Defense"])
-        enemy.stats["Magic Defense"] = max(-50, enemy.stats["Magic Defense"])
-        enemy.stats["Magic Damage Taken"] = enemy.stats.pop("Magic DT%")
+        enemy = _report_enemy(context["enemy"], context["debuffs"])
         return player, enemy, buffs, abilities
 
     def _ws_type(self) -> str:
@@ -1202,6 +1720,7 @@ class MainWindow(QMainWindow):
                 )
                 text = f"Time per WS: {output[0]:,.3f}s    TP per round: {output[1][1]:,.1f}"
             self.result_label.setText(text)
+            self.quick_stats.setPlainText(self._quick_stats_text(player, enemy))
         except Exception as error:
             QMessageBox.critical(self, "Evaluation failed", str(error))
 
