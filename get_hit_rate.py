@@ -4,6 +4,7 @@ File containing calculations for physical hit rate from the accuracy stat.
 Author: Kastra (Asura server)
 '''
 from numba_compat import njit
+import math
 
 @njit(cache=True)
 def get_hit_rate(player_accuracy, enemy_evasion, hit_rate_cap):
@@ -12,7 +13,7 @@ def get_hit_rate(player_accuracy, enemy_evasion, hit_rate_cap):
     # https://www.bg-wiki.com/ffxi/Hit_Rate
     # The first main- and sub-hits gain +100 accuracy (https://www.bg-wiki.com/ffxi/Category:Weapon_Skills), which was added on the function call in the main code.
     #        
-    hit_rate = (75 + 0.5*(player_accuracy - enemy_evasion))/100
+    hit_rate = (75 + math.floor((player_accuracy - enemy_evasion)/2))/100
 
     hit_rate_floor = 0.2 # Melee WSs have a 20% hit rate floor.
     # I'm also using a floor of 20% for ranged WS to allow the code to recover from starting at 0% hit rate.

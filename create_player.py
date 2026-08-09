@@ -64,17 +64,33 @@ def damage_taken_totals(gearset, buffs=None, item_cache=None):
 
 
 def damage_taken_from_totals(totals, main_item, abilities=None):
-    """Apply PDT/MDT caps and main-hand aftermath to precomputed totals."""
+    """Apply PDT/MDT caps and main-hand aftermath to precomputed totals.
+
+    DT is an all-damage reduction term: the same DT value is added to both
+    the physical and magical totals before their individual 50% caps apply.
+    Keeping that combination here gives the optimizer and the UI one shared
+    source of truth.
+    """
     values = dict(zip(_DAMAGE_TAKEN_STATS, totals))
     abilities = abilities or {}
     if abilities.get("Aftermath", 0) > 0 and main_item.get("Name") in ("Bravura", "Claustrum"):
         values["DT"] -= 20
 
-    pdt = max(-50, values["PDT"] + values["DT"])
-    mdt = max(-50, values["MDT"] + values["DT"])
+    combined_dt = values["DT"]
+    pdt = max(-50, values["PDT"] + combined_dt)
+    mdt = max(-50, values["MDT"] + combined_dt)
     pdt += values["PDT2"] + values["DT2"]
     mdt += values["MDT2"] + values["DT2"]
     return pdt, mdt
+
+
+def damage_taken_dt_from_totals(totals, main_item, abilities=None):
+    """Return the standalone DT total used by an optimizer DT requirement."""
+    values = dict(zip(_DAMAGE_TAKEN_STATS, totals))
+    abilities = abilities or {}
+    if abilities.get("Aftermath", 0) > 0 and main_item.get("Name") in ("Bravura", "Claustrum"):
+        values["DT"] -= 20
+    return max(-50, values["DT"]) + values["DT2"]
 
 
 def calculate_damage_taken(gearset, buffs=None, abilities=None, item_cache=None):
@@ -113,15 +129,24 @@ class create_player:
     #    abilities
     #    stats
     #
-    def __init__(self, main_job, sub_job, master_level=20, gearset={}, buffs={}, abilities={},):
+    def __init__(self, main_job, sub_job, master_level=20, gearset=None, buffs=None, abilities=None,):
         #
         #
         #
         self.main_job = main_job.lower()
         self.sub_job = sub_job.lower()
-        self.gearset = gearset
-        self.buffs = buffs
-        self.abilities = abilities
+        # Player construction derives a few values from equipment.  Keep those
+        # calculations isolated from the catalog and GUI dictionaries supplied
+        # by callers so one player can never alter another player's equipment.
+        self.gearset = {
+            slot: dict(item) if isinstance(item, dict) else item
+            for slot, item in (gearset or {}).items()
+        }
+        self.buffs = {
+            source: dict(values) if isinstance(values, dict) else values
+            for source, values in (buffs or {}).items()
+        }
+        self.abilities = dict(abilities or {})
         self.master_level = 50 if master_level > 50 else 0 if master_level < 0 else master_level
 
         self.main_job_level = 99 # Assume Lv99 main job for now, but leave room to expand to arbitrary main jobs level later.
@@ -183,7 +208,8 @@ class create_player:
         # Off-hand attack uses STR/2
         main_skill = self.gearset["main"].get("Skill Type","None") + " Skill"
         sub_skill = self.gearset["sub"].get("Skill Type","None") + " Skill"
-        self.stats["Attack1"] = 8 + self.stats.get(main_skill, 0) + self.stats["STR"] + self.stats.get("Attack",0) + self.stats.get(f"main {main_skill}", 0)
+        main_str_attack = int(0.75*self.stats["STR"]) if self.gearset["main"].get("Skill Type") == "Hand-to-Hand" else self.stats["STR"]
+        self.stats["Attack1"] = 8 + self.stats.get(main_skill, 0) + main_str_attack + self.stats.get("Attack",0) + self.stats.get(f"main {main_skill}", 0)
         self.stats["Attack2"] = 8 + self.stats.get(sub_skill, 0) + int(0.5*self.stats["STR"]) + self.stats.get("Attack",0) + self.stats.get(f"sub {sub_skill}",0)
 
         # Update Ranged Attack
@@ -264,7 +290,6 @@ class create_player:
         if self.gearset["main"]["Skill Type"] == "Hand-to-Hand":
             self.stats["Attack2"] = self.stats["Attack1"] - 0.5*self.stats["STR"]*(1+self.stats.get("Attack%",0))*0 # The off-hand H2H Attack might use STR/2 like normal weapons. This is ignored in the main code where I simply set attack1 = attack2 before calculating H2H damage.
             self.stats["Accuracy2"] = self.stats["Accuracy1"]
-            self.gearset["sub"]["Skill Type"] = self.gearset["main"]["Skill Type"]
             base_dmg = 3 + int((self.stats.get("Hand-to-Hand Skill",0) + self.stats.get("main Hand-to-Hand Skill",0))*0.11)
             self.stats["DMG1"] = base_dmg + self.stats["DMG1"]
             self.stats["DMG2"] = self.stats["DMG1"]

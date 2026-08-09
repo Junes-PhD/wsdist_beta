@@ -237,6 +237,11 @@ def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric,
 
     ta_dmg = player.stats.get("TA Damage%",0)/100
     da_dmg = player.stats.get("DA Damage%",0)/100
+    # Dynamis-D Path A weapons such as Sagitta have a chance to double the
+    # damage of the first auto-attack hit made by that main-hand weapon.  This
+    # is separate from Double Attack and does not apply to WSs, off-hand hits,
+    # kicks, or ranged attacks.
+    double_damage = max(0.0, min(1.0, float(player.stats.get("Double Damage", 0)) / 100))
 
     pdl_gear = player.stats.get("PDL",0)/100
     pdl_trait = player.stats.get("PDL Trait",0)/100
@@ -435,6 +440,7 @@ def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric,
                                                                                             * (1.0 + 2.0*(np.random.uniform()<0.3 and player.gearset["main"]["Name2"] in prime_weapons3)) \
                                                                                             * (1.0 + 1.0*(np.random.uniform()<0.3 and player.gearset["main"]["Name2"] in prime_weapons2)) \
                                                                                             * (1.0 + 2.0*(np.random.uniform() < empyrean_am[aftermath-1] and player.gearset["main"]["Name"] in empyrean_weapons and aftermath>0)) \
+                                                                                            * (1.0 + 1.0*(np.random.uniform() < double_damage)) \
                                                                                             * (1 + da_dmg*da_proc_main) * (1 + ta_dmg*ta_proc_main) # Boosts first hit damage if DA or TA procs and you have DA/TA Damage+ stat
             main_hit_damage += phys_dmg_ph
             tp_ph = get_tp(1, mdelay/2 if (main_skill_type == "Hand-to-Hand") else mdelay, stp) # Add TP return from the main-hand hit
@@ -1034,6 +1040,7 @@ def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric,
         first_main_hit_damage *= relic_hidden_damage_bonus # Hidden relic damage only applies to the first main-hand hit.
         first_main_hit_damage *= empyrean_am_damage_bonus
         first_main_hit_damage *= prime_hidden_damage_bonus
+        first_main_hit_damage *= (1 + double_damage)
 
         # Adds the extra damage gained by those bonuses to the first hit's damage.
         physical_damage += (first_main_hit_damage*hit_rate11 - main_hit_damage*hit_rate11)
@@ -1216,12 +1223,12 @@ def cast_spell(player, enemy, spell_name, spell_type, input_metric):
         affinity = 1 + 0.05*player.stats.get(f"{element} Affinity",0) + 0.05*(player.stats.get(f"{element} Affinity",0)>0) # Elemental Affinity Bonus. Only really applies to Magian Trial staves. Archon Ring is different.
         element_magic_attack_bonus = 1 + (player.stats.get(f"{element.capitalize()} Elemental Bonus", 0)/100 + player.stats.get("Elemental Bonus",0)/100) # Archon Ring, Pixie Hairpin +1, Orpheus, and more get their own (1+matk)/(1+mdef) terms.
 
-        magic_multiplier = resist_state*magic_attack_ratio*element_magic_attack_bonus*dayweather_bonus*(1-enemy_mdt/100)*affinity*magic_crit_rate2
+        magic_multiplier = resist_state*magic_attack_ratio*element_magic_attack_bonus*dayweather_bonus*(1+enemy_mdt/100)*affinity*magic_crit_rate2
 
         base_damage = int(((ranged_dmg+ammo_dmg)*2 + quick_draw_damage) * (1 + player.stats.get("Quick Draw Damage%",0)/100) + magic_damage_stat)
         damage = base_damage * magic_multiplier
 
-        tp_return = get_tp(1.0, ranged_delay+ammo_delay, player.stats.get("Store TP",0)) # Assume 100% hit rate on Quick Draw
+        tp_return = get_tp(1.0, ranged_delay+ammo_delay, player.stats.get("Store TP",0)/100) # Assume 100% hit rate on Quick Draw
 
         if input_metric=="Damage dealt":
             metric = damage
@@ -1622,6 +1629,19 @@ def real_ws(player, enemy, ws_name, tp, ws_type, input_metric):
     pass
 
 
+def effective_ws_tp(input_tp, player) -> float:
+    """Return TP used by a WS after gear/job TP Bonus and the 1,000-3,000 cap."""
+    try:
+        base_tp = float(input_tp)
+    except (TypeError, ValueError):
+        base_tp = 1000.0
+    try:
+        tp_bonus = float(player.stats.get("TP Bonus", 0))
+    except (AttributeError, TypeError, ValueError):
+        tp_bonus = 0.0
+    return max(1000.0, min(3000.0, base_tp + tp_bonus))
+
+
 def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulation=False, single=False, verbose=False):
     #
     # Calculate average weapon skill damage.
@@ -1645,7 +1665,9 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
     tp_bonus = player.stats.get("TP Bonus", 0)
     base_tp  = input_tp # TP value given by the player before any gear or abilities are added.
 
-    tp = max(1000, min(3000, input_tp + tp_bonus)) # TP used to simulate damage dealt = tp given by player + tp bonus
+    # TP Bonus from weapons, Moonshade Earring, Fencer, and other gear is
+    # applied before the WS 1,000-3,000 TP cap.
+    tp = effective_ws_tp(input_tp, player)
 
     print(f"{ws_name} at {input_tp:.1f} TP (+{tp_bonus:.0f} TP Bonus; Effective TP: {tp:.1f} TP)") if (verbose_dps or very_verbose_dps) and simulation else None
 
@@ -1728,6 +1750,7 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
     ammo_delay = player.stats.get("Ammo Delay",0)
 
     physical_damage = 0 # Calculate the physical damage first, so we can add magical damage to hybrids after.
+    hybrid_first_hit_damage = 0 # Hybrid magic is based only on the first physical hit.
     magical_damage = 0
     total_damage = 0
     tp_return = 0
@@ -1816,6 +1839,7 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
             # Calculate the correction to the first hit based on the full set of buffs and bonuses.
             first_main_hit_pdif = get_avg_pdif_melee(player_attack1, main_skill_type, pdl_trait, pdl_gear, enemy_defense, first_main_hit_crit_rate)
             first_main_hit_damage = get_avg_phys_damage(main_dmg, fstr_main, wsc, first_main_hit_pdif, ftp, first_main_hit_crit_rate, adjusted_crit_dmg, wsd, ws_bonus, ws_trait, sneak_attack_bonus, trick_attack_bonus, climactic_flourish_bonus, striking_flourish_bonus, ternary_flourish_bonus)
+            hybrid_first_hit_damage = first_main_hit_damage*hit_rate11
 
             # Adds the extra damage gained by those bonuses to the first hit's damage.
             physical_damage += (first_main_hit_damage*hit_rate11 - main_hit_damage*hit_rate11)
@@ -1886,6 +1910,7 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
                 pdif, crit = get_pdif_melee(player_attack1, main_skill_type, pdl_trait, pdl_gear, enemy_defense, first_main_hit_crit_rate) # Returns both the PDIF and whether or not the hit was a crit.
                 phys_dmg_ph = get_phys_damage(main_dmg, fstr_main, wsc, pdif, ftp, crit, adjusted_crit_dmg, wsd, ws_bonus, ws_trait, 0, sneak_attack_bonus, trick_attack_bonus, climactic_flourish_bonus, striking_flourish_bonus, ternary_flourish_bonus)
                 physical_damage += phys_dmg_ph
+                hybrid_first_hit_damage = phys_dmg_ph
                 tp_ph = get_tp(1, mdelay/2 if (main_skill_type == "Hand-to-Hand") else mdelay, stp)
                 tp_return += tp_ph
                 verbose_output(phys_dmg_ph, 0, tp_ph, crit, "main") if very_verbose_dps else None
@@ -2244,7 +2269,7 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
         ranged_accuracy = player_rangedaccuracy + player.stats.get("Weapon Skill Accuracy",0)
         hit_rate_cap_ranged = 0.99 if sharpshot else 0.95
 
-        hit_rate_ranged1 = get_hit_rate(ranged_accuracy + 100, enemy_evasion, hit_rate_cap_ranged) # Assume first ranged hit gets +100 accuracy.
+        hit_rate_ranged1 = get_hit_rate(ranged_accuracy, enemy_evasion, hit_rate_cap_ranged)
         hit_rate_ranged2 = get_hit_rate(ranged_accuracy, enemy_evasion, hit_rate_cap_ranged) 
 
         if not simulation:
@@ -2254,6 +2279,7 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
 
             ranged_hit_damage = get_avg_phys_damage(ranged_dmg+ammo_dmg, fstr_rng, wsc, avg_pdif_rng, ftp,  crit_rate, crit_dmg, wsd, ws_bonus, ws_trait) * (1 + hover_shot) # The amount of damage done by the first hit of the WS if it does not miss
             ranged_hit_damage2 = get_avg_phys_damage(ranged_dmg+ammo_dmg, fstr_rng, wsc, avg_pdif_rng, ftp2,  crit_rate, crit_dmg, 0, ws_bonus, ws_trait) * (1 + hover_shot) # Ranged hits after the first main hit (ie Jishnu's Radiance is a 3-hit Ranged WS.)
+            hybrid_first_hit_damage = ranged_hit_damage*hit_rate_ranged1*(1 + true_shot)
 
             physical_damage += ranged_hit_damage*hit_rate_ranged1 + ranged_hit_damage2*hit_rate_ranged2*(nhits-1)
             physical_damage *= (1 + true_shot)
@@ -2273,6 +2299,7 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
                 pdif, crit = get_pdif_ranged(player_rangedattack, ranged_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
                 phys_dmg_ph = get_phys_damage(ranged_dmg+ammo_dmg, fstr_rng, wsc, pdif, ftp, crit, crit_dmg, wsd, ws_bonus, ws_trait,0) * (1 + hover_shot) * (1 + true_shot)
                 physical_damage += phys_dmg_ph
+                hybrid_first_hit_damage = phys_dmg_ph
                 tp_ph = get_tp(1, ranged_delay+ammo_delay, stp)
                 tp_return += tp_ph
                 verbose_output(phys_dmg_ph, 0, tp_ph, crit, "ranged") if very_verbose_dps else None
@@ -2318,7 +2345,7 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
 
         # Calculate base magical damage
         if hybrid: # Hybrid WSs use the previous Physical damage as their base damage.
-            base_magical_damage = (physical_damage*ftp_hybrid + magic_damage_stat)
+            base_magical_damage = (hybrid_first_hit_damage*ftp_hybrid + magic_damage_stat)
         elif magical: # Magical WSs use a purely magical approach to base damage.
             weapon_level = 119
             base_magical_damage = int(((152 + int((weapon_level-99)*2.45)+wsc)*ftp)*(1+player.stats.get("Elemental WS Damage%",0)/100) + ws_dSTAT + magic_damage_stat)
@@ -2326,7 +2353,7 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
 
             # Calculate TP return for purely magical weapon skills. This is treated as a single hit (even for dual wielding) with normal TP gain from delay and Store TP.
             magic_delay = (mdelay/2 if (main_skill_type == "Hand-to-Hand") else mdelay) if ws_type=="melee" else ranged_delay+ammo_delay
-            tp_return = get_tp(magic_hit_rate, mdelay, stp)
+            tp_return = get_tp(1.0, magic_delay, stp)
             magic_tp_return = tp_return
 
         # Calculate the magical damage multiplier.
@@ -2355,7 +2382,7 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
         affinity = 1 + 0.05*player.stats.get(f"{element} Affinity",0) + 0.05*(player.stats.get(f"{element} Affinity",0)>0) # Elemental Affinity Bonus. Only really applies to Magian Trial staves. Archon Ring is different.
 
         # Now multiply the magical portion by weapon skill damage as well.
-        magic_multiplier = resist_state*magic_attack_ratio*element_magic_attack_bonus*dayweather_bonus*klimaform_bonus*(1-enemy_mdt/100)*affinity*(1 + 0.25*(magic_crit2 if simulation else magic_crit_rate2)) 
+        magic_multiplier = resist_state*magic_attack_ratio*element_magic_attack_bonus*dayweather_bonus*klimaform_bonus*(1+enemy_mdt/100)*affinity*(1 + 0.25*(magic_crit2 if simulation else magic_crit_rate2))
 
         # Multiply base damage by the multiplier
         magical_damage = base_magical_damage * magic_multiplier
@@ -2402,6 +2429,50 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
         return(total_damage, tp_return)
     else:
         return(metric, [total_damage, tp_return, invert])
+
+
+def average_tp_ws_cycle(player_tp, player_ws, enemy, ws_name, ws_threshold, ws_type):
+    """Return average DPS for a repeating TP-to-WS cycle.
+
+    The next TP phase starts with the TP returned by the preceding WS plus
+    Regain accrued during forced WS delay. This prevents combined-set scores
+    from charging every cycle for a fresh zero-to-threshold TP phase.
+    """
+    threshold = max(0.0, float(ws_threshold))
+    ws_output = average_ws(
+        player_ws, enemy, ws_name, threshold, ws_type, "Damage dealt"
+    )[1]
+    ws_damage, ws_return = float(ws_output[0]), max(0.0, float(ws_output[1]))
+    regain_ws = (
+        player_ws.stats.get("Dual Wield", 0)
+        * (player_ws.gearset["main"].get("Name") == "Gokotai")
+        + player_ws.stats.get("Regain", 0)
+    )
+    starting_tp = min(threshold, ws_return + (2.0/3.0)*regain_ws)
+
+    tp_round_damage = 0.0
+    tp_per_round = 0.0
+    tp_time = 0.0
+    total_tp_damage = 0.0
+    if starting_tp < threshold:
+        tp_time, tp_output, _ = average_attack_round(
+            player_tp, enemy, starting_tp, threshold, "Time to WS"
+        )
+        tp_round_damage = float(tp_output[0])
+        tp_per_round = float(tp_output[1])
+        if tp_per_round <= 0 or tp_time < 0:
+            return 0.0, (
+                tp_round_damage, tp_per_round, tp_time, ws_damage,
+                tp_time + 2.0, ws_return, starting_tp, 0.0, 1.0,
+            )
+        total_tp_damage = tp_round_damage * (threshold - starting_tp) / tp_per_round
+
+    total_time = tp_time + 2.0
+    total_damage = total_tp_damage + ws_damage
+    return total_damage / total_time, (
+        tp_round_damage, tp_per_round, tp_time, ws_damage, total_time,
+        ws_return, starting_tp, total_tp_damage, 1.0,
+    )
 
 
 

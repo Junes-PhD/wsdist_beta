@@ -20,7 +20,10 @@ def get_delay_timing(delay1, delay2, dw, marts, magic_haste, ja_haste, gear_hast
     ja_haste    = 256./1024. if    ja_haste > 256./1024. else    ja_haste
     total_haste = gear_haste + magic_haste + ja_haste
 
-    delay = (delay1+delay2) # Effective weapon delay. The delay minimum is 20% of this value. delay2=delay1 if not dual wielding, then this just becomes delay1
+    # Dual-wield attack rounds use the average of both weapon delays.  Callers
+    # pass zero for a single weapon and hand-to-hand, where delay1 is already
+    # the complete round delay.
+    delay = (delay1 + delay2)/2 if delay2 else delay1
 
     rdelay = (delay-marts)*(1-dw)*(1-total_haste) # Reduced weapon delay, including martial arts, dual wield, and all forms of haste
     rdelay = 0.2*delay if rdelay < 0.2*delay else rdelay # -80% delay cap, including Dual Wield, Martial Arts, and Haste

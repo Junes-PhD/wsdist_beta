@@ -24,10 +24,56 @@ from io import StringIO
 # https://stackoverflow.com/questions/47350078/importing-external-module-in-single-file-exe-created-with-pyinstaller
 import sys
 import os
-import threading
+import re
 import time
+import queue as queue_module
 sys.path.append(os.path.dirname(sys.executable))
 from gear import *
+
+
+class OptimizerStopped(RuntimeError):
+    """Raised when the GUI requests a cooperative optimizer stop."""
+
+    def __init__(self, message="Optimizer stopped by user.", *, partial_player=None,
+                 partial_output=None, partial_metric=None, results=None):
+        super().__init__(message)
+        self.partial_player = partial_player
+        self.partial_output = partial_output
+        self.partial_metric = partial_metric
+        self.results = list(results or [])
+
+
+class CombinedSetResult:
+    """Pickle-safe result containing the independently optimized TP and WS sets."""
+
+    def __init__(self, tp_player, ws_player):
+        self.tp_player = tp_player
+        self.ws_player = ws_player
+        # Keep the legacy single-player consumer pointed at the TP set.
+        self.gearset = tp_player.gearset
+
+
+def _stop_requested(stop_event) -> bool:
+    return stop_event is not None and stop_event.is_set()
+
+
+def _combined_tp_ws_metric(player, enemy, ws_name, min_tp, ws_type):
+    """Score one set by complete TP-to-WS cycle DPS.
+
+    This intentionally uses the existing TP-round and WS calculation paths;
+    it only combines their outputs so Store TP/haste is not rewarded at the
+    expense of an excessive loss in WS damage.
+    """
+    return average_tp_ws_cycle(
+        player, player, enemy, ws_name, min_tp, ws_type
+    )
+
+
+def _combined_tp_ws_metric_pair(tp_player, ws_player, enemy, ws_name, min_tp, ws_type):
+    """Score a TP gearset and WS gearset as one complete cycle."""
+    return average_tp_ws_cycle(
+        tp_player, ws_player, enemy, ws_name, min_tp, ws_type
+    )
 
 def format_bgwiki(ws_name, tp, player, best_metric):
     #
@@ -147,10 +193,17 @@ def format_bgwiki(ws_name, tp, player, best_metric):
     """
     print(bgwiki_text)
 
+def _job_eligible(item, main_job):
+    jobs = item.get("Jobs", ())
+    if isinstance(jobs, str):
+        jobs = (jobs,)
+    return str(main_job).lower() in {str(job).lower() for job in jobs}
+
+
 def _prepare_candidates(check_gear, main_job, ws_type):
     """Copy and discard candidates the current main job cannot equip."""
     candidates = {
-        slot: [item for item in items if main_job in item.get("Jobs", ())]
+        slot: [item for item in items if _job_eligible(item, main_job)]
         for slot, items in check_gear.items()
     }
     if ws_type == "melee" and main_job not in ("rng", "cor"):
@@ -175,11 +228,148 @@ def estimate_candidate_checks(check_gear, main_job, ws_type="None"):
     )
 
 
-def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, seed=None, n_iter=10, return_details=False, progress_callback=None):
+# Items whose help text forces other armor slots empty.  The bridge parser also
+# reads this rule from an exported description when it is available, so new
+# GearSetBuilder item data does not need a code change merely to carry the
+# restriction forward.
+_KNOWN_FORCED_EMPTY_SLOTS = {
+    "onca suit": ("hands", "legs", "feet"),
+    "adenium suit": ("hands", "legs", "feet"),
+    "magh bihu's suit": ("hands", "legs", "feet"),
+    "mandragora suit": ("legs",),
+    "mandragora suit +1": ("legs",),
+    "wyrmking suit": ("legs",),
+    "wyrmking suit +1": ("legs",),
+    "overalls": ("legs",),
+    "chocobo suit": ("hands", "feet"),
+    "chocobo suit +1": ("hands", "feet"),
+    "cohort cloak": ("head",),
+    "cohort cloak +1": ("head",),
+    "crepuscular cloak": ("head",),
+    "twilight cloak": ("head",),
+}
+_RESTRICTED_ARMOR_SLOTS = {
+    "head": "head", "hand": "hands", "leg": "legs", "foot": "feet",
+}
+
+
+def forced_empty_slots(item):
+    """Return armor slots that must be empty while this item is equipped."""
+    name = str(item.get("Name") or "").casefold()
+    blocked = set(_KNOWN_FORCED_EMPTY_SLOTS.get(name, ()))
+    explicit = item.get("Forced Empty Slots") or item.get("Blocked Slots") or ()
+    if isinstance(explicit, str):
+        explicit = re.split(r"[,;/]", explicit)
+    for slot in explicit:
+        slot = str(slot).strip().casefold()
+        if slot in _RESTRICTED_ARMOR_SLOTS:
+            blocked.add(_RESTRICTED_ARMOR_SLOTS[slot])
+        elif slot in _RESTRICTED_ARMOR_SLOTS.values():
+            blocked.add(slot)
+
+    text = " ".join(str(item.get(key) or "") for key in (
+        "Description", "Help Text", "description", "help_text",
+    ))
+    for phrase in re.findall(r"(?:cannot|unable to)\s+equip\s+([^.;]+?gear)", text, re.I):
+        phrase = phrase.casefold()
+        for word, slot in _RESTRICTED_ARMOR_SLOTS.items():
+            if word in phrase:
+                blocked.add(slot)
+    return blocked
+
+
+def apply_forced_empty_slots(gearset):
+    """Apply all equipped-item slot restrictions and return slots changed."""
+    blocked = set()
+    for item in gearset.values():
+        blocked.update(forced_empty_slots(item))
+    changed = set()
+    for slot in blocked:
+        if slot in gearset and gearset[slot].get("Name") != "Empty":
+            gearset[slot] = Empty
+            changed.add(slot)
+    return changed
+
+
+def starting_item_candidates(items):
+    """Prefer normal-slot items for randomized optimizer starting sets."""
+    unrestricted = [item for item in items if not forced_empty_slots(item)]
+    return unrestricted or list(items)
+
+
+_LOWER_IS_BETTER_STATS = {
+    "Delay", "DT", "DT2", "PDT", "PDT2", "MDT", "MDT2",
+    "Damage Taken", "Damage Taken%",
+}
+_NON_COMBAT_METADATA = {
+    "Item ID", "Item Level", "ItemLevel", "Rank", "Accessible Count",
+    "Total Count", "Model Complete",
+}
+
+
+def _numeric_combat_stats(item: dict) -> dict[str, float]:
+    return {
+        key: float(value) for key, value in item.items()
+        if key not in _NON_COMBAT_METADATA and not isinstance(value, bool)
+        and isinstance(value, (int, float))
+    }
+
+
+def _dominates_item(candidate: dict, other: dict) -> bool:
+    """Return true only when candidate cannot be worse for any modeled stat."""
+    if (candidate.get("Type", "None"), candidate.get("Skill Type", "None")) != (
+        other.get("Type", "None"), other.get("Skill Type", "None")
+    ):
+        return False
+    # A multi-slot item cannot safely dominate a normal item (or vice versa)
+    # from its own stat row alone. Its empty-slot footprint is part of its cost.
+    if forced_empty_slots(candidate) != forced_empty_slots(other):
+        return False
+    left = _numeric_combat_stats(candidate)
+    right = _numeric_combat_stats(other)
+    keys = set(left) | set(right)
+    if not keys:
+        return False
+    strict = False
+    for key in keys:
+        candidate_value = left.get(key, 0.0)
+        other_value = right.get(key, 0.0)
+        if key in _LOWER_IS_BETTER_STATS:
+            if candidate_value > other_value:
+                return False
+        elif candidate_value < other_value:
+            return False
+        if candidate_value != other_value:
+            strict = True
+    return strict
+
+
+def prune_dominated_candidates(check_gear: dict[str, list[dict]]) -> tuple[dict[str, list[dict]], int]:
+    """Remove obvious Pareto-dominated items within each slot/type group.
+
+    This is deliberately conservative: items are compared only to another
+    item with the same equipment type and skill type, and all numeric modeled
+    stats must be no worse.  It cannot remove a tradeoff item or alter any
+    calculation formula.
+    """
+    pruned = {}
+    removed = 0
+    for slot, items in check_gear.items():
+        kept = []
+        for index, item in enumerate(items):
+            if any(_dominates_item(other, item) for other_index, other in enumerate(items) if other_index != index):
+                removed += 1
+            else:
+                kept.append(item)
+        pruned[slot] = kept or list(items[:1])
+    return pruned, removed
+
+
+def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, dt_requirement=0, seed=None, n_iter=10, return_details=False, progress_callback=None, stop_event=None, slot_pair_filter=None, preserve_starting_gearset=False, single_outer_pass=False, combined_ws_player=None):
     #
     # Build a valid gear set, test it, and return the best set found.
     #
-    # action_type = "ranged attack", "weapon skill", "tp round", "spell cast"
+    # action_type = "weapon skill", "attack round", "spell cast", "combined tp/ws"
     #
     fitn = 2
 
@@ -188,11 +378,64 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     verbose_swaps = abilities.get("Verbose Swaps", False)
     damage_taken_item_cache = {}
     rng = np.random.default_rng(seed) if seed is not None else np.random
+    best_set = None
+    best_output = None
+    best_metric = None
 
     def report_progress(message):
         if progress_callback is not None:
             progress_callback(message)
 
+    def check_stopped():
+        if _stop_requested(stop_event):
+            partial_player = None
+            if best_set is not None and best_output is not None:
+                try:
+                    partial_player = create_player(
+                        main_job, sub_job, master_level, best_set, buffs, abilities
+                    )
+                except Exception:
+                    partial_player = None
+            raise OptimizerStopped(
+                "Optimizer stopped by user.",
+                partial_player=partial_player,
+                partial_output=best_output,
+                partial_metric=best_metric,
+            )
+
+    def progress_results_text():
+        """Format already-calculated combat output for live status updates."""
+        if best_output is None or best_metric is None:
+            return "current results: waiting for a valid set"
+        if action_type == "combined tp/ws":
+            return (
+                f"current results: DPS {best_metric:.3f}; "
+                f"WS damage {best_output[3]:,.0f}; TP time {best_output[2]:.2f}s"
+            )
+        if action_type == "attack round":
+            round_damage, tp_per_round, round_time = best_output[:3]
+            dps = round_damage / round_time if round_time > 0 else 0.0
+            result = (
+                f"current results: TP DPS {dps:.3f}; round damage {round_damage:,.1f}; "
+                f"TP/round {tp_per_round:.1f}"
+            )
+            # Time to WS is the selected attack-round metric when its inverse
+            # is used. Reconstruct the displayed metric without another call
+            # into the combat engine.
+            if best_output[-1] < 0:
+                result += f"; time to WS {best_metric ** best_output[-1]:.2f}s"
+            return result
+        if action_type == "weapon skill":
+            return (
+                f"current results: WS damage {best_output[0]:,.0f}; "
+                f"TP return {best_output[1]:.1f}"
+            )
+        return (
+            f"current results: spell damage {best_output[0]:,.0f}; "
+            f"TP return {best_output[1]:.1f}"
+        )
+
+    check_stopped()
     report_progress(f"Search started (seed {seed if seed is not None else 'random'}).")
     # Keep caller-owned selections stable and remove impossible candidates once,
     # before the hot loop. Formula evaluation is unchanged for every valid set.
@@ -202,6 +445,32 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     def duplicate_allowed(item):
         count = item.get("Accessible Count")
         return item.get("Name", "Empty") == "Empty" or count is None or int(count) >= 2
+
+    def duplicate_tp_bonus_weapon(main, sub):
+        """Return whether main/sub are the same +1000 TP Bonus weapon.
+
+        The static gear lists use a second dictionary (for example,
+        ``Centovente2``) when an item can be offered in the sub slot.  Those
+        dictionaries have different ``Name2`` values, so comparing the full
+        dictionaries does not catch an impossible duplicate weapon pair.
+        Keeping this restriction limited to weapons that provide +1000 TP
+        Bonus preserves valid duplicate ordinary weapons and normal off-hand
+        TP Bonus behavior.
+        """
+        if (main.get("Name", "Empty") == "Empty"
+                or sub.get("Name", "Empty") == "Empty"):
+            return False
+        if main.get("Type") != "Weapon" or sub.get("Type") != "Weapon":
+            return False
+        main_name = str(main.get("Name") or "").strip().casefold()
+        sub_name = str(sub.get("Name") or "").strip().casefold()
+        if not main_name or main_name != sub_name:
+            return False
+        try:
+            return (float(main.get("TP Bonus", 0)) >= 1000
+                    and float(sub.get("TP Bonus", 0)) >= 1000)
+        except (TypeError, ValueError):
+            return False
 
     ws_dict = {"Katana": ["Blade: Retsu", "Blade: Teki", "Blade: To", "Blade: Chi", "Blade: Ei", "Blade: Jin", "Blade: Ten", "Blade: Ku", "Blade: Yu", "Blade: Metsu", "Blade: Kamu", "Blade: Hi", "Blade: Shun", "Zesho Meppo",],
         "Great Katana": ["Tachi: Enpi", "Tachi: Goten", "Tachi: Kagero", "Tachi: Jinpu", "Tachi: Koki","Tachi: Yukikaze", "Tachi: Gekko", "Tachi: Kasha", "Tachi: Ageha","Tachi: Kaiten", "Tachi: Rana", "Tachi: Fudo", "Tachi: Shoha", "Tachi: Mumei"],
@@ -223,6 +492,12 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     ranged_ws = [ws for skill in ws_dict if skill in ["Archery","Marksmanship"] for ws in ws_dict[skill]]
     
     ws_type = "melee" if ws_name in melee_ws else "ranged" if ws_name in ranged_ws else "None"
+    # When combined TP optimization uses an external WS player, the TP set's
+    # weapon may legitimately differ from the WS weapon. Apply WS weapon
+    # restrictions only to the set whose WS is actually being calculated.
+    ws_action = action_type == "weapon skill" or (
+        action_type == "combined tp/ws" and combined_ws_player is None
+    )
     
     if " Shot" in spell_name:
         spell_type = "Quick Draw"
@@ -269,18 +544,33 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     check_gear = _prepare_candidates(check_gear, main_job, ws_type)
     for items in check_gear.values():
         rng.shuffle(items)
+    candidate_counts = [len(items) for items in check_gear.values()]
+    estimated_checks = sum(candidate_counts) + sum(
+        left * right for index, left in enumerate(candidate_counts)
+        for right in candidate_counts[index + 1:]
+    )
 
     # Rather than start with an empty slot, randomly build a set from the selected gear so we likely start with some accuracy+ and avoid getting stuck.
     # Do not adjust slots that are not being checked.
     for slot in starting_gearset:
 
         # Unequip gear you can't wear if it's already equipped, even if the slot is "frozen"
-        if main_job not in starting_gearset[slot]["Jobs"]:
+        if not _job_eligible(starting_gearset[slot], main_job):
             starting_gearset[slot] = Empty
 
         frozen_slot = (len(check_gear[slot]) == 0)
-        if not frozen_slot:
-            starting_gearset[slot] = rng.choice(check_gear[slot])
+        candidate_names = {
+            str(item.get("Name2") or item.get("Name") or "Empty")
+            for item in check_gear[slot]
+        }
+        starting_name = str(
+            starting_gearset[slot].get("Name2")
+            or starting_gearset[slot].get("Name")
+            or "Empty"
+        )
+        if (not frozen_slot
+                and (not preserve_starting_gearset or starting_name not in candidate_names)):
+            starting_gearset[slot] = rng.choice(starting_item_candidates(check_gear[slot]))
             
             # Avoid wearing two rare items in initial gearset to prevent "unphysical" sets.
             if slot == "ring2" and (starting_gearset["ring1"]["Name2"] == starting_gearset["ring2"]["Name2"]
@@ -290,6 +580,13 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                     and not duplicate_allowed(starting_gearset["ear2"])):
                 starting_gearset["ear2"] = Empty
 
+    apply_forced_empty_slots(starting_gearset)
+    # Do not let the random starting point contain two copies of a unique
+    # +1000 TP Bonus weapon (Centovente/Centovente2, Hitaki/Hitaki2, etc.).
+    # The candidate loop applies the same rule to every later swap.
+    if duplicate_tp_bonus_weapon(starting_gearset["main"], starting_gearset["sub"]):
+        starting_gearset["sub"] = Empty
+        report_progress("Removed duplicate +1000 TP Bonus weapon from sub slot.")
 
     best_set =  starting_gearset.copy()
 
@@ -304,26 +601,55 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
     pdt = 200 # How much PDT the set has
     mdt = 200
+    dt = 200
 
     conditional_converge_count = 0 # Break out of the loop if converged.
     pdt_old = 200 # Used to check if the automatic set finder gets stuck trying to find a set that doesn't exist. Compare this value to the old value. If no change in 3 consecutive iterations, then break out.
     mdt_old = 200
+    dt_old = 200
 
     pdt_thresh = pdt_requirement # How much PDT the final set is aiming for, taken from the user input.
     mdt_thresh = mdt_requirement
+    dt_thresh = dt_requirement
 
-    pdt_thresh_temp = 200 # How much PDT the current new set must have to be accepted. The starting values are high to ensure that the code enters the loop to begin with.
-    mdt_thresh_temp = 200
-    best_output = None
-    best_metric = None
+    def defensive_deficit(candidate_pdt, candidate_mdt, candidate_dt):
+        """Rank how far a set is from the requested defensive minimums."""
+        pdt_gap = max(0.0, candidate_pdt - pdt_thresh)
+        mdt_gap = max(0.0, candidate_mdt - mdt_thresh)
+        dt_gap = max(0.0, candidate_dt - dt_thresh)
+        return (pdt_gap + mdt_gap + dt_gap, max(pdt_gap, mdt_gap, dt_gap),
+                pdt_gap, mdt_gap, dt_gap)
 
+    # First find a legal set that satisfies requested PDT/MDT/DT totals.
+    # This avoids expensive DPS/WS evaluation for candidates that cannot
+    # possibly be returned. Split chunks keep their strict one-pass gate; the
+    # coordinator already supplies a full-search fallback when needed.
+    defense_phase = (not single_outer_pass and any(
+        threshold < 0 for threshold in (pdt_thresh, mdt_thresh, dt_thresh)
+    ))
+    metric_pass_pending = False
 
-    while pdt > pdt_thresh or mdt > mdt_thresh:
+    # Split-worker passes enforce final thresholds immediately. Regular runs
+    # use a feasibility phase first, then score only fully defensive sets.
+    pdt_thresh_temp = pdt_thresh if (single_outer_pass or defense_phase) else 200
+    mdt_thresh_temp = mdt_thresh if (single_outer_pass or defense_phase) else 200
+    dt_thresh_temp = dt_thresh if (single_outer_pass or defense_phase) else 200
+    while (metric_pass_pending or pdt > pdt_thresh
+           or mdt > mdt_thresh or dt > dt_thresh):
+        check_stopped()
         # print(f"\nChecking conditions: PDT:{pdt_thresh_temp},  MDT:{mdt_thresh_temp}")
 
         for z in range(n_iter):
+            check_stopped()
             print(f"Current iteration: {z+1}")
-            report_progress(f"Iteration {z + 1}/{n_iter}.")
+            report_progress(
+                f"Iteration {z + 1}/{n_iter} started; planned ~{estimated_checks:,} combinations."
+            )
+            tested_count = 0
+            valid_count = 0
+            last_progress = time.monotonic()
+            current_phase = "initializing"
+            last_improvement = "none"
             
             # Every candidate in this pass is compared to this immutable baseline.
             # This makes a full one/two-slot neighborhood pass independent of the
@@ -335,13 +661,46 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
             base_pdt, base_mdt = damage_taken_from_totals(
                 base_damage_taken_totals, converged_set["main"], abilities
             )
+            base_dt = damage_taken_dt_from_totals(
+                base_damage_taken_totals, converged_set["main"], abilities
+            )
 
-            if base_pdt <= pdt_thresh_temp and base_mdt <= mdt_thresh_temp:
+            if defense_phase and (base_pdt <= pdt_thresh and base_mdt <= mdt_thresh
+                                  and base_dt <= dt_thresh):
+                defense_phase = False
+                pdt_thresh_temp = pdt_thresh
+                mdt_thresh_temp = mdt_thresh
+                dt_thresh_temp = dt_thresh
+                report_progress(
+                    "Defensive minimums satisfied; evaluating damage only among valid sets."
+                )
+
+            best_defense_score = None
+            if defense_phase:
+                best_defense_score = defensive_deficit(base_pdt, base_mdt, base_dt)
+                best_metric = None
+                best_output = None
+                last_improvement = (
+                    f"defensive baseline PDT:{base_pdt:g}, MDT:{base_mdt:g}, DT:{base_dt:g}"
+                )
+            elif (base_pdt <= pdt_thresh_temp and base_mdt <= mdt_thresh_temp
+                    and base_dt <= dt_thresh_temp):
                 base_player = create_player(main_job, sub_job, master_level, converged_set, buffs, abilities)
                 if action_type == "weapon skill":
                     decimals = 1
                     nondecimals = 8
                     metric_base, best_output = average_ws(base_player, enemy, ws_name, min_tp, ws_type, input_metric)
+                elif action_type == "combined tp/ws":
+                    decimals = 1
+                    nondecimals = 8
+                    if combined_ws_player is None:
+                        metric_base, best_output = _combined_tp_ws_metric(
+                            base_player, enemy, ws_name, min_tp, ws_type
+                        )
+                    else:
+                        metric_base, best_output = _combined_tp_ws_metric_pair(
+                            base_player, combined_ws_player, enemy, ws_name, min_tp, ws_type
+                        )
                 elif action_type == "spell cast":
                     decimals = 1
                     nondecimals = 8
@@ -370,21 +729,46 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
             # For now, the code will only support two simultaneous swaps. Adding a third requires only adding a new for loop, but it adds a significant amount of computation time.
             found_feasible_neighbor = False
             for i1, slot1 in enumerate(check_slots): 
+                check_stopped()
                 for slot2 in check_slots[i1:]:
+                    check_stopped()
+                    current_phase = f"{slot1} + {slot2}"
+                    pair_key = tuple(sorted((str(slot1), str(slot2))))
+                    if slot_pair_filter is not None and pair_key not in slot_pair_filter:
+                        continue
                     
                     # Only check single item swaps if fitn==1
                     if fitn==1:
                         if slot2 != slot1:
                             continue
 
-                    test_set = converged_set.copy()
-                    
                     if slot1 == slot2:
                         item_pairs = ((item, item) for item in check_gear[slot1])
                     else:
                         item_pairs = product(check_gear[slot1], check_gear[slot2])
 
-                    for item1, item2 in item_pairs:
+                    for pair_index, (item1, item2) in enumerate(item_pairs):
+                            # Start every candidate from the immutable baseline.
+                            # Forced-empty items such as Onca Suit must not leave
+                            # hands/legs/feet empty for the next candidate.
+                            test_set = converged_set.copy()
+                            tested_count += 1
+                            if pair_index % 64 == 0:
+                                check_stopped()
+
+                            if tested_count % 256 == 0:
+                                now = time.monotonic()
+                            else:
+                                now = last_progress
+                            if now - last_progress >= 5.0:
+                                best_text = f"{best_metric:.4f}" if best_metric is not None else "n/a"
+                                report_progress(
+                                    f"Iteration {z + 1}/{n_iter}; phase {current_phase}; "
+                                    f"tested {tested_count:,}/{estimated_checks:,}; "
+                                    f"valid {valid_count:,}; last improvement {last_improvement}; "
+                                    f"best {best_text}; {progress_results_text()}."
+                                )
+                                last_progress = now
 
                             if (item1==converged_set[slot1]) or (item2==converged_set[slot2]): # Do not retest the baseline set.
                                 continue
@@ -392,6 +776,13 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             # Equip the items and check that the test_set is valid.
                             test_set[slot1] = item1
                             test_set[slot2] = item2
+                            forced_empty = apply_forced_empty_slots(test_set)
+                            # A candidate forcibly removed by another equipped
+                            # piece would only duplicate an already-valid empty
+                            # slot state, so skip that redundant combination.
+                            if ((slot1 in forced_empty and item1.get("Name") != "Empty")
+                                    or (slot2 in forced_empty and item2.get("Name") != "Empty")):
+                                continue
 
 
                             if (test_set["ring1"]==test_set["ring2"]) and (test_set["ring1"]["Name"]!="Empty") and not duplicate_allowed(test_set["ring1"]):
@@ -399,6 +790,8 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             if (test_set["ear1"]==test_set["ear2"]) and (test_set["ear1"]["Name"]!="Empty") and not duplicate_allowed(test_set["ear1"]):
                                 continue
                             if (test_set["main"]==test_set["sub"]) and (test_set["main"]["Name"]!="Empty") and not duplicate_allowed(test_set["main"]):
+                                continue
+                            if duplicate_tp_bonus_weapon(test_set["main"], test_set["sub"]):
                                 continue
                             #print("test1")
 
@@ -418,7 +811,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
                             #print("test4")
 
-                            if (action_type=="weapon skill") and (ws_name in archery_ws + marksmanship_ws):
+                            if ws_action and (ws_name in archery_ws + marksmanship_ws):
                                 # If using a ranged weapon skill, ensure that the weapon and ammo type match the weapon skill.
 
                                 if (ws_name in archery_ws) and (test_set["ranged"]["Skill Type"]!="Archery" or test_set["ammo"]["Type"]!="Arrow"):
@@ -484,7 +877,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                     continue
                             #print("test13")
 
-                            if action_type == "weapon skill":
+                            if ws_action:
                                 # Some weapon skills can only be used with certain weapons.
                                 if ws_name in restricted_ws:
                                     if (restricted_ws[ws_name]!=test_set["main"]["Name"]) and (restricted_ws[ws_name]!=test_set["ranged"]["Name"]):
@@ -503,7 +896,11 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             # Only one or two slots differ from the immutable
                             # baseline, so update its PDT/MDT totals by delta.
                             candidate_totals = base_damage_taken_totals.copy()
-                            changed_items = {slot1: item1, slot2: item2}
+                            changed_slots = {slot1, slot2, *forced_empty}
+                            changed_items = {
+                                slot: test_set[slot] for slot in changed_slots
+                                if test_set[slot] != converged_set[slot]
+                            }
                             for changed_slot, changed_item in changed_items.items():
                                 previous_values = damage_taken_item_values(
                                     converged_set[changed_slot], damage_taken_item_cache
@@ -516,9 +913,28 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             pdt, mdt = damage_taken_from_totals(
                                 candidate_totals, test_set["main"], abilities
                             )
-                            if pdt > pdt_thresh_temp or mdt > mdt_thresh_temp:
+                            dt = damage_taken_dt_from_totals(
+                                candidate_totals, test_set["main"], abilities
+                            )
+                            if defense_phase:
+                                candidate_defense_score = defensive_deficit(pdt, mdt, dt)
+                                if candidate_defense_score < best_defense_score:
+                                    best_set = test_set.copy()
+                                    best_defense_score = candidate_defense_score
+                                    valid_count += 1
+                                    last_improvement = (
+                                        f"defense {slot1} + {slot2}: "
+                                        f"PDT:{pdt:g}, MDT:{mdt:g}, DT:{dt:g}"
+                                    )
+                                # This phase deliberately does no player or
+                                # action calculation: only defensive totals
+                                # decide the next feasible baseline.
+                                continue
+                            if (pdt > pdt_thresh_temp or mdt > mdt_thresh_temp
+                                    or dt > dt_thresh_temp):
                                 continue
                             found_feasible_neighbor = True
+                            valid_count += 1
 
                             # Sets that survive this long are valid and satisfy the temporary PDT/MDT requirements.
                             player = create_player(main_job, sub_job, master_level, test_set, buffs, abilities)
@@ -545,6 +961,20 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                 invert = output[-1]
                                 metric = metric_base**invert
 
+                            elif action_type == "combined tp/ws":
+                                decimals = 1
+                                nondecimals = 8
+                                if combined_ws_player is None:
+                                    metric_base, output = _combined_tp_ws_metric(
+                                        player, enemy, ws_name, min_tp, ws_type
+                                    )
+                                else:
+                                    metric_base, output = _combined_tp_ws_metric_pair(
+                                        player, combined_ws_player, enemy, ws_name, min_tp, ws_type
+                                    )
+                                invert = 1.0
+                                metric = metric_base
+
                             else:
                                 print(f"Unknown action_type  ({action_type})")
                                 import sys; sys.exit()
@@ -558,6 +988,11 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                 best_set = test_set.copy()
                                 best_metric = metric
                                 best_output = output
+                                last_improvement = (
+                                    f"{slot1} + {slot2}: {item1.get('Name', 'item')}"
+                                    if item1 != item2
+                                    else f"{slot1}: {item1.get('Name', 'item')}"
+                                )
     
                             elif (item1==item2):
                                 relative_difference = (best_metric - metric) / best_metric
@@ -565,28 +1000,88 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                         and slot1 not in ["main", "sub", "ranged", "back"]):
                                     swaps[slot1].append([item1["Name2"], metric**invert, relative_difference])
 
-            if (base_pdt > pdt_thresh_temp or base_mdt > mdt_thresh_temp) and not found_feasible_neighbor:
-                raise ValueError(
-                    "Optimizer could not reach the requested PDT/MDT requirements from the current search neighborhood. "
-                    "Try more selected defensive gear or additional restarts."
-                )
+            best_text = f"{best_metric:.4f}" if best_metric is not None else "n/a"
+            report_progress(
+                f"Iteration {z + 1}/{n_iter} finished; tested {tested_count:,}/"
+                f"{estimated_checks:,}; valid {valid_count:,}; "
+                f"last improvement {last_improvement}; best {best_text}; "
+                f"{progress_results_text()}."
+            )
 
-            if best_set==converged_set: # If no improvement is found after one full iteration.
-                # best_player = create_player(main_job, sub_job, master_level, best_set, buffs, abilities)
-                # for k in best_player.gearset:
-                #     print(k,best_player.gearset[k]["Name2"])
-                # print(best_output)
-                break # Break out of the main loop and check PDT/MDT conditions.
+        if defense_phase:
+            pdt, mdt = calculate_damage_taken(best_set, buffs, abilities, damage_taken_item_cache)
+            dt = damage_taken_dt_from_totals(
+                damage_taken_totals(best_set, buffs, damage_taken_item_cache),
+                best_set["main"], abilities,
+            )
+            if pdt > pdt_thresh or mdt > mdt_thresh or dt > dt_thresh:
+                if best_set == converged_set:
+                    raise ValueError(
+                        "Optimizer could not reach the requested PDT/MDT/DT minimums from the "
+                        "current legal candidates. Try more selected defensive gear or additional search runs."
+                    )
+                report_progress(
+                    f"Defensive search improving: PDT:{pdt:g}, MDT:{mdt:g}, DT:{dt:g}; "
+                    "continuing without damage simulation."
+                )
+                continue
+
+            # Force one following outer pass so the now-feasible baseline can
+            # be scored with the requested damage metric.
+            defense_phase = False
+            metric_pass_pending = True
+            pdt_thresh_temp = pdt_thresh
+            mdt_thresh_temp = mdt_thresh
+            dt_thresh_temp = dt_thresh
+            report_progress(
+                "Defensive minimums satisfied; starting damage optimization from the feasible set."
+            )
+            continue
+
+        if single_outer_pass:
+            if best_output is None:
+                raise ValueError("No valid gear set satisfies the current PDT/MDT/DT requirements.")
+            pdt, mdt = calculate_damage_taken(
+                best_set, buffs, abilities, damage_taken_item_cache
+            )
+            dt = damage_taken_dt_from_totals(
+                damage_taken_totals(best_set, buffs, damage_taken_item_cache),
+                best_set["main"], abilities,
+            )
+            break
+
+        if (base_pdt > pdt_thresh_temp or base_mdt > mdt_thresh_temp
+                or base_dt > dt_thresh_temp) and not found_feasible_neighbor:
+            raise ValueError(
+                "Optimizer could not reach the requested PDT/MDT/DT minimums from the current search neighborhood. "
+                "Try more selected defensive gear or additional search runs."
+            )
+
+        # The candidate loop leaves pdt/mdt/dt containing the last candidate
+        # examined, not necessarily the selected set. Recalculate before any
+        # convergence exit so a valid set is never reported as failing its
+        # defensive requirements.
+        pdt, mdt = calculate_damage_taken(best_set, buffs, abilities, damage_taken_item_cache)
+        dt = damage_taken_dt_from_totals(
+            damage_taken_totals(best_set, buffs, damage_taken_item_cache),
+            best_set["main"], abilities,
+        )
+
+        if best_set==converged_set: # If no improvement is found after one full iteration.
+            # best_player = create_player(main_job, sub_job, master_level, best_set, buffs, abilities)
+            # for k in best_player.gearset:
+            #     print(k,best_player.gearset[k]["Name2"])
+            # print(best_output)
+            break # Break out of the main loop and check PDT/MDT conditions.
 
 
         if best_output is None:
-            raise ValueError("No valid gear set satisfies the current PDT/MDT requirements.")
-
-        pdt, mdt = calculate_damage_taken(best_set, buffs, abilities, damage_taken_item_cache)
+            raise ValueError("No valid gear set satisfies the current PDT/MDT/DT requirements.")
+        metric_pass_pending = False
 
 
         # Compare the pdt and mdt values from this iteration with the previous iteration.
-        if pdt == pdt_old and mdt == mdt_old:
+        if pdt == pdt_old and mdt == mdt_old and dt == dt_old:
             conditional_converge_count += 1
             if conditional_converge_count >= 3:
                 print("Unable to find a set which satisfies the conditions better than the current set. Exiting.")
@@ -597,17 +1092,19 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         # Save the PDT and MDT values from this iteration to compare with the next iteration.
         pdt_old = pdt
         mdt_old = mdt
+        dt_old = dt
 
         # Update the temporary PDT and MDT requirements so that the next set is slightly closer to the true requirements.
         pdt_thresh_temp = pdt - 1 if pdt-1 > pdt_thresh else pdt_thresh
         mdt_thresh_temp = mdt - 1 if mdt-1 > mdt_thresh else mdt_thresh
+        dt_thresh_temp = dt - 1 if dt-1 > dt_thresh else dt_thresh
         
-        print(f"Current best set: PDT:{pdt},  MDT:{mdt}")
-        report_progress(f"Current best PDT:{pdt:g}, MDT:{mdt:g}.")
+        print(f"Current best set: PDT:{pdt}, MDT:{mdt}, DT:{dt}")
+        report_progress(f"Current best PDT:{pdt:g}, MDT:{mdt:g}, DT:{dt:g}.")
 
 
-    if pdt > pdt_thresh or mdt > mdt_thresh:
-        raise ValueError("Optimizer could not find a set satisfying the requested PDT/MDT requirements.")
+    if pdt > pdt_thresh or mdt > mdt_thresh or dt > dt_thresh:
+        raise ValueError("Optimizer could not find a set satisfying the requested PDT/MDT/DT minimums.")
 
     # At this point, we've found the best conditional set.
 
@@ -619,7 +1116,10 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     best_player = create_player(main_job, sub_job, master_level, best_set, buffs, abilities)
 
 
-    header = {"weapon skill":ws_name,"spell cast":spell_name,"attack round":"Melee TP set"}[action_type]
+    header = {
+        "weapon skill": ws_name, "combined tp/ws": f"{ws_name} + TP cycle",
+        "spell cast": spell_name, "attack round": "Melee TP set",
+    }[action_type]
     # Print a fancy output.
     print("==============================================================")
     print(f"Best   \"{input_metric}\"   \"{header}\"   set")
@@ -627,7 +1127,11 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     for k in best_player.gearset:
         print(f"{k:>10s}  {best_player.gearset[k]['Name2']:<50s}")
     print()
-    if action_type=="attack round":
+    if action_type == "combined tp/ws":
+        print(f"Combined TP + WS DPS = {best_metric:.3f}")
+        print(f"Avg TP time = {best_output[2]:.3f} s; Avg WS damage = {best_output[3]:.1f}")
+        print(f"Cycle time including WS delay = {best_output[4]:.3f} s")
+    elif action_type=="attack round":
         if input_metric=="Time to WS":
             print(f"Avg WS Time = {best_metric**invert:<{nondecimals}.{decimals}f} s")
             print(f"Avg TP per round = {best_output[1]:<5.1f} TP")
@@ -664,10 +1168,27 @@ def _build_set_restart_worker(request, progress_callback=None):
     output_buffer = StringIO()
     try:
         build_kwargs = request["kwargs"].copy()
+        progress_queue = build_kwargs.pop("progress_queue", None)
         if progress_callback is not None:
             build_kwargs["progress_callback"] = progress_callback
+        elif progress_queue is not None:
+            label = request.get("progress_label", f"Search run {request['index']}")
+            build_kwargs["progress_callback"] = lambda message: progress_queue.put(
+                f"{label}: {message}"
+            )
         with redirect_stdout(output_buffer):
             player, output, metric = build_set(*request["args"], **build_kwargs)
+    except OptimizerStopped as error:
+        return {
+            "index": request["index"],
+            "seed": request["seed"],
+            "stopped": True,
+            "error": str(error),
+            "player": error.partial_player,
+            "output": error.partial_output,
+            "metric": error.partial_metric,
+            "log": output_buffer.getvalue(),
+        }
     except Exception as error:
         return {
             "index": request["index"],
@@ -686,13 +1207,379 @@ def _build_set_restart_worker(request, progress_callback=None):
         }
 
 
-def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, restarts=1, workers=0, seed=None, n_iter=10, return_details=False, progress_callback=None):
-    """Run independent seeded searches and return the best valid result.
+def _rank_optimizer_results(results, limit=5):
+    usable = [
+        result for result in results
+        if result.get("player") is not None and result.get("metric") is not None
+    ]
+    usable.sort(key=lambda result: result["metric"], reverse=True)
+    return [
+        {
+            "rank": rank,
+            "player": result["player"],
+            "output": result.get("output"),
+            "metric": result["metric"],
+            "seed": result.get("seed"),
+            "index": result.get("index"),
+        }
+        for rank, result in enumerate(usable[:limit], start=1)
+    ]
 
-    ``workers=0`` selects up to one process per restart while leaving one CPU
-    core free. A single restart runs in-process, preserving the prior UI path.
+
+def _gearset_key(player):
+    return tuple(
+        (slot, str(item.get("Name2") or item.get("Name") or "Empty"))
+        for slot, item in sorted(player.gearset.items())
+    )
+
+
+def _gearset_mapping_key(gearset):
+    return tuple(
+        (slot, str(item.get("Name2") or item.get("Name") or "Empty"))
+        for slot, item in sorted(gearset.items())
+    )
+
+
+def _unique_ranked_results(results, limit=5):
+    ranked = _rank_optimizer_results(results, limit=max(limit, len(results)))
+    unique, seen = [], set()
+    for result in ranked:
+        key = _gearset_key(result["player"])
+        if key in seen:
+            continue
+        seen.add(key)
+        result["rank"] = len(unique) + 1
+        unique.append(result)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
+def _optimize_combined_pair(main_job, sub_job, master_level, buffs, abilities, enemy,
+                            ws_name, min_tp, check_gear, starting_gearset,
+                            pdt_requirement, mdt_requirement, dt_requirement,
+                            print_swaps, next_best_percent, *, tp_starting_gearset=None,
+                            ws_starting_gearset=None, restarts=1, workers=0, seed=None,
+                            n_iter=10, return_details=False, return_top_results=False,
+                            parallel_mode="search_runs", progress_callback=None,
+                            progress_queue=None, stop_event=None,
+                            combined_defense_both=True):
+    """Find the best WS first, then optimize TP around its fixed weapon pair."""
+    tp_start = dict(tp_starting_gearset or starting_gearset)
+    ws_start = dict(ws_starting_gearset or starting_gearset)
+
+    if progress_callback is not None:
+        progress_callback("Combined optimization: searching WS set first...")
+    ws_pdt = pdt_requirement if combined_defense_both else 199
+    ws_mdt = mdt_requirement if combined_defense_both else 199
+    ws_dt = dt_requirement if combined_defense_both else 199
+    ws_result = optimize_set(
+        main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, "None",
+        "weapon skill", min_tp, check_gear, ws_start, ws_pdt, ws_mdt,
+        "Damage Dealt", print_swaps, next_best_percent, dt_requirement=ws_dt,
+        restarts=restarts, workers=workers, seed=seed, n_iter=n_iter,
+        return_details=True, return_top_results=True, parallel_mode=parallel_mode,
+        progress_callback=progress_callback, progress_queue=progress_queue,
+        stop_event=stop_event,
+    )
+    if progress_callback is not None:
+        progress_callback(
+            "Combined optimization: optimizing TP armor against the same WS main/sub pair..."
+        )
+    # A TP+WS result is one equipment pair.  The TP set may improve every
+    # armor/accessory slot, but its main and sub weapons must remain the same
+    # weapons used by the selected WS set.  WS optimization still considers
+    # all eligible weapon combinations before this constraint is applied.
+    ws_player = ws_result[0]
+    tp_check_gear = {slot: list(items) for slot, items in check_gear.items()}
+    tp_start["main"] = ws_player.gearset["main"]
+    tp_start["sub"] = ws_player.gearset["sub"]
+    for slot in ("main", "sub"):
+        tp_check_gear[slot] = [ws_player.gearset[slot]]
+    tp_result = optimize_set(
+        main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, "None",
+        "combined tp/ws", min_tp, tp_check_gear, tp_start, pdt_requirement, mdt_requirement,
+        "Combined DPS", print_swaps, next_best_percent, dt_requirement=dt_requirement,
+        restarts=restarts, workers=workers, seed=seed, n_iter=n_iter,
+        return_details=True, return_top_results=True, parallel_mode=parallel_mode,
+        progress_callback=progress_callback, progress_queue=progress_queue,
+        stop_event=stop_event, combined_ws_player=ws_player,
+    )
+    tp_top = list(tp_result[4] or [])
+    ws_top = [{"player": ws_result[0], "metric": ws_result[2], "seed": ws_result[3]}]
+    if not tp_top:
+        tp_top = [{"player": tp_result[0], "metric": tp_result[2], "seed": tp_result[3]}]
+
+    ranged_ws_names = {
+        "Empyreal Arrow", "Flaming Arrow", "Namas Arrow", "Jishnu's Radiance",
+        "Apex Arrow", "Refulgent Arrow", "Sidewinder", "Blast Arrow", "Piercing Arrow",
+        "Last Stand", "Hot Shot", "Leaden Salute", "Wildfire", "Coronach",
+        "Trueflight", "Detonator", "Blast Shot", "Slug Shot", "Split Shot",
+    }
+    ws_type = "ranged" if ws_name in ranged_ws_names else "melee"
+    pair_results = []
+    for tp_entry in tp_top:
+        for ws_entry in ws_top:
+            metric, output = _combined_tp_ws_metric_pair(
+                tp_entry["player"], ws_entry["player"], enemy, ws_name, min_tp, ws_type
+            )
+            pair_results.append({
+                "player": CombinedSetResult(tp_entry["player"], ws_entry["player"]),
+                "tp_player": tp_entry["player"], "ws_player": ws_entry["player"],
+                "output": output, "metric": metric,
+                "tp_metric": tp_entry.get("metric"), "ws_metric": ws_entry.get("metric"),
+                "tp_seed": tp_entry.get("seed"), "ws_seed": ws_entry.get("seed"),
+            })
+    pair_results.sort(key=lambda result: result["metric"], reverse=True)
+    for rank, result in enumerate(pair_results[:5], start=1):
+        result["rank"] = rank
+    if not pair_results:
+        raise ValueError("Combined TP + WS optimization returned no usable set pair.")
+    winner = pair_results[0]
+    winning_seed = f"TP {winner.get('tp_seed')} / WS {winner.get('ws_seed')}"
+    if progress_callback is not None:
+        progress_callback(
+            f"Combined optimization complete: DPS {winner['metric']:.6f} "
+            f"(TP set + WS set)."
+        )
+    if return_details:
+        result = winner["player"], winner["output"], winner["metric"], winning_seed
+        if return_top_results:
+            return (*result, pair_results[:5])
+        return result
+    return winner["player"], winner["output"]
+
+
+def _optimize_single_run_parallel(main_job, sub_job, master_level, buffs, abilities, enemy,
+                                  ws_name, spell_name, action_type, min_tp, check_gear,
+                                  starting_gearset, pdt_requirement, mdt_requirement,
+                                  input_metric, print_swaps, next_best_percent, *, dt_requirement=0, workers,
+                                  seed, n_iter, return_details, return_top_results,
+                                  progress_callback, progress_queue, stop_event,
+                                  combined_ws_player=None):
+    """Split one seeded optimizer run into independent slot-pair worker chunks.
+
+    Each round evaluates the same immutable baseline in parallel, merges the
+    best result, then uses it as the next baseline.  This retains the existing
+    per-candidate formulas while making a single large search use multiple CPU
+    processes.
     """
-    restarts = max(1, int(restarts))
+    def drain_progress():
+        if progress_queue is not None and progress_callback is not None:
+            while True:
+                try:
+                    progress_callback(progress_queue.get_nowait())
+                except queue_module.Empty:
+                    break
+
+    def notify(message):
+        drain_progress()
+        if progress_callback is not None:
+            progress_callback(message)
+
+    def check_stopped():
+        if _stop_requested(stop_event):
+            raise OptimizerStopped("Optimizer stopped by user.", results=_unique_ranked_results(history))
+
+    slot_names = sorted(check_gear)
+    slot_pairs = [
+        tuple(sorted((left, right)))
+        for index, left in enumerate(slot_names)
+        for right in slot_names[index:]
+    ]
+    if not slot_pairs:
+        raise ValueError("No optimizer candidate slots were selected.")
+    worker_count = int(workers)
+    if worker_count <= 0:
+        worker_count = max(1, (os.cpu_count() or 2) - 1)
+    worker_count = min(worker_count, len(slot_pairs))
+    # Slot pairs are not equally expensive: a pair of slots with 200
+    # candidates each has 40,000 combinations, while a pair with 10 each has
+    # only 100.  Round-robin assignment left one process working on a huge
+    # pair while most workers went idle.  Greedy weighted bin-packing keeps
+    # the same formulas and baseline merge behavior, but gives each worker a
+    # comparable amount of candidate work.
+    pair_weights = []
+    for left, right in slot_pairs:
+        left_count = len(check_gear.get(left, ()))
+        right_count = len(check_gear.get(right, ()))
+        weight = left_count if left == right else left_count * right_count
+        pair_weights.append((weight, (left, right)))
+    pair_weights.sort(key=lambda entry: entry[0], reverse=True)
+    partitions = [set() for _ in range(worker_count)]
+    partition_loads = [0] * worker_count
+    for weight, pair in pair_weights:
+        index = min(range(worker_count), key=partition_loads.__getitem__)
+        partitions[index].add(pair)
+        partition_loads[index] += weight
+
+    run_seed = int(np.random.SeedSequence(seed).generate_state(1)[0])
+    baseline = dict(starting_gearset)
+    history = []
+    latest = []
+    max_rounds = max(1, int(n_iter))
+    shared_args = (
+        main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name,
+        action_type, min_tp, check_gear, baseline, pdt_requirement, mdt_requirement,
+        input_metric, print_swaps, next_best_percent,
+    )
+    notify(
+        f"Search run 1/1 started in split-worker mode with {worker_count} worker "
+        f"chunks (estimated loads {', '.join(f'{load:,}' for load in partition_loads)}; "
+        f"seed {run_seed})."
+    )
+    for round_index in range(max_rounds):
+        check_stopped()
+        requests = []
+        for index, partition in enumerate(partitions, start=1):
+            requests.append({
+                "args": shared_args[:11] + (baseline,) + shared_args[12:],
+                "kwargs": {
+                    "seed": run_seed,
+                    "n_iter": 1,
+                    "return_details": True,
+                    "dt_requirement": dt_requirement,
+                    "combined_ws_player": combined_ws_player,
+                    "stop_event": stop_event,
+                    "progress_queue": progress_queue,
+                    "slot_pair_filter": partition,
+                    "preserve_starting_gearset": round_index > 0,
+                    "single_outer_pass": True,
+                },
+                "seed": run_seed,
+                "index": index,
+                "progress_label": f"Search run 1/1 · chunk {index}/{worker_count}",
+            })
+        notify(f"Search run 1/1 · split pass {round_index + 1}/{max_rounds} started.")
+        if worker_count == 1:
+            latest = [_build_set_restart_worker(requests[0])]
+        else:
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(_build_set_restart_worker, request) for request in requests]
+                latest = []
+                pending = set(futures)
+                while pending:
+                    # Worker processes report through the manager queue. Drain
+                    # it before and after each wait so progress reaches Qt while
+                    # futures are still running.
+                    drain_progress()
+                    done, pending = wait(pending, timeout=5.0)
+                    drain_progress()
+                    notify(
+                        f"Search run 1/1 · split pass {round_index + 1}/{max_rounds} "
+                        f"is evaluating {len(pending)} worker chunks."
+                    )
+                    for future in done:
+                        latest.append(future.result())
+        history.extend(latest)
+        ranked = _unique_ranked_results(latest, limit=1)
+        if not ranked:
+            if any(result.get("stopped") for result in latest):
+                raise OptimizerStopped("Optimizer stopped by user.", results=_unique_ranked_results(history))
+            # A worker owns only part of the one/two-slot neighborhood.  With
+            # PDT/MDT/DT minimums enabled, no *individual* partition may be
+            # able to meet the final target even though successive swaps from
+            # several partitions form a valid set.  Do one complete, seeded
+            # search instead of reporting that false negative to the user.
+            notify(
+                "Split-worker chunks could not individually satisfy the defensive "
+                "minimums; retrying the full search so defensive slots can combine."
+            )
+            fallback_request = {
+                "args": shared_args[:11] + (baseline,) + shared_args[12:],
+                "kwargs": {
+                    "seed": run_seed,
+                    # ``build_set`` already repeats its outer defensive
+                    # convergence passes.  One full neighborhood pass per
+                    # step keeps this fallback responsive and avoids treating
+                    # split-worker round count as duplicate inner iterations.
+                    "n_iter": 1,
+                    "return_details": True,
+                    "dt_requirement": dt_requirement,
+                    "stop_event": stop_event,
+                    "preserve_starting_gearset": True,
+                },
+                "seed": run_seed,
+                "index": 1,
+            }
+            fallback = _build_set_restart_worker(
+                fallback_request,
+                lambda message: notify(f"Search run 1/1 · full-search fallback: {message}"),
+            )
+            history.append(fallback)
+            if fallback.get("stopped"):
+                raise OptimizerStopped("Optimizer stopped by user.", results=_unique_ranked_results(history))
+            if "error" in fallback:
+                errors = "; ".join(
+                    str(result.get("error", "unknown worker failure")) for result in latest
+                )
+                raise ValueError(
+                    "Split-worker chunks could not form a feasible set, and the full-search "
+                    f"fallback also failed: {fallback['error']} (chunk errors: {errors})"
+                )
+            fallback_ranked = _unique_ranked_results([fallback], limit=1)
+            winner = fallback_ranked[0]
+            top_results = _unique_ranked_results(history)
+            notify("Search run 1/1 · full-search fallback completed.")
+            if return_details:
+                result = winner["player"], winner["output"], winner["metric"], winner["seed"]
+                return (*result, top_results) if return_top_results else result
+            return winner["player"], winner["output"]
+        winner = ranked[0]
+        previous_key = _gearset_mapping_key(baseline)
+        next_key = _gearset_key(winner["player"])
+        baseline = dict(winner["player"].gearset)
+        notify(
+            f"Search run 1/1 · split pass {round_index + 1}/{max_rounds} merged; "
+            f"best metric {winner['metric']:.6f}."
+        )
+        if next_key == previous_key:
+            break
+
+    check_stopped()
+    top_results = _unique_ranked_results(history)
+    if not top_results:
+        raise ValueError("Split-worker search returned no usable gear set.")
+    winner = top_results[0]
+    if return_details:
+        result = winner["player"], winner["output"], winner["metric"], winner["seed"]
+        return (*result, top_results) if return_top_results else result
+    return winner["player"], winner["output"]
+
+
+def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, dt_requirement=0, tp_starting_gearset=None, ws_starting_gearset=None, restarts=1, workers=0, seed=None, n_iter=10, return_details=False, return_top_results=False, parallel_mode="search_runs", progress_callback=None, progress_queue=None, stop_event=None, combined_ws_player=None, combined_defense_both=True):
+    """Run independent seeded searches or one split-worker search.
+
+    ``workers=0`` selects available CPU cores while leaving one core free.
+    ``parallel_mode='single_run'`` assigns disjoint slot-pair groups to those
+    workers and merges each pass against the same seeded baseline.
+    """
+    if action_type == "combined tp/ws" and combined_ws_player is None:
+        return _optimize_combined_pair(
+            main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, min_tp,
+            check_gear, starting_gearset, pdt_requirement, mdt_requirement,
+            dt_requirement, print_swaps, next_best_percent,
+            tp_starting_gearset=tp_starting_gearset,
+            ws_starting_gearset=ws_starting_gearset, restarts=restarts, workers=workers,
+            seed=seed, n_iter=n_iter, return_details=return_details,
+            return_top_results=return_top_results, parallel_mode=parallel_mode,
+            progress_callback=progress_callback, progress_queue=progress_queue,
+            stop_event=stop_event, combined_defense_both=combined_defense_both,
+        )
+    if parallel_mode == "single_run":
+        return _optimize_single_run_parallel(
+            main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
+            spell_name, action_type, min_tp, check_gear, starting_gearset,
+            pdt_requirement, mdt_requirement, input_metric, print_swaps,
+            next_best_percent, dt_requirement=dt_requirement, workers=workers, seed=seed, n_iter=n_iter,
+            return_details=return_details, return_top_results=return_top_results,
+            progress_callback=progress_callback, progress_queue=progress_queue,
+            stop_event=stop_event, combined_ws_player=combined_ws_player,
+        )
+    # Independent runs are deliberately bounded.  Beyond ten, the extra process
+    # and result-management overhead is rarely useful, and the GUI presents one
+    # persistent status card per run.
+    restarts = max(1, min(10, int(restarts)))
     workers = int(workers)
     seed_sequence = np.random.SeedSequence(seed)
     restart_seeds = [int(value) for value in seed_sequence.generate_state(restarts)]
@@ -704,44 +1591,47 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
     requests = [
         {
             "args": shared_args,
-            "kwargs": {"seed": restart_seed, "n_iter": n_iter, "return_details": True},
+            "kwargs": {
+                "seed": restart_seed, "n_iter": n_iter, "return_details": True,
+                "dt_requirement": dt_requirement,
+                "combined_ws_player": combined_ws_player,
+                "stop_event": stop_event,
+                "progress_queue": progress_queue,
+            },
             "seed": restart_seed,
             "index": index,
         }
         for index, restart_seed in enumerate(restart_seeds, start=1)
     ]
 
+    def drain_progress():
+        if progress_queue is not None and progress_callback is not None:
+            while True:
+                try:
+                    progress_callback(progress_queue.get_nowait())
+                except queue_module.Empty:
+                    break
+
     def notify(message):
+        drain_progress()
         if progress_callback is not None:
             progress_callback(message)
 
+    def check_stopped():
+        if _stop_requested(stop_event):
+            raise OptimizerStopped("Optimizer stopped by user.")
+
     def run_serial(request):
-        notify(f"Restart {request['index']}/{restarts} started (seed {request['seed']}).")
-        callback = lambda message: notify(f"Restart {request['index']}: {message}")
-        stop_heartbeat = threading.Event()
-        started_at = time.monotonic()
-
-        def heartbeat():
-            while not stop_heartbeat.wait(5.0):
-                elapsed = time.monotonic() - started_at
-                notify(
-                    f"Restart {request['index']}/{restarts} active "
-                    f"({elapsed:.0f}s elapsed; search is still progressing)."
-                )
-
-        heartbeat_thread = threading.Thread(
-            target=heartbeat, name=f"optimizer-heartbeat-{request['index']}", daemon=True
-        )
-        heartbeat_thread.start()
-        try:
-            result = _build_set_restart_worker(request, callback)
-        finally:
-            stop_heartbeat.set()
-            heartbeat_thread.join(timeout=1.0)
-        if "error" in result:
-            notify(f"Restart {request['index']} failed: {result['error']}")
+        check_stopped()
+        notify(f"Search run {request['index']}/{restarts} started (seed {request['seed']}).")
+        callback = lambda message: notify(f"Search run {request['index']}: {message}")
+        result = _build_set_restart_worker(request, callback)
+        if result.get("stopped"):
+            notify(f"Search run {request['index']} stopped after the current calculation.")
+        elif "error" in result:
+            notify(f"Search run {request['index']} failed: {result['error']}")
         else:
-            notify(f"Restart {request['index']}/{restarts} completed.")
+            notify(f"Search run {request['index']}/{restarts} completed.")
         return result
 
     if restarts == 1:
@@ -754,58 +1644,111 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
         if max_workers == 1:
             results = [run_serial(request) for request in requests]
         else:
+            notify(
+                f"Independent mode using {max_workers} worker processes for "
+                f"{restarts} search runs."
+            )
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                check_stopped()
                 for request in requests:
-                    notify(f"Restart {request['index']}/{restarts} started (seed {request['seed']}).")
+                    notify(f"Search run {request['index']}/{restarts} started (seed {request['seed']}).")
                 futures = {
                     executor.submit(_build_set_restart_worker, request): request
                     for request in requests
                 }
                 results = []
                 pending = set(futures)
-                started_at = {future: time.monotonic() for future in pending}
                 while pending:
-                    done, pending = wait(pending, timeout=5.0)
-                    if not done:
-                        now = time.monotonic()
-                        for future in sorted(pending, key=lambda value: futures[value]["index"]):
-                            request = futures[future]
-                            elapsed = now - started_at[future]
-                            notify(
-                                f"Restart {request['index']}/{restarts} active "
-                                f"({elapsed:.0f}s elapsed; worker is still progressing)."
-                            )
+                    stopping = _stop_requested(stop_event)
+                    # Do not wait for a process to finish before forwarding its
+                    # queue messages to the GUI.
+                    drain_progress()
+                    done, pending = wait(pending, timeout=1.0 if stopping else 5.0)
+                    drain_progress()
                     for future in done:
                         request = futures[future]
                         result = future.result()
                         results.append(result)
-                        if "error" in result:
-                            notify(f"Restart {request['index']} failed: {result['error']}")
+                        if result.get("stopped"):
+                            notify(f"Search run {request['index']} stopped after the current calculation.")
+                        elif "error" in result:
+                            notify(f"Search run {request['index']} failed: {result['error']}")
                         else:
-                            notify(f"Restart {request['index']}/{restarts} completed.")
+                            notify(f"Search run {request['index']}/{restarts} completed.")
 
     results.sort(key=lambda result: result["index"])
 
     successful_results = [result for result in results if "error" not in result]
-    if not successful_results:
-        errors = "; ".join(
-            f"seed {result['seed']}: {result['error']}" for result in results
-        )
-        raise ValueError(f"All optimizer restarts failed. {errors}")
-
-    winner = max(successful_results, key=lambda result: result["metric"])
-    print(winner["log"], end="")
-    if restarts > 1:
+    top_results = _rank_optimizer_results(results)
+    if not top_results:
+        if any(result.get("stopped") for result in results):
+            raise OptimizerStopped("Optimizer stopped before a usable set was completed.")
+        # Restarts begin from randomized candidate sets.  When every restart
+        # rejects a defensive target, give the exact user-selected starting
+        # set one complete convergence search before declaring the target
+        # impossible.  This preserves the PDT/MDT/DT gate; it only avoids a
+        # random-start false negative.
         notify(
-            f"Selected restart {winner['index']}/{restarts} "
+            "All independent search runs missed the defensive minimums; retrying "
+            "a full search from the selected set."
+        )
+        fallback_seed = restart_seeds[0]
+        fallback_request = {
+            "args": shared_args[:11] + (dict(starting_gearset),) + shared_args[12:],
+            "kwargs": {
+                "seed": fallback_seed,
+                "n_iter": 1,
+                "return_details": True,
+                "dt_requirement": dt_requirement,
+                "stop_event": stop_event,
+                "preserve_starting_gearset": True,
+            },
+            "seed": fallback_seed,
+            "index": 0,
+        }
+        fallback = _build_set_restart_worker(
+            fallback_request,
+            lambda message: notify(f"Full-search fallback: {message}"),
+        )
+        results.append(fallback)
+        if fallback.get("stopped"):
+            raise OptimizerStopped("Optimizer stopped by user.")
+        if "error" in fallback:
+            errors = "; ".join(
+                f"seed {result['seed']}: {result.get('error', 'unknown worker failure')}"
+                for result in results
+            )
+            raise ValueError(
+                "All optimizer search runs failed, and the full-search fallback also failed. "
+                f"{errors}"
+            )
+        successful_results = [fallback]
+        top_results = _rank_optimizer_results([fallback])
+        notify("Full-search fallback completed.")
+
+    if _stop_requested(stop_event):
+        raise OptimizerStopped("Optimizer stopped by user.", results=top_results)
+
+    winner = top_results[0]
+    winner_result = max(successful_results, key=lambda result: result["metric"])
+    print(winner_result["log"], end="")
+    if winner.get("index") == 0:
+        notify(f"Selected full-search fallback (seed {winner['seed']}; metric {winner['metric']:.6f}).")
+        print(f"Selected full-search fallback (seed {winner['seed']}; metric {winner['metric']:.6f}).")
+    elif restarts > 1:
+        notify(
+            f"Selected search run {winner['index']}/{restarts} "
             f"(seed {winner['seed']}; metric {winner['metric']:.6f})."
         )
         print(
-            f"Selected restart {winner['index']}/{restarts} "
+            f"Selected search run {winner['index']}/{restarts} "
             f"(seed {winner['seed']}; metric {winner['metric']:.6f})."
         )
     if return_details:
-        return winner["player"], winner["output"], winner["metric"], winner["seed"]
+        result = winner["player"], winner["output"], winner["metric"], winner["seed"]
+        if return_top_results:
+            return (*result, top_results)
+        return result
     return winner["player"], winner["output"]
 
 if __name__ == "__main__":
