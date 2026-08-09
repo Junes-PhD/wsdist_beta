@@ -1751,6 +1751,96 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
         return result
     return winner["player"], winner["output"]
 
+
+def rank_weapon_skills(main_job, sub_job, master_level, buffs, abilities, enemy,
+                       weapon_skill_names, ws_type, check_gear, starting_gearset,
+                       pdt_requirement, mdt_requirement, *, dt_requirement=0,
+                       tp_values=(1000, 2000, 3000), restarts=1, workers=0,
+                       seed=None, n_iter=10, parallel_mode="search_runs",
+                       progress_callback=None, progress_queue=None, stop_event=None):
+    """Optimize and rank every supplied WS independently at each TP tier.
+
+    Weapon-slot locking belongs to the caller because the GUI knows which
+    selected melee/ranged setup defines the comparison.  Failed or restricted
+    weapon skills are returned as diagnostics so one unsupported WS does not
+    discard the useful rankings for the rest of the weapon type.
+    """
+    names = list(dict.fromkeys(str(name) for name in weapon_skill_names if name))
+    tiers = tuple(int(value) for value in tp_values)
+    if not names:
+        raise ValueError("The selected weapon type has no modeled weapon skills.")
+    if not tiers or any(value < 1000 or value > 3000 for value in tiers):
+        raise ValueError("Weapon-skill ranking TP values must be between 1000 and 3000.")
+
+    total = len(names) * len(tiers)
+    completed = 0
+    rankings = {value: [] for value in tiers}
+    errors = []
+
+    def notify(message):
+        if progress_callback is not None:
+            progress_callback(message)
+
+    for tier_index, tp_value in enumerate(tiers):
+        for ws_index, ws_name in enumerate(names):
+            if _stop_requested(stop_event):
+                raise OptimizerStopped("Weapon-skill ranking stopped by user.")
+            cell_seed = None if seed is None else int(seed) + tier_index * len(names) + ws_index
+            notify(
+                f"WS ranking {completed + 1}/{total}: optimizing {ws_name} at "
+                f"{tp_value:,} TP."
+            )
+            try:
+                player, output, metric, winning_seed = optimize_set(
+                    main_job, sub_job, master_level, buffs, abilities, enemy,
+                    ws_name, "", "weapon skill", tp_value, check_gear,
+                    dict(starting_gearset), pdt_requirement, mdt_requirement,
+                    "Damage dealt", False, 2, dt_requirement=dt_requirement,
+                    restarts=restarts, workers=workers, seed=cell_seed,
+                    n_iter=n_iter, return_details=True,
+                    parallel_mode=parallel_mode,
+                    progress_callback=(
+                        lambda message, name=ws_name, tp=tp_value:
+                        notify(f"{name} @ {tp:,} TP: {message}")
+                    ),
+                    progress_queue=progress_queue, stop_event=stop_event,
+                )
+                damage = float(output[0])
+                rankings[tp_value].append({
+                    "ws_name": ws_name,
+                    "tp": tp_value,
+                    "damage": damage,
+                    "player": player,
+                    "output": output,
+                    "metric": float(metric),
+                    "seed": winning_seed,
+                })
+            except OptimizerStopped:
+                raise
+            except Exception as error:
+                errors.append({
+                    "ws_name": ws_name,
+                    "tp": tp_value,
+                    "error": str(error),
+                })
+                notify(f"WS ranking skipped {ws_name} at {tp_value:,} TP: {error}")
+            completed += 1
+
+    for tp_value in tiers:
+        rankings[tp_value].sort(
+            key=lambda row: (-row["damage"], row["ws_name"].casefold())
+        )
+        for rank, row in enumerate(rankings[tp_value], start=1):
+            row["rank"] = rank
+    if not any(rankings.values()):
+        detail = errors[0]["error"] if errors else "No usable result was returned."
+        raise ValueError(f"No weapon skill could be ranked: {detail}")
+    notify(
+        f"WS ranking complete: {completed - len(errors)}/{total} optimized "
+        f"successfully."
+    )
+    return {"tp_values": tiers, "rankings": rankings, "errors": errors}
+
 if __name__ == "__main__":
 
     if len(sys.argv) > 1:

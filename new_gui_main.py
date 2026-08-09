@@ -186,6 +186,25 @@ def _optimizer_check_gear(candidates: dict[str, set[str]], items_by_slot: dict[s
     return check_gear, empty_weapon_slots
 
 
+def _ranking_weapon_types(gearset: dict[str, dict]) -> list[str]:
+    """Return modeled skill types from the selected melee/ranged weapons."""
+    values = []
+    for slot in ("main", "ranged", "ammo"):
+        skill = str(gearset.get(slot, {}).get("Skill Type") or "None")
+        if skill != "None" and skill in WS_BY_SKILL and skill not in values:
+            values.append(skill)
+    return values
+
+
+def _lock_ranking_weapon_slots(check_gear: dict[str, list[dict]],
+                               selected_gear: dict[str, dict]) -> dict[str, list[dict]]:
+    """Freeze the current weapon setup so every ranked WS is comparable."""
+    locked = {slot: list(items) for slot, items in check_gear.items()}
+    for slot in WEAPON_SLOTS:
+        locked[slot] = [selected_gear.get(slot, gear.Empty)]
+    return locked
+
+
 def _profile_ws_name(set_name: str) -> str | None:
     lowered = set_name.casefold()
     compact = re.sub(r"[^a-z0-9]+", "", lowered)
@@ -550,10 +569,11 @@ class OptimizeThread(QThread):
     failed = pyqtSignal(str)
     stopped = pyqtSignal(object)
 
-    def __init__(self, args: tuple, kwargs: dict, parent=None):
+    def __init__(self, args: tuple, kwargs: dict, parent=None, *, target=None):
         super().__init__(parent)
         self.args = args
         self.kwargs = kwargs
+        self.target = target or wsdist.optimize_set
         self._stop_requested = threading.Event()
         self._shared_stop_event = None
         self._manager = None
@@ -579,7 +599,7 @@ class OptimizeThread(QThread):
                 self._shared_stop_event.set()
             kwargs["stop_event"] = self._shared_stop_event
             kwargs["progress_queue"] = manager.Queue()
-            self.succeeded.emit(wsdist.optimize_set(*self.args, **kwargs))
+            self.succeeded.emit(self.target(*self.args, **kwargs))
         except wsdist.OptimizerStopped as error:
             self.stopped.emit({"message": str(error), "top_results": error.results})
         except Exception as error:
@@ -733,6 +753,76 @@ class TopSetsDialog(QDialog):
             grid.addWidget(cell, row, column)
 
 
+class WeaponSkillRankingDialog(QDialog):
+    """Three-column ranking of independently optimized WS sets."""
+
+    def __init__(self, result: dict, icons: GearIconProvider, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Weapon-skill rankings")
+        self.resize(980, 680)
+        self.cell_results = {}
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            f"{result.get('skill_type') or 'Selected weapon'}: each column is optimized "
+            "and ranked independently for the current enemy, buffs, abilities, "
+            "candidates, and locked weapon setup."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        tiers = tuple(result.get("tp_values") or (1000, 2000, 3000))
+        rankings = result.get("rankings") or {}
+        row_count = max((len(rankings.get(tp, ())) for tp in tiers), default=0)
+        self.table = QTableWidget(row_count, len(tiers))
+        self.table.setHorizontalHeaderLabels([f"{tp:,} TP ranking" for tp in tiers])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        for column, tp_value in enumerate(tiers):
+            for row, entry in enumerate(rankings.get(tp_value, ())):
+                item = QTableWidgetItem(
+                    f"{entry.get('rank', row + 1)}. {entry['ws_name']}\n"
+                    f"{float(entry['damage']):,.0f} average damage"
+                )
+                item.setData(Qt.ItemDataRole.UserRole, float(entry["damage"]))
+                item.setToolTip(
+                    f"Seed: {entry.get('seed')}\n"
+                    "Select this cell to load its optimized set into the WS editor."
+                )
+                self.table.setItem(row, column, item)
+                self.cell_results[(row, column)] = entry
+        self.table.resizeColumnsToContents()
+        self.table.resizeRowsToContents()
+        layout.addWidget(self.table, 1)
+        errors = list(result.get("errors") or ())
+        if errors:
+            error_label = QLabel(
+                f"{len(errors)} unsupported or infeasible WS/TP evaluations were skipped. "
+                "Details are available in the optimizer log."
+            )
+            error_label.setWordWrap(True)
+            layout.addWidget(error_label)
+        controls = QHBoxLayout()
+        load = QPushButton("Load selected optimized WS set")
+        load.setEnabled(parent is not None)
+        load.clicked.connect(self._load_selected)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        controls.addWidget(load)
+        controls.addStretch(1)
+        controls.addWidget(close)
+        layout.addLayout(controls)
+
+    def _load_selected(self):
+        indexes = self.table.selectedIndexes()
+        if not indexes:
+            return
+        index = indexes[0]
+        entry = self.cell_results.get((index.row(), index.column()))
+        if entry is not None and self.parent() is not None:
+            self.parent().load_ws_ranking_result(entry)
+            self.accept()
+
+
 def _report_enemy(raw_enemy: dict, debuffs: dict | None = None):
     """Create an enemy after applying the same debuff model as the legacy UI."""
     source = dict(raw_enemy)
@@ -854,6 +944,7 @@ class MainWindow(QMainWindow):
         self.best_tp_player = None
         self.best_ws_player = None
         self.optimizer_top_results: list[dict] = []
+        self._ranking_skill_in_progress: str | None = None
         self._optimizer_run_state: dict[int, dict] = {}
         self._optimizer_started_at: float | None = None
         self._optimizer_status_timer = QTimer(self)
@@ -1525,13 +1616,21 @@ class MainWindow(QMainWindow):
         options = QGroupBox("Search")
         form = QFormLayout(options)
         self.optimize_action = QComboBox()
-        self.optimize_action.addItems(["Weapon skill", "Attack round", "Spell", "Combined TP + WS"])
+        self.optimize_action.addItems([
+            "Weapon skill", "Rank weapon-type WS", "Attack round", "Spell",
+            "Combined TP + WS",
+        ])
         self.optimize_action.setToolTip(
             "Combined TP + WS finds the best WS set first, then optimizes the TP set "
             "against that WS set using the same main/sub weapons and full-cycle DPS "
             "(TP-round damage plus WS damage, divided by TP time plus the 2-second WS delay)."
         )
         self.metric_combo = QComboBox()
+        self.ranking_weapon_type = QComboBox()
+        self.ranking_weapon_type.setToolTip(
+            "Ranks every modeled weapon skill for this selected weapon type. "
+            "The current Main/Sub/Range/Ammo setup is frozen for a fair comparison."
+        )
         self.optimize_action.currentTextChanged.connect(self._refresh_optimizer_metrics)
         self.optimize_action.currentTextChanged.connect(self._refresh_combined_options)
         self.pdt = QSpinBox()
@@ -1581,6 +1680,7 @@ class MainWindow(QMainWindow):
         )
         form.addRow("Action", self.optimize_action)
         form.addRow("Metric", self.metric_combo)
+        form.addRow("Ranking weapon type", self.ranking_weapon_type)
         form.addRow("Minimum PDT reduction %", self.pdt)
         form.addRow("Minimum MDT reduction %", self.mdt)
         form.addRow("Minimum DT reduction %", self.dt)
@@ -1651,6 +1751,7 @@ class MainWindow(QMainWindow):
         self.show_top_sets_button.clicked.connect(self.show_top_sets)
         layout.addWidget(self.show_top_sets_button, 0, Qt.AlignmentFlag.AlignRight)
         self._refresh_optimizer_metrics(self.optimize_action.currentText())
+        self._refresh_ranking_weapon_types()
         self._refresh_combined_options(self.optimize_action.currentText())
         self._refresh_parallel_mode(self.parallel_mode.currentText())
         self._refresh_candidate_preset_names()
@@ -1659,6 +1760,7 @@ class MainWindow(QMainWindow):
     def _refresh_optimizer_metrics(self, action: str):
         metrics = {
             "Weapon skill": ["Damage dealt", "TP return", "Magic accuracy"],
+            "Rank weapon-type WS": ["Average damage at 1000 / 2000 / 3000 TP"],
             "Attack round": ["Time to WS", "Damage dealt", "TP return", "DPS"],
             "Spell": ["Damage dealt", "TP return"],
             "Combined TP + WS": ["Combined DPS"],
@@ -1671,6 +1773,23 @@ class MainWindow(QMainWindow):
 
     def _refresh_combined_options(self, action: str):
         self.combined_defense_both.setVisible(action == "Combined TP + WS")
+        ranking = action == "Rank weapon-type WS"
+        self.ranking_weapon_type.setVisible(ranking)
+        label = self.ranking_weapon_type.parentWidget().layout().labelForField(
+            self.ranking_weapon_type
+        )
+        if label is not None:
+            label.setVisible(ranking)
+
+    def _refresh_ranking_weapon_types(self):
+        if not hasattr(self, "ranking_weapon_type") or not hasattr(self, "quick_set"):
+            return
+        current = self.ranking_weapon_type.currentText()
+        values = _ranking_weapon_types(self.quick_set.items)
+        self.ranking_weapon_type.clear()
+        self.ranking_weapon_type.addItems(values)
+        if current in values:
+            self.ranking_weapon_type.setCurrentText(current)
 
     def _refresh_parallel_mode(self, mode: str):
         split_one_run = mode == "Split one search run"
@@ -3073,6 +3192,7 @@ class MainWindow(QMainWindow):
             editor.refresh_icons()
         self._reset_invalid_equipment()
         self._refresh_ws_choices()
+        self._refresh_ranking_weapon_types()
         self.refresh_quick_stats()
 
     def _gear_changed(self):
@@ -3083,6 +3203,7 @@ class MainWindow(QMainWindow):
                 self.candidates[slot].add(name)
                 self._update_candidate_button(slot)
         self._refresh_ws_choices()
+        self._refresh_ranking_weapon_types()
         self.refresh_quick_stats()
 
     def _refresh_ws_choices(self):
@@ -3202,10 +3323,23 @@ class MainWindow(QMainWindow):
                     f"No optimizer candidates are selected for {labels}. "
                     "Select a weapon or explicitly select Empty; the current Quick Look weapon will not be added automatically."
                 )
+            action_label = self.optimize_action.currentText()
+            ranking_mode = action_label == "Rank weapon-type WS"
+            ranking_skill = self.ranking_weapon_type.currentText().strip() if ranking_mode else ""
+            if ranking_mode:
+                if ranking_skill not in WS_BY_SKILL:
+                    raise ValueError(
+                        "Equip a modeled melee or ranged weapon before running WS rankings."
+                    )
+                check_gear = _lock_ranking_weapon_slots(check_gear, self.quick_set.items)
+            optimizer_ws_type = (
+                "ranged" if ranking_skill in {"Archery", "Marksmanship"}
+                else "melee" if ranking_mode else self._ws_type()
+            )
             if not any(len(values) > 1 for values in check_gear.values()):
                 raise ValueError("Select at least two candidates in one slot.")
             raw_checks = wsdist.estimate_candidate_checks(
-                check_gear, JOBS[self.main_job.currentText()], self._ws_type()
+                check_gear, JOBS[self.main_job.currentText()], optimizer_ws_type
             )
             pruned_count = 0
             if self.prune_candidates.isChecked():
@@ -3216,7 +3350,8 @@ class MainWindow(QMainWindow):
                 "Weapon skill": "weapon skill", "Attack round": "attack round",
                 "Spell": "spell cast",
                 "Combined TP + WS": "combined tp/ws",
-            }[self.optimize_action.currentText()]
+                "Rank weapon-type WS": "rank weapon skills",
+            }[action_label]
             if action_type in {"weapon skill", "combined tp/ws"} and self.ws_combo.currentText() in {"", "None"}:
                 raise ValueError("Select a weapon skill for this optimizer mode.")
             # The original optimizer uses negative damage-taken values.  Its
@@ -3225,33 +3360,48 @@ class MainWindow(QMainWindow):
             pdt_requirement = -self.pdt.value() if self.pdt.value() else 199
             mdt_requirement = -self.mdt.value() if self.mdt.value() else 199
             dt_requirement = -self.dt.value() if self.dt.value() else 199
-            args = (
+            parallel_mode = (
+                "single_run" if self.parallel_mode.currentText() == "Split one search run"
+                else "search_runs"
+            )
+            common = (
                 JOBS[self.main_job.currentText()], JOBS.get(self.sub_job.currentText(), "None"),
                 self.master_level.value(), buffs, abilities, enemy,
-                self.ws_combo.currentText(), self.spell_combo.currentText(), action_type,
-                self.tp_value.value(), check_gear, dict(self.quick_set.items),
-                pdt_requirement, mdt_requirement, self.metric_combo.currentText(), False, 2,
             )
-            kwargs = {
-                "restarts": self.restarts.value(), "workers": self.workers.value(),
-                "seed": seed, "return_details": True, "return_top_results": True,
-                "dt_requirement": dt_requirement,
-                "combined_defense_both": self.combined_defense_both.isChecked(),
-                "tp_starting_gearset": dict(self.tp_set.items),
-                "ws_starting_gearset": dict(self.ws_set.items),
-                "parallel_mode": (
-                    "single_run" if self.parallel_mode.currentText() == "Split one search run"
-                    else "search_runs"
-                ),
-            }
+            if ranking_mode:
+                args = common + (
+                    list(WS_BY_SKILL[ranking_skill]), optimizer_ws_type, check_gear,
+                    dict(self.quick_set.items), pdt_requirement, mdt_requirement,
+                )
+                kwargs = {
+                    "dt_requirement": dt_requirement,
+                    "tp_values": (1000, 2000, 3000),
+                    "restarts": self.restarts.value(), "workers": self.workers.value(),
+                    "seed": seed, "parallel_mode": parallel_mode,
+                }
+            else:
+                args = common + (
+                    self.ws_combo.currentText(), self.spell_combo.currentText(), action_type,
+                    self.tp_value.value(), check_gear, dict(self.quick_set.items),
+                    pdt_requirement, mdt_requirement, self.metric_combo.currentText(), False, 2,
+                )
+                kwargs = {
+                    "restarts": self.restarts.value(), "workers": self.workers.value(),
+                    "seed": seed, "return_details": True, "return_top_results": True,
+                    "dt_requirement": dt_requirement,
+                    "combined_defense_both": self.combined_defense_both.isChecked(),
+                    "tp_starting_gearset": dict(self.tp_set.items),
+                    "ws_starting_gearset": dict(self.ws_set.items),
+                    "parallel_mode": parallel_mode,
+                }
             checks = wsdist.estimate_candidate_checks(
-                check_gear, JOBS[self.main_job.currentText()], self._ws_type()
+                check_gear, JOBS[self.main_job.currentText()], optimizer_ws_type
             )
             self.optimizer_log.clear()
             self.optimizer_top_results = []
             self._optimizer_run_state = {}
             self._optimizer_started_at = time.monotonic()
-            run_count = 1 if kwargs["parallel_mode"] == "single_run" else self.restarts.value()
+            run_count = 1 if ranking_mode or kwargs["parallel_mode"] == "single_run" else self.restarts.value()
             self._initialize_optimizer_run_cards(run_count)
             self._optimizer_status_timer.start()
             self.show_top_sets_button.setEnabled(False)
@@ -3272,9 +3422,15 @@ class MainWindow(QMainWindow):
             self.optimize_button.setEnabled(False)
             self.stop_optimizer_button.setEnabled(True)
             self.equip_best_button.setEnabled(False)
-            self.optimizer_thread = OptimizeThread(args, kwargs, self)
+            self._ranking_skill_in_progress = ranking_skill if ranking_mode else None
+            self.optimizer_thread = OptimizeThread(
+                args, kwargs, self,
+                target=wsdist.rank_weapon_skills if ranking_mode else None,
+            )
             self.optimizer_thread.progress.connect(self._optimizer_progress)
-            self.optimizer_thread.succeeded.connect(self._optimizer_done)
+            self.optimizer_thread.succeeded.connect(
+                self._ws_ranking_done if ranking_mode else self._optimizer_done
+            )
             self.optimizer_thread.failed.connect(self._optimizer_failed)
             self.optimizer_thread.stopped.connect(self._optimizer_stopped)
             self.optimizer_thread.start()
@@ -3521,6 +3677,41 @@ class MainWindow(QMainWindow):
             state["phase"] = phase.group(1).strip().rstrip(".")
         self._refresh_optimizer_status()
 
+    def _ws_ranking_done(self, result: dict):
+        self._optimizer_status_timer.stop()
+        for state in self._optimizer_run_state.values():
+            state["phase"] = "completed"
+            state["fraction"] = 1.0
+        self._refresh_optimizer_status()
+        result = dict(result)
+        result["skill_type"] = self._ranking_skill_in_progress or "Selected weapon"
+        self._ranking_skill_in_progress = None
+        errors = list(result.get("errors") or ())
+        for error in errors:
+            self._append_optimizer_log(
+                f"Skipped {error.get('ws_name')} at {int(error.get('tp') or 0):,} TP: "
+                f"{error.get('error')}"
+            )
+        success_count = sum(
+            len(rows) for rows in (result.get("rankings") or {}).values()
+        )
+        self._append_optimizer_log(
+            f"Weapon-skill ranking complete Â· {success_count} optimized results Â· "
+            f"{len(errors)} skipped"
+        )
+        self.optimize_button.setEnabled(True)
+        self.stop_optimizer_button.setEnabled(False)
+        self.equip_best_button.setEnabled(False)
+        self.show_top_sets_button.setEnabled(False)
+        self.optimizer_activity.setText("Completed")
+        self.optimizer_progress_value.setText("Approx. progress: 100.0%")
+        self.optimizer_eta_value.setText("Estimated time remaining: complete")
+        self.optimizer_best_value.setText("Best metric: see three-column ranking")
+        self.optimizer_phase_value.setText("Current phase: finished")
+        self.ws_ranking_dialog = WeaponSkillRankingDialog(result, self.icons, self)
+        self.ws_ranking_dialog.show()
+        self.statusBar().showMessage("Weapon-skill ranking completed", 5000)
+
     def _optimizer_done(self, result):
         self._optimizer_status_timer.stop()
         for state in self._optimizer_run_state.values():
@@ -3547,6 +3738,7 @@ class MainWindow(QMainWindow):
 
     def _optimizer_failed(self, message: str):
         self._optimizer_status_timer.stop()
+        self._ranking_skill_in_progress = None
         for state in self._optimizer_run_state.values():
             if state.get("phase") not in {"completed", "stopped"}:
                 state["phase"] = "failed"
@@ -3560,6 +3752,7 @@ class MainWindow(QMainWindow):
 
     def _optimizer_stopped(self, payload):
         self._optimizer_status_timer.stop()
+        self._ranking_skill_in_progress = None
         for state in self._optimizer_run_state.values():
             if state.get("phase") != "completed":
                 state["phase"] = "stopped"
@@ -3591,6 +3784,15 @@ class MainWindow(QMainWindow):
             self._append_optimizer_log("Stop requested; finishing the current calculation...")
 
     def _optimizer_progress(self, message: str):
+        ranking = re.search(r"WS ranking (\d+)/(\d+):\s*(.+)", message)
+        if ranking:
+            current, total = int(ranking.group(1)), int(ranking.group(2))
+            self.optimizer_progress_value.setText(
+                f"Approx. progress: {(current - 1) / max(1, total) * 100:.1f}%"
+            )
+            self.optimizer_phase_value.setText(
+                f"Current phase: {ranking.group(3)}"
+            )
         self._update_optimizer_run_state(message)
         if not re.search(r"Search run \d+", message):
             self._append_optimizer_log(message)
@@ -3625,6 +3827,18 @@ class MainWindow(QMainWindow):
             self.quick_set.set_gearset(tp_player.gearset)
             self.tabs.setCurrentIndex(0)
             self.statusBar().showMessage("Loaded selected TP result into Quick Look", 5000)
+
+    def load_ws_ranking_result(self, entry: dict):
+        player = entry.get("player")
+        if player is None:
+            return
+        self.ws_set.set_gearset(player.gearset)
+        self.ws_combo.setCurrentText(str(entry.get("ws_name") or "None"))
+        self.tp_value.setValue(int(entry.get("tp") or 1000))
+        self.tabs.setCurrentIndex(2)
+        self.statusBar().showMessage(
+            f"Loaded {entry.get('ws_name')} optimized WS set", 5000
+        )
 
     def equip_best(self):
         if self.best_player is not None:
