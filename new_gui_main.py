@@ -922,21 +922,25 @@ class GearBlacklistDialog(QDialog):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
-        row = QHBoxLayout()
-        self.entry = QLineEdit()
-        self.entry.setPlaceholderText("Item name, e.g. Example Breastplate")
-        add = QPushButton("Add")
-        add.clicked.connect(self._add)
-        self.entry.returnPressed.connect(self._add)
-        row.addWidget(self.entry, 1)
-        row.addWidget(add)
-        layout.addLayout(row)
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Filter available gear...")
+        self.filter.textChanged.connect(self._filter_items)
+        layout.addWidget(self.filter)
         self.items = QListWidget()
-        self.items.addItems(sorted(parent.gear_blacklist))
+        self.items.setAlternatingRowColors(True)
+        self.items.setToolTip("Check an item to hide it from every character and optimizer section.")
+        available_items = parent.available_blacklist_items()
+        for key in parent.gear_blacklist:
+            available_items.setdefault(key, key)
+        for key, label in available_items.items():
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if key in parent.gear_blacklist else Qt.CheckState.Unchecked
+            )
+            self.items.addItem(item)
         layout.addWidget(self.items, 1)
-        remove = QPushButton("Remove selected")
-        remove.clicked.connect(lambda: self.items.takeItem(self.items.currentRow()))
-        layout.addWidget(remove, 0, Qt.AlignmentFlag.AlignLeft)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -944,19 +948,17 @@ class GearBlacklistDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _add(self):
-        value = self.entry.text().strip()
-        if not value:
-            return
-        normalized = _normalized_item_name(value)
-        if not any(self.items.item(index).text() == normalized for index in range(self.items.count())):
-            self.items.addItem(normalized)
-        self.entry.clear()
+    def _filter_items(self, text: str):
+        needle = text.strip().casefold()
+        for index in range(self.items.count()):
+            item = self.items.item(index)
+            item.setHidden(bool(needle) and needle not in item.text().casefold())
 
     def _save(self):
         values = {
-            _normalized_item_name(self.items.item(index).text())
+            str(self.items.item(index).data(Qt.ItemDataRole.UserRole) or "")
             for index in range(self.items.count())
+            if self.items.item(index).checkState() == Qt.CheckState.Checked
         }
         self.parent().set_gear_blacklist(values)
         self.accept()
@@ -1351,6 +1353,36 @@ class MainWindow(QMainWindow):
             _normalized_item_name(value) for value in values
             if _normalized_item_name(value)
         }
+
+    def available_blacklist_items(self) -> dict[str, str]:
+        """Return selectable base item names from every discovered inventory."""
+        available: dict[str, str] = {}
+
+        def add(item: dict):
+            if item_name(item) == "Empty":
+                return
+            base = _normalized_item_name(item.get("Name") or item.get("Name2"))
+            if base:
+                available.setdefault(base, str(item.get("Name") or item.get("Name2")))
+
+        for values in self.equipment.values():
+            for item in values:
+                add(item)
+        for item in self.bridge_store.catalog.values():
+            if item.get("Eligible"):
+                add(item)
+        for label, path in self.character_paths.items():
+            if self.bridge_store.bridge_path and path.resolve() == self.bridge_store.bridge_path.resolve():
+                continue
+            try:
+                store = BridgeStore(self.bridge_store.ashita_root)
+                store.load(path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            for item in store.catalog.values():
+                if item.get("Eligible"):
+                    add(item)
+        return dict(sorted(available.items(), key=lambda entry: entry[1].casefold()))
 
     def set_gear_blacklist(self, values: set[str]) -> None:
         self.gear_blacklist = {
