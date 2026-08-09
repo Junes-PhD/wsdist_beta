@@ -969,6 +969,7 @@ class WeaponSkillRankingDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Weapon-skill rankings")
         self.resize(980, 680)
+        self.icons = icons
         self.cell_results = {}
         layout = QVBoxLayout(self)
         note = QLabel(
@@ -1001,7 +1002,22 @@ class WeaponSkillRankingDialog(QDialog):
                 self.cell_results[(row, column)] = entry
         self.table.resizeColumnsToContents()
         self.table.resizeRowsToContents()
-        layout.addWidget(self.table, 1)
+        self.table.currentCellChanged.connect(self._selection_changed)
+        content = QHBoxLayout()
+        content.addWidget(self.table, 1)
+        preview_box = QGroupBox("Selected WS set")
+        preview_box.setMinimumWidth(360)
+        preview_box_layout = QVBoxLayout(preview_box)
+        self.preview_scroll = QScrollArea()
+        self.preview_scroll.setWidgetResizable(True)
+        self.preview_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.preview_widget = QWidget()
+        self.preview_layout = QGridLayout(self.preview_widget)
+        self.preview_layout.setContentsMargins(2, 2, 2, 2)
+        self.preview_scroll.setWidget(self.preview_widget)
+        preview_box_layout.addWidget(self.preview_scroll, 1)
+        content.addWidget(preview_box, 0)
+        layout.addLayout(content, 1)
         errors = list(result.get("errors") or ())
         if errors:
             error_label = QLabel(
@@ -1020,6 +1036,58 @@ class WeaponSkillRankingDialog(QDialog):
         controls.addStretch(1)
         controls.addWidget(close)
         layout.addLayout(controls)
+        for row in range(self.table.rowCount()):
+            for column in range(self.table.columnCount()):
+                if self.table.item(row, column) is not None:
+                    self.table.setCurrentCell(row, column)
+                    return
+
+    def _selection_changed(self, *_args):
+        indexes = self.table.selectedIndexes()
+        if not indexes:
+            self._render_preview(None)
+            return
+        index = indexes[0]
+        self._render_preview(self.cell_results.get((index.row(), index.column())))
+
+    def _render_preview(self, entry: dict | None):
+        while self.preview_layout.count():
+            item = self.preview_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        if entry is None:
+            self.preview_layout.addWidget(QLabel("Select a WS ranking cell to preview its set."), 0, 0)
+            return
+        title = QLabel(
+            f"{entry.get('ws_name', 'Weapon skill')} · {int(entry.get('tp') or 0):,} TP\n"
+            f"{float(entry.get('damage') or 0):,.0f} average damage"
+        )
+        title.setObjectName("sectionTitle")
+        title.setWordWrap(True)
+        self.preview_layout.addWidget(title, 0, 0, 1, 2)
+        player = entry.get("player")
+        gearset = getattr(player, "gearset", {}) if player is not None else {}
+        for index, slot in enumerate(SLOTS, start=1):
+            item = gearset.get(slot, gear.Empty)
+            cell = QFrame()
+            cell.setMinimumHeight(58)
+            cell.setFrameShape(QFrame.Shape.StyledPanel)
+            cell_layout = QHBoxLayout(cell)
+            cell_layout.setContentsMargins(4, 3, 4, 3)
+            icon_label = QLabel()
+            icon_label.setFixedSize(34, 34)
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon = self.icons.icon(item)
+            if not icon.isNull():
+                icon_label.setPixmap(icon.pixmap(QSize(30, 30)))
+            cell_layout.addWidget(icon_label)
+            name = QLabel(f"{slot.upper()}\n{item.get('Name') or 'Empty'}")
+            name.setWordWrap(True)
+            name.setToolTip(item_tooltip(item))
+            cell_layout.addWidget(name, 1)
+            row, column = divmod(index - 1, 2)
+            self.preview_layout.addWidget(cell, row + 1, column)
+        self.preview_layout.setRowStretch((len(SLOTS) + 1) // 2 + 1, 1)
 
     def _load_selected(self):
         indexes = self.table.selectedIndexes()
