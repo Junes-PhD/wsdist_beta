@@ -365,7 +365,30 @@ def prune_dominated_candidates(check_gear: dict[str, list[dict]]) -> tuple[dict[
     return pruned, removed
 
 
-def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, dt_requirement=0, seed=None, n_iter=10, return_details=False, progress_callback=None, stop_event=None, slot_pair_filter=None, preserve_starting_gearset=False, single_outer_pass=False, combined_ws_player=None):
+def _substat_value(player, stat_name):
+    """Return a numeric player stat for secondary-stat optimization."""
+    try:
+        value = player.stats.get(str(stat_name), 0)
+        if isinstance(value, (list, tuple)):
+            value = value[-1] if value else 0
+        return float(value or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
+def _substat_player(player):
+    """Use the TP component when a combined result wraps two players."""
+    return getattr(player, "tp_player", player)
+
+
+def _substat_constraints_met(player, constraints):
+    return all(
+        _substat_value(player, stat_name) >= float(minimum)
+        for stat_name, minimum in (constraints or ())
+    )
+
+
+def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, dt_requirement=0, seed=None, n_iter=10, return_details=False, progress_callback=None, stop_event=None, slot_pair_filter=None, preserve_starting_gearset=False, single_outer_pass=False, combined_ws_player=None, substat_spec=None):
     #
     # Build a valid gear set, test it, and return the best set found.
     #
@@ -381,6 +404,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     best_set = None
     best_output = None
     best_metric = None
+    best_primary_metric = None
 
     def report_progress(message):
         if progress_callback is not None:
@@ -713,6 +737,22 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                     raise ValueError(f"Unknown action_type ({action_type})")
                 invert = best_output[-1]
                 best_metric = max(0.0001, metric_base ** invert)
+                best_primary_metric = best_metric
+                if substat_spec:
+                    primary_floor = float(substat_spec.get("primary_floor", 0.0))
+                    target_stat = substat_spec.get("target")
+                    eligible = (
+                        best_metric >= primary_floor
+                        and _substat_constraints_met(
+                            _substat_player(base_player), substat_spec.get("constraints")
+                        )
+                    )
+                    if eligible:
+                        best_metric = _substat_value(_substat_player(base_player), target_stat)
+                    else:
+                        best_metric = -float("inf")
+                        best_output = None
+                        best_primary_metric = None
             else:
                 # The current set no longer meets the tightened PDT/MDT gate, so
                 # the first valid neighbor establishes the new baseline.
@@ -979,14 +1019,34 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                 print(f"Unknown action_type  ({action_type})")
                                 import sys; sys.exit()
 
+                            primary_metric = metric
+                            if substat_spec:
+                                primary_floor = float(substat_spec.get("primary_floor", 0.0))
+                                if primary_metric < primary_floor:
+                                    continue
+                                if not _substat_constraints_met(
+                                    _substat_player(player), substat_spec.get("constraints")
+                                ):
+                                    continue
+                                metric = _substat_value(
+                                    _substat_player(player), substat_spec.get("target")
+                                )
+
                             metric = 0.0001 if metric <= 0 else metric # Prevent divide-by-zero errors
-                            if (metric > best_metric):
+                            better_substat = metric > best_metric
+                            tied_substat_better_damage = (
+                                substat_spec
+                                and metric == best_metric
+                                and (best_primary_metric is None or primary_metric > best_primary_metric)
+                            )
+                            if better_substat or tied_substat_better_damage or (not substat_spec and metric > best_metric):
                                 if item1==item2:
                                     print(f"[{slot1:<15s}]: [{best_set[slot1]['Name2']} ->  {item1['Name2']}   [{best_metric**invert:>{nondecimals}.{decimals}f} -> {metric**invert:>{nondecimals}.{decimals}f}]") if verbose_swaps else None
                                 else:
                                     print(f"[{slot1:<6s} & {slot2:<6s}]: [{best_set[slot1]['Name2']} & {best_set[slot2]['Name2']}] -> [{item1['Name2']} & {item2['Name2']}] [{best_metric**invert:>{nondecimals}.{decimals}f} -> {metric**invert:>{nondecimals}.{decimals}f}]") if verbose_swaps else None
                                 best_set = test_set.copy()
                                 best_metric = metric
+                                best_primary_metric = primary_metric
                                 best_output = output
                                 last_improvement = (
                                     f"{slot1} + {slot2}: {item1.get('Name', 'item')}"
@@ -1066,6 +1126,11 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
             damage_taken_totals(best_set, buffs, damage_taken_item_cache),
             best_set["main"], abilities,
         )
+
+        if substat_spec and best_output is None:
+            raise ValueError(
+                "No gear set satisfies the requested damage floor and secondary-stat constraints."
+            )
 
         if best_set==converged_set: # If no improvement is found after one full iteration.
             # best_player = create_player(main_job, sub_job, master_level, best_set, buffs, abilities)
@@ -1156,9 +1221,10 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     if False:
         format_bgwiki(header, (min_tp), best_player, best_metric)
 
+    result_metric = best_primary_metric if substat_spec else best_metric
     if return_details:
         report_progress("Search completed.")
-        return best_player, best_output, best_metric
+        return best_player, best_output, result_metric
     report_progress("Search completed.")
     return(best_player, best_output)
 
@@ -1750,6 +1816,94 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
             return (*result, top_results)
         return result
     return winner["player"], winner["output"]
+
+
+def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
+                      ws_name, spell_name, base_action_type, min_tp, check_gear,
+                      starting_gearset, pdt_requirement, mdt_requirement,
+                      input_metric, print_swaps, next_best_percent, substat_specs,
+                      *, dt_requirement=0, restarts=1, workers=0, seed=None,
+                      n_iter=10, return_details=False, return_top_results=False,
+                      parallel_mode="search_runs", progress_callback=None,
+                      progress_queue=None, stop_event=None):
+    """Optimize damage first, then trade a bounded amount for prioritized stats.
+
+    The damage floor is fixed from the first optimization.  Each secondary
+    stat is then maximized in order, while preserving that floor and all
+    previously selected stat floors.  This makes row 1 more important than
+    row 2, and row 2 more important than row 3, without turning the result
+    into an arbitrary weighted score.
+    """
+    specs = [
+        {"target": str(spec.get("target") or "").strip()}
+        for spec in (substat_specs or ())
+        if str(spec.get("target") or "").strip()
+    ]
+    if not specs:
+        raise ValueError("Select at least one secondary stat to optimize.")
+    if progress_callback is not None:
+        progress_callback("Sub-stat optimization: finding the damage baseline...")
+    baseline = optimize_set(
+        main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
+        spell_name, base_action_type, min_tp, check_gear, starting_gearset,
+        pdt_requirement, mdt_requirement, input_metric, print_swaps,
+        next_best_percent, dt_requirement=dt_requirement, restarts=restarts,
+        workers=workers, seed=seed, n_iter=n_iter, return_details=True,
+        return_top_results=True, parallel_mode=parallel_mode,
+        progress_callback=progress_callback, progress_queue=progress_queue,
+        stop_event=stop_event,
+    )
+    current_player, current_output, damage_metric, winning_seed, _ = baseline
+    damage_floor = float(damage_metric) * (
+        1.0 - max(0.0, min(100.0, float(substat_specs[0].get("loss_percent", 15.0)))) / 100.0
+    )
+    constraints = []
+    summary = []
+    current_gearset = dict(current_player.gearset)
+    for index, spec in enumerate(specs, start=1):
+        if _stop_requested(stop_event):
+            raise OptimizerStopped("Optimizer stopped by user.")
+        target = spec["target"]
+        if progress_callback is not None:
+            progress_callback(
+                f"Sub-stat optimization: prioritizing {target} ({index}/{len(specs)})..."
+            )
+        phase = dict(
+            target=target,
+            primary_floor=damage_floor,
+            constraints=list(constraints),
+        )
+        phase_seed = None if seed is None else int(seed) + index
+        phase_result = build_set(
+            main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
+            spell_name, base_action_type, min_tp, check_gear, current_gearset,
+            pdt_requirement, mdt_requirement, input_metric, False,
+            next_best_percent, dt_requirement=dt_requirement, seed=phase_seed,
+            n_iter=n_iter, return_details=True, progress_callback=progress_callback,
+            stop_event=stop_event, preserve_starting_gearset=True,
+            substat_spec=phase,
+        )
+        current_player, current_output, damage_metric = phase_result
+        value = _substat_value(_substat_player(current_player), target)
+        constraints.append((target, value))
+        summary.append({
+            "stat": target,
+            "value": value,
+            "damage": float(damage_metric),
+            "damage_floor": damage_floor,
+        })
+        current_gearset = dict(current_player.gearset)
+
+    if progress_callback is not None:
+        progress_callback("Sub-stat optimization complete.")
+    top_results = [{
+        "rank": 1, "player": current_player, "output": current_output,
+        "metric": damage_metric, "seed": winning_seed, "index": 1,
+    }]
+    if return_details:
+        result = current_player, current_output, damage_metric, winning_seed, top_results, summary
+        return result if return_top_results else result[:4]
+    return current_player, current_output
 
 
 def rank_weapon_skills(main_job, sub_job, master_level, buffs, abilities, enemy,

@@ -9,6 +9,51 @@ from new_gui_main import _lock_ranking_weapon_slots, _ranking_weapon_types
 
 
 class WeaponSkillRankingTests(unittest.TestCase):
+    def test_substat_optimization_is_lexicographic_with_damage_floor(self):
+        baseline = SimpleNamespace(
+            gearset={"head": {"Name": "Damage"}},
+            stats={"Magic Evasion": 20, "Evasion": 30, "Defense": 40},
+        )
+        phases = []
+
+        def fake_phase(*args, **kwargs):
+            spec = kwargs["substat_spec"]
+            phases.append(spec)
+            stat = spec["target"]
+            value = {"Magic Evasion": 90, "Evasion": 80, "Defense": 70}[stat]
+            player = SimpleNamespace(
+                gearset={"head": {"Name": stat}},
+                stats={"Magic Evasion": 90, "Evasion": 80, "Defense": 70},
+            )
+            return player, [value, 0], 950.0
+
+        with patch.object(
+            wsdist, "optimize_set",
+            return_value=(baseline, [1000, 0], 1000.0, 7, []),
+        ), patch.object(wsdist, "build_set", side_effect=fake_phase):
+            result = wsdist.optimize_substats(
+                "mnk", "war", 50, {}, {}, object(), "Howling Fist", "None",
+                "weapon skill", 1000, {}, baseline.gearset, 199, 199,
+                "Damage dealt", False, 2,
+                [
+                    {"target": "Magic Evasion", "loss_percent": 15},
+                    {"target": "Evasion", "loss_percent": 15},
+                    {"target": "Defense", "loss_percent": 15},
+                ],
+                return_details=True, return_top_results=True,
+            )
+
+        self.assertEqual([phase["target"] for phase in phases], [
+            "Magic Evasion", "Evasion", "Defense",
+        ])
+        self.assertEqual(phases[0]["constraints"], [])
+        self.assertEqual(phases[1]["constraints"], [("Magic Evasion", 90.0)])
+        self.assertEqual(phases[2]["constraints"], [
+            ("Magic Evasion", 90.0), ("Evasion", 80.0),
+        ])
+        self.assertEqual(result[5][-1]["stat"], "Defense")
+        self.assertEqual(result[5][-1]["damage_floor"], 850.0)
+
     def test_ranks_each_tp_tier_independently(self):
         damages = {
             ("Asuran Fists", 1000): 1200,

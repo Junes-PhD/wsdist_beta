@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QInputDialog, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QPlainTextEdit, QPushButton, QScrollArea, QDoubleSpinBox, QSpinBox, QSplitter,
     QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -179,6 +179,11 @@ WEAPON_SLOTS = ("main", "sub", "ranged", "ammo")
 MAIN_WEAPON_SLOTS = ("main", "sub")
 RANGED_WEAPON_SLOTS = ("ranged", "ammo")
 ITEM_LEVEL_FILTER_SLOTS = ("main", "head", "body", "hands", "legs", "feet")
+SUBSTAT_OPTIONS = (
+    "None", "Magic Evasion", "Evasion", "Defense", "Magic Defense",
+    "Subtle Blow", "Counter", "Store TP", "Accuracy", "Magic Accuracy",
+    "Attack", "Magic Attack", "HP", "MP", "Enmity",
+)
 
 
 def _optimizer_check_gear(candidates: dict[str, set[str]], items_by_slot: dict[str, list[dict]], quick_gear: dict[str, dict]):
@@ -1142,6 +1147,7 @@ class MainWindow(QMainWindow):
         self.best_ws_player = None
         self._optimizer_action_in_progress = ""
         self._last_completed_optimizer_action = ""
+        self._last_substat_summary = []
         self.optimizer_top_results: list[dict] = []
         self._ranking_skill_in_progress: str | None = None
         self._optimizer_run_state: dict[int, dict] = {}
@@ -1817,7 +1823,7 @@ class MainWindow(QMainWindow):
         self.optimize_action = QComboBox()
         self.optimize_action.addItems([
             "Weapon skill", "Rank weapon-type WS", "Attack round", "Spell",
-            "Combined TP + WS",
+            "Combined TP + WS", "Sub-stat optimization",
         ])
         self.optimize_action.setToolTip(
             "Combined TP + WS finds the best WS set first, then optimizes the TP set "
@@ -1830,6 +1836,28 @@ class MainWindow(QMainWindow):
             "Ranks every modeled weapon skill for this selected weapon type. "
             "The current Main/Sub/Range/Ammo setup is frozen for a fair comparison."
         )
+        self.substat_base_action = QComboBox()
+        self.substat_base_action.addItems([
+            "Weapon skill", "Attack round", "Spell", "Combined TP + WS",
+        ])
+        self.substat_base_action.setToolTip(
+            "Choose the damage calculation that establishes the primary result before secondary stats are optimized."
+        )
+        self.substat_loss_percent = QDoubleSpinBox()
+        self.substat_loss_percent.setRange(0.0, 100.0)
+        self.substat_loss_percent.setDecimals(1)
+        self.substat_loss_percent.setSingleStep(0.5)
+        self.substat_loss_percent.setValue(10.0)
+        self.substat_loss_percent.setSuffix(" %")
+        self.substat_loss_percent.setToolTip(
+            "Maximum allowed damage loss from the best primary-damage set."
+        )
+        self.substat_combos = []
+        for _index, default_stat in enumerate(("Magic Evasion", "Evasion", "Defense")):
+            combo = QComboBox()
+            combo.addItems(SUBSTAT_OPTIONS)
+            combo.setCurrentText(default_stat)
+            self.substat_combos.append(combo)
         self.optimize_action.currentTextChanged.connect(self._refresh_optimizer_metrics)
         self.optimize_action.currentTextChanged.connect(self._refresh_combined_options)
         self.pdt = QSpinBox()
@@ -1880,6 +1908,10 @@ class MainWindow(QMainWindow):
         form.addRow("Action", self.optimize_action)
         form.addRow("Metric", self.metric_combo)
         form.addRow("Ranking weapon type", self.ranking_weapon_type)
+        form.addRow("Sub-stat damage action", self.substat_base_action)
+        form.addRow("Max damage loss from best", self.substat_loss_percent)
+        for index, combo in enumerate(self.substat_combos, start=1):
+            form.addRow(f"Secondary stat priority {index}", combo)
         form.addRow("Minimum PDT reduction %", self.pdt)
         form.addRow("Minimum MDT reduction %", self.mdt)
         form.addRow("Minimum DT reduction %", self.dt)
@@ -1963,6 +1995,7 @@ class MainWindow(QMainWindow):
             "Attack round": ["Time to WS", "Damage dealt", "TP return", "DPS"],
             "Spell": ["Damage dealt", "TP return"],
             "Combined TP + WS": ["Combined DPS"],
+            "Sub-stat optimization": ["Damage dealt"],
         }[action]
         current = self.metric_combo.currentText()
         self.metric_combo.clear()
@@ -1979,6 +2012,13 @@ class MainWindow(QMainWindow):
         )
         if label is not None:
             label.setVisible(ranking)
+        substats = action == "Sub-stat optimization"
+        for widget in (self.substat_base_action, self.substat_loss_percent, *self.substat_combos):
+            widget.setVisible(substats)
+        for widget in (self.substat_base_action, self.substat_loss_percent, *self.substat_combos):
+            label = self.substat_base_action.parentWidget().layout().labelForField(widget)
+            if label is not None:
+                label.setVisible(substats)
 
     def _refresh_ranking_weapon_types(self):
         if not hasattr(self, "ranking_weapon_type") or not hasattr(self, "quick_set"):
@@ -3505,6 +3545,9 @@ class MainWindow(QMainWindow):
             "optimizer": {
                 "action": self.optimize_action.currentText(),
                 "metric": self.metric_combo.currentText(),
+                "substat_base_action": self.substat_base_action.currentText(),
+                "substat_loss_percent": self.substat_loss_percent.value(),
+                "substat_stats": [combo.currentText() for combo in self.substat_combos],
                 "pdt": self.pdt.value(), "mdt": self.mdt.value(), "dt": self.dt.value(),
                 "combined_defense_both": self.combined_defense_both.isChecked(),
                 "restarts": self.restarts.value(), "workers": self.workers.value(),
@@ -3566,6 +3609,20 @@ class MainWindow(QMainWindow):
         optimizer = state.get("optimizer") if isinstance(state.get("optimizer"), dict) else {}
         self._set_combo_value(self.optimize_action, optimizer.get("action"), self.optimize_action.currentText())
         self._set_combo_value(self.metric_combo, optimizer.get("metric"), self.metric_combo.currentText())
+        self._set_combo_value(
+            self.substat_base_action, optimizer.get("substat_base_action"),
+            self.substat_base_action.currentText(),
+        )
+        try:
+            self.substat_loss_percent.setValue(float(
+                optimizer.get("substat_loss_percent", self.substat_loss_percent.value())
+            ))
+        except (TypeError, ValueError):
+            pass
+        saved_substats = optimizer.get("substat_stats")
+        if isinstance(saved_substats, list):
+            for combo, value in zip(self.substat_combos, saved_substats):
+                self._set_combo_value(combo, value, "None")
         self._set_combo_value(self.parallel_mode, optimizer.get("parallel_mode"), self.parallel_mode.currentText())
         for control, key in ((self.pdt, "pdt"), (self.mdt, "mdt"), (self.dt, "dt"), (self.restarts, "restarts"), (self.workers, "workers")):
             try:
@@ -3820,6 +3877,7 @@ class MainWindow(QMainWindow):
                 )
             action_label = self.optimize_action.currentText()
             ranking_mode = action_label == "Rank weapon-type WS"
+            substat_mode = action_label == "Sub-stat optimization"
             ranking_skill = self.ranking_weapon_type.currentText().strip() if ranking_mode else ""
             if ranking_mode:
                 if ranking_skill not in WS_BY_SKILL:
@@ -3846,9 +3904,24 @@ class MainWindow(QMainWindow):
                 "Spell": "spell cast",
                 "Combined TP + WS": "combined tp/ws",
                 "Rank weapon-type WS": "rank weapon skills",
-            }[action_label]
+            }.get(action_label)
+            if substat_mode:
+                action_type = {
+                    "Weapon skill": "weapon skill", "Attack round": "attack round",
+                    "Spell": "spell cast", "Combined TP + WS": "combined tp/ws",
+                }.get(self.substat_base_action.currentText())
+                selected_substats = [
+                    combo.currentText() for combo in self.substat_combos
+                    if combo.currentText() != "None"
+                ]
+                if not selected_substats:
+                    raise ValueError("Select at least one secondary stat to optimize.")
+            else:
+                selected_substats = []
             if action_type in {"weapon skill", "combined tp/ws"} and self.ws_combo.currentText() in {"", "None"}:
                 raise ValueError("Select a weapon skill for this optimizer mode.")
+            if action_type == "spell cast" and self.spell_combo.currentText() in {"", "None"}:
+                raise ValueError("Select a spell for this optimizer mode.")
             # The original optimizer uses negative damage-taken values.  Its
             # initial pass sentinel is 200, so 199 means an explicitly disabled
             # requirement while still ensuring the search performs one pass.
@@ -3873,6 +3946,21 @@ class MainWindow(QMainWindow):
                     "tp_values": (1000, 2000, 3000),
                     "restarts": self.restarts.value(), "workers": self.workers.value(),
                     "seed": seed, "parallel_mode": parallel_mode,
+                }
+            elif substat_mode:
+                args = common + (
+                    self.ws_combo.currentText(), self.spell_combo.currentText(), action_type,
+                    self.tp_value.value(), check_gear, dict(self.quick_set.items),
+                    pdt_requirement, mdt_requirement, "Damage dealt", False, 2,
+                    [
+                        {"target": stat, "loss_percent": self.substat_loss_percent.value()}
+                        for stat in selected_substats
+                    ],
+                )
+                kwargs = {
+                    "restarts": self.restarts.value(), "workers": self.workers.value(),
+                    "seed": seed, "return_details": True, "return_top_results": True,
+                    "dt_requirement": dt_requirement, "parallel_mode": parallel_mode,
                 }
             else:
                 args = common + (
@@ -3920,9 +4008,14 @@ class MainWindow(QMainWindow):
             self._ranking_skill_in_progress = ranking_skill if ranking_mode else None
             self._optimizer_action_in_progress = action_label
             self._last_completed_optimizer_action = ""
+            self._last_substat_summary = []
             self.optimizer_thread = OptimizeThread(
                 args, kwargs, self,
-                target=wsdist.rank_weapon_skills if ranking_mode else None,
+                target=(
+                    wsdist.rank_weapon_skills if ranking_mode
+                    else wsdist.optimize_substats if substat_mode
+                    else None
+                ),
             )
             self.optimizer_thread.progress.connect(self._optimizer_progress)
             self.optimizer_thread.succeeded.connect(
@@ -4215,10 +4308,12 @@ class MainWindow(QMainWindow):
             state["phase"] = "completed"
             state["fraction"] = 1.0
         self._refresh_optimizer_status()
-        self.best_player, _output, metric, winning_seed, self.optimizer_top_results = result
+        substat_summary = result[5] if isinstance(result, (tuple, list)) and len(result) > 5 else []
+        self.best_player, _output, metric, winning_seed, self.optimizer_top_results = result[:5]
         self.best_tp_player = getattr(self.best_player, "tp_player", self.best_player)
         self.best_ws_player = getattr(self.best_player, "ws_player", self.best_player)
         self._last_completed_optimizer_action = self._optimizer_action_in_progress
+        self._last_substat_summary = list(substat_summary or [])
         self.optimizer_top_results = list(self.optimizer_top_results or [])
         self._append_optimizer_log(
             f"Completed · metric {metric:.6f} · seed {winning_seed}"
@@ -4231,6 +4326,15 @@ class MainWindow(QMainWindow):
         self.optimizer_progress_value.setText("Approx. progress: 100.0%")
         self.optimizer_eta_value.setText("Estimated time remaining: complete")
         self.optimizer_best_value.setText(f"Best metric: {metric:,.4f}")
+        if self._last_substat_summary:
+            for row in self._last_substat_summary:
+                self._append_optimizer_log(
+                    f"Priority {row['stat']}: {row['value']:,.1f} "
+                    f"(damage {row['damage']:,.4f}; floor {row['damage_floor']:,.4f})"
+                )
+            self.optimizer_best_value.setText(
+                f"Damage floor: {self._last_substat_summary[-1]['damage_floor']:,.4f}"
+            )
         self.optimizer_phase_value.setText("Current phase: finished")
         self.statusBar().showMessage("Optimizer completed", 5000)
 
