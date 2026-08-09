@@ -3421,6 +3421,15 @@ class MainWindow(QMainWindow):
 
     def _shared_gear_changed(self, enabled: bool):
         self._refresh_shared_gear()
+        if enabled:
+            # The mode is an optimizer opt-in, so shared pieces participate
+            # immediately instead of requiring a second "Select candidates"
+            # pass.  They remain individually removable from each picker.
+            for slot in SLOTS:
+                self.candidates[slot].update(
+                    item_name(item) for item in self.equipment.get(slot, ())
+                    if item.get("Shared Only")
+                )
         self._reset_invalid_equipment()
         for editor in (self.quick_set, self.tp_set, self.ws_set):
             editor.refresh_icons()
