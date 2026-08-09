@@ -591,12 +591,13 @@ class GearPicker(QDialog):
 
 class CandidatePicker(QDialog):
     def __init__(self, slot: str, items: list[dict], selected: set[str],
-                 icons: GearIconProvider, parent=None):
+                 icons: GearIconProvider, locked_name: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Optimizer candidates: {slot.title()}")
         self.resize(600, 680)
         self._items = sorted(items, key=lambda value: item_name(value).lower())
         self.selected_names = set(selected)
+        self.locked_name = str(locked_name or "")
         self.icons = icons
         layout = QVBoxLayout(self)
         self.search = QLineEdit()
@@ -605,6 +606,19 @@ class CandidatePicker(QDialog):
         self.list.setUniformItemSizes(True)
         self.list.setIconSize(QSize(32, 32))
         layout.addWidget(self.search)
+        lock_row = QHBoxLayout()
+        lock_row.addWidget(QLabel("Lock this slot"))
+        self.lock_combo = QComboBox()
+        self.lock_combo.addItem("No lock", "")
+        for item in self._items:
+            self.lock_combo.addItem(item_name(item), item_name(item))
+        lock_index = self.lock_combo.findData(self.locked_name)
+        self.lock_combo.setCurrentIndex(max(0, lock_index))
+        self.lock_combo.setToolTip(
+            "The selected item is forced in this slot when the optimizer runs."
+        )
+        lock_row.addWidget(self.lock_combo, 1)
+        layout.addLayout(lock_row)
         layout.addWidget(self.list, 1)
         row = QHBoxLayout()
         select_all = QPushButton("Select visible")
@@ -659,6 +673,7 @@ class CandidatePicker(QDialog):
 
     def _accept_selection(self):
         self._remember_visible()
+        self.locked_name = str(self.lock_combo.currentData() or "")
         self.accept()
 
 
@@ -1347,6 +1362,7 @@ class MainWindow(QMainWindow):
         self.gear_blacklist: set[str] = self._load_gear_blacklist()
         self.shared_catalog: dict[str, dict] = {}
         self.candidates = {slot: {"Empty"} for slot in SLOTS}
+        self.locked_gear = {slot: "" for slot in SLOTS}
         self._build_ui()
         self._restore_settings()
         self._refresh_job_data()
@@ -2076,23 +2092,8 @@ class MainWindow(QMainWindow):
         preset_row.addWidget(save_candidates)
         preset_row.addWidget(delete_candidates)
         grid.addLayout(preset_row, 7, 0, 1, 4)
-        locks = QGroupBox("Locked gear (optional)")
-        locks.setToolTip(
-            "When a slot is locked, the optimizer uses that exact item and does not swap it."
-        )
-        lock_grid = QGridLayout(locks)
-        self.locked_gear_combos = {}
-        for index, slot in enumerate(SLOTS):
-            combo = QComboBox()
-            combo.setMinimumWidth(170)
-            combo.currentIndexChanged.connect(lambda _index, name=slot: self._locked_gear_changed(name))
-            row, column = divmod(index, 2)
-            lock_grid.addWidget(QLabel(slot.upper()), row, column * 2)
-            lock_grid.addWidget(combo, row, column * 2 + 1)
-            self.locked_gear_combos[slot] = combo
         candidate_column = QVBoxLayout()
         candidate_column.addWidget(candidates, 1)
-        candidate_column.addWidget(locks)
         top.addLayout(candidate_column, 1)
 
         options = QGroupBox("Search")
@@ -2266,7 +2267,6 @@ class MainWindow(QMainWindow):
         self._refresh_combined_options(self.optimize_action.currentText())
         self._refresh_parallel_mode(self.parallel_mode.currentText())
         self._refresh_candidate_preset_names()
-        self._refresh_locked_gear_options()
         for slot in SLOTS:
             self._update_candidate_button(slot)
         return tab
@@ -3574,32 +3574,14 @@ class MainWindow(QMainWindow):
         return filtered
 
     def _refresh_locked_gear_options(self):
-        if not hasattr(self, "locked_gear_combos"):
-            return
-        for slot, combo in self.locked_gear_combos.items():
-            current = combo.currentData()
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem("No lock", "")
-            for item in self.optimizer_items_for_slot(slot):
-                if item_name(item) == "Empty":
-                    continue
-                combo.addItem(item_name(item), item_name(item))
-            if current:
-                index = combo.findData(current)
-                if index >= 0:
-                    combo.setCurrentIndex(index)
-            combo.blockSignals(False)
-
-    def _locked_gear_changed(self, slot: str):
-        combo = self.locked_gear_combos.get(slot)
-        if combo is None:
-            return
-        self._update_candidate_button(slot)
+        for slot, locked_name in self.locked_gear.items():
+            if locked_name and locked_name not in {
+                item_name(item) for item in self.optimizer_items_for_slot(slot)
+            }:
+                self.locked_gear[slot] = ""
 
     def _apply_locked_gear(self, check_gear: dict[str, list[dict]]) -> None:
-        for slot, combo in getattr(self, "locked_gear_combos", {}).items():
-            locked_name = combo.currentData()
+        for slot, locked_name in self.locked_gear.items():
             if not locked_name:
                 continue
             lookup = {item_name(item): item for item in self.optimizer_items_for_slot(slot)}
@@ -3693,8 +3675,8 @@ class MainWindow(QMainWindow):
             "exclude_under_119": bool(self.exclude_under_119.isChecked()),
             "include_shared_gear": bool(self.include_shared_gear.isChecked()),
             "locks": {
-                slot: str(combo.currentData() or "")
-                for slot, combo in self.locked_gear_combos.items()
+                slot: str(value or "")
+                for slot, value in self.locked_gear.items()
             },
             "candidates": {slot: sorted(values) for slot, values in self.candidates.items()},
         }
@@ -3744,10 +3726,8 @@ class MainWindow(QMainWindow):
         self._refresh_locked_gear_options()
         locks = state.get("locks") if isinstance(state.get("locks"), dict) else {}
         for slot, value in locks.items():
-            combo = self.locked_gear_combos.get(slot)
-            if combo is not None:
-                index = combo.findData(str(value or ""))
-                combo.setCurrentIndex(max(0, index))
+            if slot in self.locked_gear:
+                self.locked_gear[slot] = str(value or "")
         self._candidate_filter_changed(self.exclude_under_119.isChecked())
         for slot in SLOTS:
             self._update_candidate_button(slot)
@@ -3790,10 +3770,12 @@ class MainWindow(QMainWindow):
 
     def choose_candidates(self, slot: str):
         dialog = CandidatePicker(
-            slot, self.optimizer_items_for_slot(slot), self.candidates[slot], self.icons, self
+            slot, self.optimizer_items_for_slot(slot), self.candidates[slot], self.icons,
+            self.locked_gear.get(slot, ""), self,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.candidates[slot] = dialog.selected_names
+            self.locked_gear[slot] = dialog.locked_name
             self._update_candidate_button(slot)
 
     def select_all_candidates(self):
@@ -3815,6 +3797,8 @@ class MainWindow(QMainWindow):
                 detail += "\nTransferable: " + ", ".join(shared[:2])
                 if len(shared) > 2:
                     detail += f" (+{len(shared) - 2})"
+            if self.locked_gear.get(slot):
+                detail += f"\nLocked: {self.locked_gear[slot]}"
             self.candidate_detail_labels[slot].setText(detail)
 
     def choose_bridge_root(self):
@@ -4060,10 +4044,8 @@ class MainWindow(QMainWindow):
             self._refresh_locked_gear_options()
             locks = candidate_state.get("locks") if isinstance(candidate_state.get("locks"), dict) else {}
             for slot, value in locks.items():
-                combo = self.locked_gear_combos.get(slot)
-                if combo is not None:
-                    index = combo.findData(str(value or ""))
-                    combo.setCurrentIndex(max(0, index))
+                if slot in self.locked_gear:
+                    self.locked_gear[slot] = str(value or "")
             self._candidate_filter_changed(self.exclude_under_119.isChecked())
         for slot in SLOTS:
             self._update_candidate_button(slot)
