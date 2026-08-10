@@ -596,6 +596,8 @@ class CandidatePicker(QDialog):
         self.setWindowTitle(f"Optimizer candidates: {slot.title()}")
         self.resize(600, 680)
         self._items = sorted(items, key=lambda value: item_name(value).lower())
+        self._player_items = [item for item in self._items if not item.get("Shared Only")]
+        self._transferable_items = [item for item in self._items if item.get("Shared Only")]
         self.selected_names = set(selected)
         self.locked_name = str(locked_name or "")
         self.icons = icons
@@ -642,16 +644,15 @@ class CandidatePicker(QDialog):
         for index in range(self.list.count()):
             row = self.list.item(index)
             name = row.data(Qt.ItemDataRole.UserRole)
+            if not name:
+                continue
             if row.checkState() == Qt.CheckState.Checked:
                 self.selected_names.add(name)
             else:
                 self.selected_names.discard(name)
 
-    def _populate(self):
-        self._remember_visible()
-        query = self.search.text().strip().lower()
-        self.list.clear()
-        for item in self._items:
+    def _append_items(self, items, query):
+        for item in items:
             if query and query not in item_tooltip(item).lower():
                 continue
             name = item_name(item)
@@ -665,11 +666,36 @@ class CandidatePicker(QDialog):
                 else Qt.CheckState.Unchecked
             )
             self.list.addItem(row)
+        return any(
+            not query or query in item_tooltip(item).lower()
+            for item in items
+        )
+
+    def _populate(self):
+        self._remember_visible()
+        query = self.search.text().strip().lower()
+        self.list.clear()
+        self._append_items(self._player_items, query)
+        transferable = [
+            item for item in self._transferable_items
+            if not query or query in item_tooltip(item).lower()
+        ]
+        if transferable:
+            separator = QListWidgetItem("Transferable gear")
+            separator.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            separator.setForeground(QColor("#667085"))
+            font = separator.font()
+            font.setBold(True)
+            separator.setFont(font)
+            self.list.addItem(separator)
+            self._append_items(transferable, "")
 
     def _check_visible(self, checked: bool):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for index in range(self.list.count()):
-            self.list.item(index).setCheckState(state)
+            row = self.list.item(index)
+            if row.data(Qt.ItemDataRole.UserRole):
+                row.setCheckState(state)
 
     def _accept_selection(self):
         self._remember_visible()
@@ -990,13 +1016,16 @@ class GearBlacklistDialog(QDialog):
         layout.addWidget(self.filter)
         self.items = QListWidget()
         self.items.setAlternatingRowColors(True)
+        self.items.setIconSize(QSize(32, 32))
         self.items.setToolTip("Check an item to hide it from every character and optimizer section.")
-        available_items = parent.available_blacklist_items()
+        available_items = parent.available_blacklist_records()
         for key in parent.gear_blacklist:
-            available_items.setdefault(key, key)
-        for key, label in available_items.items():
-            item = QListWidgetItem(label)
+            available_items.setdefault(key, {"Name": key})
+        for key, record in available_items.items():
+            item = QListWidgetItem(str(record.get("Name") or record.get("Name2") or key))
             item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setIcon(parent.icons.icon(record))
+            item.setToolTip(item_tooltip(record))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
                 Qt.CheckState.Checked if key in parent.gear_blacklist else Qt.CheckState.Unchecked
@@ -1384,6 +1413,29 @@ class MainWindow(QMainWindow):
             QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
             QLabel#sectionTitle { font-size: 16px; font-weight: 700; padding: 3px; }
             QPushButton { padding: 5px 9px; }
+            QFrame#candidateCard {
+                background: #f8fafc;
+                border: 1px solid #d0d5dd;
+                border-radius: 7px;
+            }
+            QLabel#candidateSlot {
+                color: #344054;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+            }
+            QLabel#candidatePlayer {
+                color: #667085;
+                font-size: 10px;
+            }
+            QPushButton#candidateButton {
+                background: #eef2f6;
+                border: 1px solid #c7ced8;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+            QPushButton#candidateButton:hover { background: #e2e8f0; }
+            QPushButton#candidateButton:pressed { background: #d7dee8; }
             QPlainTextEdit { font-family: Consolas, monospace; }
         """)
 
@@ -1419,14 +1471,21 @@ class MainWindow(QMainWindow):
 
     def available_blacklist_items(self) -> dict[str, str]:
         """Return selectable base item names from every discovered inventory."""
-        available: dict[str, str] = {}
+        return {
+            key: str(item.get("Name") or item.get("Name2") or key)
+            for key, item in self.available_blacklist_records().items()
+        }
+
+    def available_blacklist_records(self) -> dict[str, dict]:
+        """Return one representative item record for each blacklist name."""
+        available: dict[str, dict] = {}
 
         def add(item: dict):
             if item_name(item) == "Empty":
                 return
             base = _normalized_item_name(item.get("Name") or item.get("Name2"))
             if base:
-                available.setdefault(base, str(item.get("Name") or item.get("Name2")))
+                available.setdefault(base, item)
 
         for values in self.equipment.values():
             for item in values:
@@ -1445,7 +1504,10 @@ class MainWindow(QMainWindow):
             for item in store.catalog.values():
                 if item.get("Eligible"):
                     add(item)
-        return dict(sorted(available.items(), key=lambda entry: entry[1].casefold()))
+        return dict(sorted(
+            available.items(),
+            key=lambda entry: str(entry[1].get("Name") or entry[1].get("Name2") or entry[0]).casefold(),
+        ))
 
     def set_gear_blacklist(self, values: set[str]) -> None:
         self.gear_blacklist = {
@@ -2039,26 +2101,39 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         candidates = QGroupBox("Candidates by slot")
         grid = QGridLayout(candidates)
+        grid.setContentsMargins(10, 14, 10, 10)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
         self.candidate_buttons = {}
         self.candidate_detail_labels = {}
         for index, slot in enumerate(SLOTS):
             button = QPushButton("1 selected")
+            button.setObjectName("candidateButton")
+            button.setMinimumHeight(34)
+            button.setIconSize(QSize(24, 24))
             button.clicked.connect(lambda _checked=False, name=slot: self.choose_candidates(name))
             row, column = divmod(index, 4)
-            cell = QVBoxLayout()
+            card = QFrame()
+            card.setObjectName("candidateCard")
+            card.setMinimumHeight(92)
+            cell = QVBoxLayout(card)
+            cell.setContentsMargins(10, 8, 10, 8)
+            cell.setSpacing(4)
             label = QLabel(slot.upper())
+            label.setObjectName("candidateSlot")
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             cell.addWidget(label)
             detail = QLabel()
-            detail.setWordWrap(True)
-            detail.setMinimumHeight(34)
-            detail.setStyleSheet("font-size: 10px; color: #667085;")
+            detail.setObjectName("candidatePlayer")
+            detail.setWordWrap(False)
+            detail.setFixedHeight(20)
             cell.addWidget(detail)
             cell.addWidget(button)
-            grid.addLayout(cell, row, column)
+            grid.addWidget(card, row, column)
             self.candidate_buttons[slot] = button
             self.candidate_detail_labels[slot] = detail
         select_all = QPushButton("Select all gear in all slots")
+        select_all.setMinimumHeight(34)
         select_all.setToolTip("Include every available item for every optimizer slot.")
         select_all.clicked.connect(self.select_all_candidates)
         grid.addWidget(select_all, 4, 0, 1, 4)
@@ -2069,10 +2144,10 @@ class MainWindow(QMainWindow):
         )
         self.exclude_under_119.toggled.connect(self._candidate_filter_changed)
         grid.addWidget(self.exclude_under_119, 5, 0, 1, 4)
-        self.include_shared_gear = QCheckBox("Include transferable gear from other characters")
+        self.include_shared_gear = QCheckBox("Show transferable gear in equipment pickers")
         self.include_shared_gear.setToolTip(
-            "Opt-in: add only non-Ex gear exported as transferable by GearSetBuilder "
-            "from the other discovered characters."
+            "Opt-in: show only non-Ex gear exported as transferable by GearSetBuilder "
+            "from the other discovered characters in the gear-slot picker."
         )
         self.include_shared_gear.toggled.connect(self._shared_gear_changed)
         grid.addWidget(self.include_shared_gear, 6, 0, 1, 4)
@@ -3599,7 +3674,12 @@ class MainWindow(QMainWindow):
     def items_for_slot(self, slot: str) -> list[dict]:
         job = JOBS[self.main_job.currentText()]
         result, seen = [], set()
-        for item in [gear.Empty, *self.equipment.get(slot, [])]:
+        items = [gear.Empty, *self.equipment.get(slot, [])]
+        items.extend(
+            item for item in self.shared_catalog.values()
+            if slot in item.get("Slots", ())
+        )
+        for item in items:
             jobs = [str(value).lower() for value in item.get("Jobs", gear.all_jobs)]
             name = item_name(item)
             if job not in jobs or name in seen or _blacklist_matches(item, self.gear_blacklist):
@@ -3624,6 +3704,8 @@ class MainWindow(QMainWindow):
         return int(match.group(1)) if match else None
 
     def optimizer_items_for_slot(self, slot: str) -> list[dict]:
+        # Include transferable gear in the slot-selection popup. The main
+        # screen only shows candidate counts and the selected player item.
         items = self.items_for_slot(slot)
         if not getattr(self, "exclude_under_119", None) or not self.exclude_under_119.isChecked():
             return items
@@ -3677,15 +3759,6 @@ class MainWindow(QMainWindow):
     def _shared_gear_changed(self, enabled: bool):
         self._refresh_shared_gear()
         self._refresh_locked_gear_options()
-        if enabled:
-            # The mode is an optimizer opt-in, so shared pieces participate
-            # immediately instead of requiring a second "Select candidates"
-            # pass.  They remain individually removable from each picker.
-            for slot in SLOTS:
-                self.candidates[slot].update(
-                    item_name(item) for item in self.equipment.get(slot, ())
-                    if item.get("Shared Only")
-                )
         self._reset_invalid_equipment()
         for editor in (self.quick_set, self.tp_set, self.ws_set):
             editor.refresh_icons()
@@ -3698,14 +3771,11 @@ class MainWindow(QMainWindow):
         """Merge transferable inventory from other bridge characters when enabled."""
         self.shared_catalog = {}
         if not getattr(self, "include_shared_gear", None) or not self.include_shared_gear.isChecked():
-            if self.bridge_store.data:
-                self.equipment = self.bridge_store.equipment_dict()
             return
         if not self.bridge_store.bridge_path or not self.bridge_store.ashita_root:
             return
         current_path = self.bridge_store.bridge_path.resolve()
-        combined = self.bridge_store.equipment_dict()
-        known = {item_name(item) for values in combined.values() for item in values}
+        known = {item_name(item) for values in self.equipment.values() for item in values}
         for label, path in self.character_paths.items():
             if path.resolve() == current_path:
                 continue
@@ -3721,17 +3791,11 @@ class MainWindow(QMainWindow):
                 name = item_name(item)
                 if name in known or _blacklist_matches(item, self.gear_blacklist):
                     continue
-                shared = deepcopy(item)
+                shared = copy.deepcopy(item)
                 shared["Shared Only"] = True
                 shared["Shared Characters"] = [label]
                 self.shared_catalog[name] = shared
                 known.add(name)
-                for slot in shared.get("Slots", ()):
-                    if slot in combined:
-                        combined[slot].append(shared)
-        for slot in combined:
-            combined[slot].sort(key=lambda item: item_name(item).casefold())
-        self.equipment = combined
 
     def _capture_candidate_state(self) -> dict:
         return {
@@ -3848,21 +3912,22 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("All available gear selected for every optimizer slot.", 5000)
 
     def _update_candidate_button(self, slot: str):
-        self.candidate_buttons[slot].setText(f"{len(self.candidates[slot])} selected")
+        button = self.candidate_buttons[slot]
+        button.setText(f"{len(self.candidates[slot])} selected")
         if hasattr(self, "candidate_detail_labels"):
             player_item = self.quick_set.items.get(slot, gear.Empty)
-            shared = [
-                item_name(item) for item in self.equipment.get(slot, ())
-                if item.get("Shared Only")
-            ]
+            button.setIcon(self.icons.icon(player_item))
+            detail_label = self.candidate_detail_labels[slot]
             detail = f"Player: {item_name(player_item)}"
-            if shared:
-                detail += "\nTransferable: " + ", ".join(shared[:2])
-                if len(shared) > 2:
-                    detail += f" (+{len(shared) - 2})"
+            width = max(150, detail_label.width() - 4)
+            detail_label.setText(QFontMetrics(detail_label.font()).elidedText(
+                detail, Qt.TextElideMode.ElideRight, width
+            ))
+            tooltip = item_tooltip(player_item)
             if self.locked_gear.get(slot):
-                detail += f"\nLocked: {self.locked_gear[slot]}"
-            self.candidate_detail_labels[slot].setText(detail)
+                tooltip += f"\nLocked: {self.locked_gear[slot]}"
+            detail_label.setToolTip(tooltip)
+            button.setToolTip("Choose optimizer candidates for this slot.\n" + tooltip)
 
     def choose_bridge_root(self):
         initial = self.settings.value("ashita_root", "", str)

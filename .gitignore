@@ -4,6 +4,9 @@ defaults.txt
 *.manifest
 *.pkg
 *.pyc
+__pycache__/
+*.nbi
+*.nbc
 *.pyz
 *.html
 *.jpg
