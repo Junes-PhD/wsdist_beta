@@ -281,6 +281,107 @@ class PerformanceParityTests(unittest.TestCase):
         self.assertGreater(footwork[1][1], normal[1][1])
         self.assertLess(footwork_time[0], normal_time[0])
 
+    def test_monk_kick_attack_rate_includes_trait_and_full_merits(self):
+        gearset = empty_gearset()
+        gearset["main"] = Spharai
+
+        normal = create_player("mnk", "war", 50, gearset, {}, {})
+        footwork = create_player(
+            "mnk", "war", 50, gearset, {}, {"Footwork": True}
+        )
+
+        self.assertEqual(normal.stats["Kick Attacks"], 14 + 5)
+        self.assertEqual(footwork.stats["Kick Attacks"], 14 + 5 + 20)
+
+    def test_footwork_attack_modifier_requires_actual_enhancing_feet(self):
+        empty_feet_set = empty_gearset()
+        empty_feet_set["main"] = Spharai
+        bhikku_set = {slot: dict(item) for slot, item in empty_feet_set.items()}
+        bhikku_set["feet"] = Bhikku_Gaiters
+
+        empty_feet = create_player(
+            "mnk", "war", 50, empty_feet_set, {}, {"Footwork": True}
+        )
+        bhikku = create_player(
+            "mnk", "war", 50, bhikku_set, {}, {"Footwork": True}
+        )
+
+        self.assertAlmostEqual(
+            empty_feet.stats["Kick Attacks Attack%"], 25 / 256
+        )
+        self.assertAlmostEqual(
+            bhikku.stats["Kick Attacks Attack%"], 25 / 256 + 0.16
+        )
+
+    def test_footwork_optimizer_keeps_neutral_armor_equipped_on_tie(self):
+        gearset = empty_gearset()
+        gearset["main"] = Spharai
+        neutral_cap = {
+            "Name": "Neutral Cap",
+            "Name2": "Neutral Cap",
+            "Defense": 120,
+            "Evasion": 80,
+            "Magic Evasion": 100,
+            "Magic Defense": 8,
+            "Jobs": all_jobs,
+        }
+        check_gear = {slot: [item] for slot, item in gearset.items()}
+        check_gear["head"] = [Empty, neutral_cap]
+        enemy = create_enemy(preset_enemies["Apex Toad"])
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            player, _output, _metric = build_set(
+                "mnk", "war", 50, {}, {"Footwork": True}, enemy,
+                "Victory Smite", "", "attack round", 1000, check_gear,
+                gearset, 199, 199, "Time to WS", False, 1,
+                seed=20260809, n_iter=1, return_details=True,
+                preserve_starting_gearset=True,
+            )
+
+        self.assertEqual(player.gearset["head"]["Name"], "Neutral Cap")
+
+    def test_time_to_ws_optimizer_compares_baseline_and_candidates_on_same_scale(self):
+        defensive_cap = {
+            "Name": "Defensive Cap",
+            "Name2": "Defensive Cap",
+            "Defense": 150,
+            "Magic Evasion": 150,
+            "Jobs": all_jobs,
+        }
+        multiattack_cap = {
+            "Name": "Multiattack Cap",
+            "Name2": "Multiattack Cap",
+            "DA": 20,
+            "Jobs": all_jobs,
+        }
+        enemy = create_enemy(preset_enemies["Apex Toad"])
+        cases = (
+            ("mnk", "war", Spharai, Empty),
+            ("brd", "war", Centovente, Empty),
+        )
+        for main_job, sub_job, weapon, sub_weapon in cases:
+            with self.subTest(main_job=main_job):
+                gearset = empty_gearset()
+                gearset["main"] = weapon
+                gearset["sub"] = sub_weapon
+                gearset["head"] = defensive_cap
+                check_gear = {slot: [item] for slot, item in gearset.items()}
+                check_gear["head"] = [defensive_cap, multiattack_cap]
+
+                with contextlib.redirect_stdout(io.StringIO()):
+                    player, output, normalized_metric = build_set(
+                        main_job, sub_job, 50, {}, {}, enemy,
+                        "", "", "attack round", 1000, check_gear,
+                        gearset, 199, 199, "Time to WS", False, 1,
+                        seed=20260810, n_iter=1, return_details=True,
+                        preserve_starting_gearset=True,
+                    )
+
+                self.assertEqual(player.gearset["head"]["Name"], "Multiattack Cap")
+                self.assertEqual(output[-1], -1)
+                expected_time = output[2] * 1000 / output[1]
+                self.assertAlmostEqual(normalized_metric, 1 / expected_time)
+
     def test_base_stats_cache_is_isolated_and_configuration_sensitive(self):
         player_module._BASE_STATS_CACHE.clear()
         gearset = empty_gearset()

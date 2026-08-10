@@ -6,13 +6,14 @@ import hashlib
 import json
 import numbers
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 DEFAULT_MAX_BYTES = 250 * 1024 * 1024
 DEFAULT_MAX_AGE_SECONDS = 90 * 24 * 60 * 60
 
@@ -65,26 +66,77 @@ class SimulationCache:
         self.max_bytes = max(1, int(max_bytes))
         self.max_age_seconds = max(1, int(max_age_seconds))
         self.source_hash = str(source_hash)
+        self._maintenance_done = False
+        self._maintenance_lock = threading.RLock()
 
-    def _connect(self) -> sqlite3.Connection:
+    @staticmethod
+    def _is_corruption(error: sqlite3.DatabaseError) -> bool:
+        message = str(error).casefold()
+        return any(marker in message for marker in (
+            "malformed", "not a database", "disk image is malformed",
+            "file is encrypted", "unsupported file format",
+        ))
+
+    def _quarantine_corrupt_files(self):
+        """Move a broken cache aside so a fresh database can be created."""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
+            if not path.exists():
+                continue
+            target = path.with_name(f"{path.name}.corrupt-{stamp}")
+            suffix = 1
+            while target.exists():
+                target = path.with_name(f"{path.name}.corrupt-{stamp}-{suffix}")
+                suffix += 1
+            try:
+                path.replace(target)
+            except OSError:
+                pass
+
+    def _open_database(self) -> sqlite3.Connection:
         self.directory.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path, timeout=2)
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=2000")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS simulation_results (
-                cache_key TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                source_hash TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                accessed_at REAL NOT NULL,
-                runtime_seconds REAL NOT NULL,
-                payload TEXT NOT NULL,
-                payload_bytes INTEGER NOT NULL
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=2000")
+            connection.execute("PRAGMA wal_autocheckpoint=256")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS simulation_results (
+                    cache_key TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    accessed_at REAL NOT NULL,
+                    runtime_seconds REAL NOT NULL,
+                    payload TEXT NOT NULL,
+                    payload_bytes INTEGER NOT NULL
+                )
+                """
             )
-            """
-        )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS simulation_results_lru "
+                "ON simulation_results(source_hash, accessed_at)"
+            )
+        except Exception:
+            connection.close()
+            raise
+        return connection
+
+    def _connect(self) -> sqlite3.Connection:
+        try:
+            connection = self._open_database()
+        except sqlite3.DatabaseError as error:
+            if not self._is_corruption(error):
+                raise
+            with self._maintenance_lock:
+                self._quarantine_corrupt_files()
+                self._maintenance_done = False
+                connection = self._open_database()
+        with self._maintenance_lock:
+            if not self._maintenance_done:
+                self._prune(connection, time.time())
+                self._maintenance_done = True
         return connection
 
     @contextmanager
@@ -129,7 +181,9 @@ class SimulationCache:
                     connection.execute("DELETE FROM simulation_results WHERE cache_key = ?", (key,))
                     return None
                 connection.execute(
-                    "UPDATE simulation_results SET accessed_at = ? WHERE cache_key = ?", (now, key)
+                    "UPDATE simulation_results SET accessed_at = ? "
+                    "WHERE cache_key = ? AND accessed_at < ?",
+                    (now, key, now - 60),
                 )
                 return {"payload": decoded, "created_at": float(created_at), "runtime_seconds": float(runtime_seconds)}
         except (OSError, sqlite3.DatabaseError):
@@ -158,32 +212,69 @@ class SimulationCache:
         connection.execute(
             "DELETE FROM simulation_results WHERE created_at < ?", (now - self.max_age_seconds,)
         )
+        # A source change makes every older row unreachable. Remove those rows
+        # immediately instead of letting them consume the cache budget for 90 days.
+        connection.execute(
+            "DELETE FROM simulation_results WHERE source_hash != ?", (self.source_hash,)
+        )
         total = connection.execute(
             "SELECT COALESCE(SUM(payload_bytes), 0) FROM simulation_results"
         ).fetchone()[0]
         while total > self.max_bytes:
-            row = connection.execute(
-                "SELECT cache_key, payload_bytes FROM simulation_results ORDER BY accessed_at ASC LIMIT 1"
-            ).fetchone()
-            if row is None:
+            rows = connection.execute(
+                "SELECT cache_key, payload_bytes FROM simulation_results "
+                "ORDER BY accessed_at ASC LIMIT 128"
+            ).fetchall()
+            if not rows:
                 break
-            connection.execute("DELETE FROM simulation_results WHERE cache_key = ?", (row[0],))
-            total -= int(row[1])
+            victims = []
+            for row in rows:
+                victims.append((row[0],))
+                total -= int(row[1])
+                if total <= self.max_bytes:
+                    break
+            connection.executemany(
+                "DELETE FROM simulation_results WHERE cache_key = ?",
+                victims,
+            )
+
+    def disk_bytes(self) -> int:
+        """Return actual allocated database/WAL bytes, not just JSON payload."""
+        total = 0
+        for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
+            try:
+                total += path.stat().st_size
+            except OSError:
+                pass
+        return total
 
     def clear(self) -> bool:
         try:
             with self._connection() as connection:
                 connection.execute("DELETE FROM simulation_results")
+            # DELETE is logical only. VACUUM and truncate the WAL so the File
+            # menu's clear action actually returns disk space to the system.
+            with self._connection() as connection:
+                connection.execute("VACUUM")
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             return True
         except (OSError, sqlite3.DatabaseError):
             return False
 
-    def summary(self) -> dict[str, int]:
+    def summary(self) -> dict[str, Any]:
         try:
             with self._connection() as connection:
                 entries, payload_bytes = connection.execute(
                     "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM simulation_results"
                 ).fetchone()
-                return {"entries": int(entries), "bytes": int(payload_bytes)}
+                kinds = {
+                    str(kind): int(count) for kind, count in connection.execute(
+                        "SELECT kind, COUNT(*) FROM simulation_results GROUP BY kind"
+                    ).fetchall()
+                }
+            return {
+                "entries": int(entries), "bytes": int(payload_bytes),
+                "disk_bytes": self.disk_bytes(), "kinds": kinds,
+            }
         except (OSError, sqlite3.DatabaseError):
-            return {"entries": 0, "bytes": 0}
+            return {"entries": 0, "bytes": 0, "disk_bytes": self.disk_bytes(), "kinds": {}}

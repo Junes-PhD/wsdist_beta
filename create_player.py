@@ -358,7 +358,15 @@ class create_player:
                     self.stats["Accuracy"] = self.stats.get("Accuracy",0) + 100 + 20
                 if self.abilities.get("Footwork",False):
                     self.stats["Kick Attacks"] = self.stats.get("Kick Attacks",0) + 20
-                    self.stats["Kick Attacks Attack%"] = self.stats.get("Kick Attacks Attack%",0) + 100./1024 + (130./1024 if "Bhikku Gaiters +2"==self.gearset["feet"]["Name"] else 160./1024)
+                    # Footwork itself raises kick attack by 25/256. Equipment
+                    # that enhances Footwork adds its own listed percentage;
+                    # never infer that bonus from a catch-all item-name branch
+                    # (which previously gave Empty feet the Bhikku +3 bonus).
+                    self.stats["Kick Attacks Attack%"] = (
+                        self.stats.get("Kick Attacks Attack%", 0)
+                        + 25.0 / 256
+                        + self.stats.get("Footwork Attack%", 0) / 100
+                    )
                     self.stats["Kick Attacks DMG"] = self.stats.get("Kick Attacks DMG",0) + 20 + 20 # Activating footwork increases Kick DMG by 20, with an additional 20 from job points
                 if self.abilities.get("Impetus",False):
                     impetus_potency = 0.9
@@ -942,6 +950,7 @@ class create_player:
                   "Dual Wield":{"nin":[[85,35],[65,30],[45,25],[25,15],[10,10]],"dnc":[[80,30],[60,25],[40,15],[20,10]],"thf":[[98,25],[90,15],[83,10]]},
                   "Evasion":{"thf":[[88,72],[76,60],[70,48],[50,35],[30,22],[10,10]],"dnc":[[86,48],[75,35],[45,22],[15,10]],"pup":[[76,48],[60,35],[40,22],[20,10]]},
                   "Fencer":{"war":[[97,5],[84,4],[71,3],[58,2],[45,1]],"bst":[[94,3],[87,2],[80,1]],"brd":[[95,2],[85,1]]}, # Listed as tiers for now.
+                  # MNK99 has Kick Attacks III: 14% before merits or gear.
                   "Kick Attacks":{"mnk":[[76,14],[71,12],[51,10]]},
                   "Magic Burst Damage Trait":{"blm":[[97,13],[84,11],[71,9],[58,7],[45,5]],"sch":[[99,7],[89,7],[79,5]],"nin":[[90,7],[80,5]],"rdm":[[95,7],[85,5]]},
                   "Magic Attack":{"blm":[[91,40],[81,36],[70,32],[50,28],[30,24],[10,20]],"rdm":[[86,28],[40,24],[20,20]]},
@@ -1018,6 +1027,7 @@ class create_player:
         # Stats that are obtained through merits.
         job_merit_stats = {
                             "war":{"DA":5,},
+                            # Assume the full 5/5 Group 1 Kick Attacks merits.
                             "mnk":{"Kick Attacks":5,},
                             "whm":{},
                             "blm":{"Magic Attack":10, "Magic Accuracy":25,},

@@ -1,14 +1,34 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 import gear
+from create_player import create_enemy
+from enemies import preset_enemies
 from new_gui_main import (
     REMA_WEAPON_NAMES, _aspirational_catalog, _compose_profile_payloads,
     _is_r15_variant, _profile_category, _profile_set_descriptor, _profile_ws_name,
-    _with_weapon_overlays,
+    _quick_cache_request, _run_overnight_cache_task, _with_weapon_overlays,
 )
+from simulation_cache import SimulationCache
 
 
 class ProfileReportHelperTests(unittest.TestCase):
+    def test_quick_cache_request_ignores_inputs_unused_by_action(self):
+        common = {
+            "main_job": "mnk", "sub_job": "war", "master_level": 50,
+            "buffs": {}, "abilities": {}, "enemy": {"Defense": 100},
+        }
+        first = _quick_cache_request(
+            "attack", {"main": gear.Spharai}, **common, tp=1000,
+            ws_name="Victory Smite", spell_name="Fire VI",
+        )
+        second = _quick_cache_request(
+            "attack", {"main": gear.Spharai}, **common, tp=1000,
+            ws_name="Shijin Spiral", spell_name="Blizzard VI",
+        )
+        self.assertEqual(first, second)
+
     def test_profile_ws_name_matches_compact_and_short_names(self):
         self.assertEqual(_profile_ws_name("Laststand_Default"), "Last Stand")
         self.assertEqual(_profile_ws_name("Savage_Acc"), "Savage Blade")
@@ -89,6 +109,42 @@ class ProfileReportHelperTests(unittest.TestCase):
             self.assertTrue(variants, weapon_name)
             self.assertTrue(any(not _is_r15_variant(item) for item in variants), weapon_name)
             self.assertTrue(any(_is_r15_variant(item) for item in variants), weapon_name)
+
+    def test_overnight_task_stores_then_reuses_deterministic_result(self):
+        empty = {
+            "Name": "Empty", "Name2": "Empty", "Type": "None",
+            "Skill Type": "None", "Jobs": gear.all_jobs,
+        }
+        gearset = {
+            slot: empty.copy() for slot in (
+                "main", "sub", "ranged", "ammo", "head", "body", "hands", "legs",
+                "feet", "neck", "waist", "ear1", "ear2", "ring1", "ring2", "back",
+            )
+        }
+        gearset["main"] = gear.Spharai
+        enemy = create_enemy(preset_enemies["Apex Toad"])
+        context = {
+            "main_job": "mnk", "sub_job": "war", "master_level": 50,
+            "buffs": {}, "abilities": {},
+        }
+        request = _quick_cache_request(
+            "attack", gearset, **context, enemy=dict(enemy.stats), tp=1000
+        )
+        task = {
+            "kind": "quick-look", "request": request, "context": context,
+            "enemy": dict(enemy.stats), "gearset": gearset,
+            "action": "attack", "tp": 1000, "ws_name": "", "ws_type": "",
+            "spell_name": "", "spell_type": "",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cache = SimulationCache(Path(directory), source_hash="test")
+            self.assertEqual(_run_overnight_cache_task(task, cache), "stored")
+            key = cache.key_for("quick-look", request)
+            self.assertIsNotNone(cache.get(key, "quick-look"))
+            self.assertEqual(_run_overnight_cache_task(task, cache), "cached")
+            summary = cache.summary()
+            self.assertEqual(summary["entries"], 1)
+            self.assertEqual(summary["kinds"], {"quick-look": 1})
 
 
 if __name__ == "__main__":

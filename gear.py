@@ -1531,8 +1531,8 @@ Lustratio_LeggingsB = {"Name":"Lustratio Leggings +1", "Name2":"Lustratio Leggin
 Lustratio_LeggingsD = {"Name":"Lustratio Leggings +1", "Name2":"Lustratio Leggings +1 R15D", "STR":32+15, "DEX":33+15, "Jobs":["war", "thf", "pld", "drk", "bst", "brd", "drg", "dnc", "run",]}
 Skulker_Poulaines = {"Name":"Skulker's Poulaines +3", "Evasion":130, "Magic Evasion":125, "Magic Defense":9, "DT":-11, "STR":27, "DEX":39, "VIT":22, "AGI":57, "INT":0, "MND":22, "CHR":40, "Accuracy":60, "Attack":60, "Magic Accuracy":60, "Gear Haste":4, "Jobs":["thf"]}
 Skulker_Poulaines2 = {'Name':"Skulker's Poulaines +2", 'Evasion':120, 'Magic Evasion':115, 'Magic Defense':8, 'DT':-10, 'STR':22, 'DEX':34, 'VIT':17, 'AGI':52, 'INT':0, 'MND':17, 'CHR':35, 'Accuracy':50, 'Attack':50, 'Magic Accuracy':50, 'Gear Haste':4, 'Jobs':['thf']}
-Bhikku_Gaiters = {"Name":"Bhikku Gaiters +3", "Evasion":122, "Magic Evasion":119, "Magic Defense":7, "DT":-10, "STR":30, "DEX":30, "VIT":30, "AGI":49, "INT":0, "MND":30, "CHR":39, "Accuracy":60, "Attack":60, "Magic Accuracy":60, "Gear Haste":4, "Kick Attacks DMG":65, "Jobs":["mnk"]}
-Bhikku_Gaiters2 = {"Name":"Bhikku Gaiters +2", "Evasion":112, "Magic Evasion":109, "Magic Defense":6, "DT":-9, "STR":25, "DEX":25, "VIT":25, "AGI":44, "INT":0, "MND":25, "CHR":34, "Accuracy":50, "Attack":50, "Magic Accuracy":50, "Gear Haste":4, "Kick Attacks DMG":60, "Jobs":["mnk"]}
+Bhikku_Gaiters = {"Name":"Bhikku Gaiters +3", "Evasion":122, "Magic Evasion":119, "Magic Defense":7, "DT":-10, "STR":30, "DEX":30, "VIT":30, "AGI":49, "INT":0, "MND":30, "CHR":39, "Accuracy":60, "Attack":60, "Magic Accuracy":60, "Gear Haste":4, "Kick Attacks DMG":65, "Footwork Attack%":16, "Jobs":["mnk"]}
+Bhikku_Gaiters2 = {"Name":"Bhikku Gaiters +2", "Evasion":112, "Magic Evasion":109, "Magic Defense":6, "DT":-9, "STR":25, "DEX":25, "VIT":25, "AGI":44, "INT":0, "MND":25, "CHR":34, "Accuracy":50, "Attack":50, "Magic Accuracy":50, "Gear Haste":4, "Kick Attacks DMG":60, "Footwork Attack%":13, "Jobs":["mnk"]}
 Maculele_Toe_Shoes = {"Name":"Maculele Toe Shoes +3", "Evasion":140, "Magic Evasion":115, "Magic Defense":9, "DT":-10, "STR":27, "DEX":39, "VIT":22, "AGI":57, "INT":0, "MND":22, "CHR":43, "Accuracy":60, "Attack":60, "Magic Accuracy":60, "Gear Haste":5, "Store TP":12, "Jobs":["dnc"]}
 Maculele_Toe_Shoes2 = {'Name':'Maculele Toe Shoes +2', 'Evasion':130, 'Magic Evasion':105, 'Magic Defense':8, 'DT':-9, 'STR':22, 'DEX':34, 'VIT':17, 'AGI':52, 'INT':0, 'MND':17, 'CHR':38, 'Accuracy':50, 'Attack':50, 'Magic Accuracy':50, 'Gear Haste':5, 'Store TP':11, 'Jobs':['dnc']}
 Nukumi_Ocreae = {"Name":"Nukumi Ocreae +3", "Evasion":105, "Magic Evasion":130, "Magic Defense":6, "STR":31, "DEX":35, "VIT":31, "AGI":40, "INT":0, "MND":20, "CHR":34, "Accuracy":60, "Attack":60, "Magic Accuracy":60, "Gear Haste":3, "DA":6, "PDL":10, "Jobs":["bst"]}
@@ -1917,6 +1917,8 @@ available_stats = ["FUA", "Automaton Skill", "Pet:Magic Evasion", "Pet:Magic Def
 
 if "Double Damage" not in available_stats:
   available_stats.append("Double Damage")
+if "Footwork Attack%" not in available_stats:
+  available_stats.append("Footwork Attack%")
 
 typo = False
 slots = [mains, subs, grips, ranged, ammos, heads, necks, ears, ears2, bodies, hands, rings, rings2, capes, waists, legs, feet, foods]

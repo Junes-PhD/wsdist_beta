@@ -207,6 +207,21 @@ def _prepare_candidates(check_gear, main_job, ws_type):
         slot: [item for item in items if _job_eligible(item, main_job)]
         for slot, items in check_gear.items()
     }
+    # Empty armor is a UI placeholder, not a useful optimizer choice.  Once a
+    # slot has any equippable item selected, keep that slot equipped.  Multi-
+    # slot body pieces can still force the appropriate armor slots empty via
+    # apply_forced_empty_slots(). Weapon/ranged slots retain Empty because it
+    # is a legitimate configuration for those slots.
+    for slot in (
+        "head", "neck", "ear1", "ear2", "body", "hands",
+        "ring1", "ring2", "back", "waist", "legs", "feet",
+    ):
+        equipped = [
+            item for item in candidates.get(slot, ())
+            if item.get("Name", "Empty") != "Empty"
+        ]
+        if equipped:
+            candidates[slot] = equipped
     if ws_type == "melee" and main_job not in ("rng", "cor"):
         candidates["ranged"] = [
             item for item in candidates["ranged"]
@@ -307,6 +322,34 @@ _NON_COMBAT_METADATA = {
     "Total Count", "Model Complete",
 }
 
+# Stats that can improve an offensive result or reduce time to the next WS.
+# Defensive-only gear must not win an exact optimizer tie merely because it is
+# non-empty; this is especially visible in Footwork/Time to WS searches.
+_POSITIVE_DPS_STATS = {
+    "STR", "DEX", "VIT", "AGI", "INT", "MND", "CHR", "DMG", "Delay",
+    "Accuracy", "Ranged Accuracy", "Attack", "Ranged Attack", "Magic Accuracy",
+    "Magic Attack", "Magic Damage", "Gear Haste", "JA Haste", "Magic Haste",
+    "Martial Arts", "Dual Wield", "Store TP", "Regain", "Occult Acumen",
+    "DA", "TA", "QA", "Kick Attacks", "Kick Attacks DMG", "Kick Attacks Attack",
+    "Kick Attacks Attack%", "Footwork Attack%", "Daken", "Zanshin", "PDL", "Crit Rate", "Crit Damage",
+    "Weapon Skill Damage", "TP Bonus", "Magic Burst Damage", "Magic Burst Damage II",
+    "Skillchain Bonus", "EnSpell Damage", "EnSpell Damage%", "Hand-to-Hand Skill",
+    "Sword Skill", "Dagger Skill", "Axe Skill", "Club Skill", "Katana Skill",
+    "Great Sword Skill", "Great Katana Skill", "Great Axe Skill", "Polearm Skill",
+    "Scythe Skill", "Staff Skill", "Archery Skill", "Marksmanship Skill",
+    "Throwing Skill", "Magic Accuracy Skill",
+}
+
+
+def _has_positive_dps_stat(item):
+    return any(
+        key in _POSITIVE_DPS_STATS
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value > 0
+        for key, value in item.items()
+    )
+
 
 def _numeric_combat_stats(item: dict) -> dict[str, float]:
     return {
@@ -406,6 +449,8 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     # revisit the same gear set, without any cross-process SQLite contention.
     evaluation_cache = OrderedDict()
     evaluation_cache_limit = 512
+    evaluation_cache_hits = 0
+    evaluation_cache_misses = 0
     rng = np.random.default_rng(seed) if seed is not None else np.random
     best_set = None
     best_output = None
@@ -440,11 +485,14 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         )
 
     def evaluate_gearset(gearset):
+        nonlocal evaluation_cache_hits, evaluation_cache_misses
         key = evaluation_key(gearset)
         cached = evaluation_cache.get(key)
         if cached is not None:
+            evaluation_cache_hits += 1
             evaluation_cache.move_to_end(key)
             return cached
+        evaluation_cache_misses += 1
         player = create_player(main_job, sub_job, master_level, gearset, buffs, abilities)
         if action_type == "weapon skill":
             metric_base, output = average_ws(player, enemy, ws_name, min_tp, ws_type, input_metric)
@@ -539,19 +587,19 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         except (TypeError, ValueError):
             return False
 
-    def empty_nonweapon_slots(gearset):
-        """Prefer a real armor/accessory on otherwise identical results.
+    def nonweapon_tiebreak_score(gearset):
+        """Prefer offensive equipment, then any equipment, over Empty.
 
-        Empty is still valid for weapon slots and forced-empty equipment.  This
-        only resolves exact score ties caused by an item with no modeled effect
-        during the current action, preventing a randomized starting Empty slot
-        from being presented as the winning Footwork/TP set.
+        The second tier keeps a valid full equipment set when all modeled DPS
+        values tie.  The first tier prevents a defensive-only item from taking
+        precedence over a selected item that carries an offensive/speed stat.
         """
-        return sum(
-            1 for slot, item in gearset.items()
+        items = [
+            item for slot, item in gearset.items()
             if slot not in {"main", "sub", "ranged", "ammo"}
-            and item.get("Name", "Empty") == "Empty"
-        )
+            and item.get("Name", "Empty") != "Empty"
+        ]
+        return sum(_has_positive_dps_stat(item) for item in items), len(items)
 
     ws_dict = {"Katana": ["Blade: Retsu", "Blade: Teki", "Blade: To", "Blade: Chi", "Blade: Ei", "Blade: Jin", "Blade: Ten", "Blade: Ku", "Blade: Yu", "Blade: Metsu", "Blade: Kamu", "Blade: Hi", "Blade: Shun", "Zesho Meppo",],
         "Great Katana": ["Tachi: Enpi", "Tachi: Goten", "Tachi: Kagero", "Tachi: Jinpu", "Tachi: Koki","Tachi: Yukikaze", "Tachi: Gekko", "Tachi: Kasha", "Tachi: Ageha","Tachi: Kaiten", "Tachi: Rana", "Tachi: Fudo", "Tachi: Shoha", "Tachi: Mumei"],
@@ -766,7 +814,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                 )
             elif (base_pdt <= pdt_thresh_temp and base_mdt <= mdt_thresh_temp
                     and base_dt <= dt_thresh_temp):
-                base_player, metric_base, best_output = evaluate_gearset(converged_set)
+                base_player, normalized_metric, best_output = evaluate_gearset(converged_set)
                 if action_type == "weapon skill":
                     decimals = 1
                     nondecimals = 8
@@ -782,7 +830,13 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                 else:
                     raise ValueError(f"Unknown action_type ({action_type})")
                 invert = best_output[-1]
-                best_metric = max(0.0001, metric_base ** invert)
+                # evaluate_gearset() has already normalized every action to a
+                # higher-is-better score.  Applying ``invert`` again here
+                # turned the Time-to-WS baseline back into seconds while all
+                # candidate sets remained reciprocal seconds.  The random
+                # starting set then appeared roughly 100x better than every
+                # candidate and could never be replaced.
+                best_metric = max(0.0001, normalized_metric)
                 best_primary_metric = best_metric
                 if substat_spec:
                     primary_floor = float(substat_spec.get("primary_floor", 0.0))
@@ -1068,7 +1122,8 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             )
                             tied_nonempty_gear = (
                                 not substat_spec and metric == best_metric
-                                and empty_nonweapon_slots(test_set) < empty_nonweapon_slots(best_set)
+                                and nonweapon_tiebreak_score(test_set)
+                                > nonweapon_tiebreak_score(best_set)
                             )
                             if better_substat or tied_substat_better_damage or tied_nonempty_gear:
                                 if item1==item2:
@@ -1253,10 +1308,16 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         format_bgwiki(header, (min_tp), best_player, best_metric)
 
     result_metric = best_primary_metric if substat_spec else best_metric
+    memo_total = evaluation_cache_hits + evaluation_cache_misses
+    memo_rate = 100 * evaluation_cache_hits / memo_total if memo_total else 0.0
+    completion_message = (
+        f"Search completed. Worker memo: {evaluation_cache_hits:,} hits, "
+        f"{evaluation_cache_misses:,} misses ({memo_rate:.1f}% hit rate)."
+    )
     if return_details:
-        report_progress("Search completed.")
+        report_progress(completion_message)
         return best_player, best_output, result_metric
-    report_progress("Search completed.")
+    report_progress(completion_message)
     return(best_player, best_output)
 
 

@@ -1657,7 +1657,8 @@ def weaponskill_info(ws_name, tp, player, enemy, wsc_bonus, dual_wield):
         player_attack2 += player.stats.get("Food Attack",0)
         sc = ["Tranfixion","Impaction"]
     elif ws_name == "Dragon Kick":
-        # This is a kick weaponskill that may benefit from Footwork. We re-calculate player attack using the "Kick Attacks Attack%" stat, which is 0% without Footwork, or ~26% with Footwork.
+        # This kick weapon skill may benefit from Footwork. Recalculate attack
+        # with Footwork's 25/256 modifier plus any explicit equipment bonus.
         base_ftp = [1.7, 3.0, 5.0]
         ftp      = np.interp(tp, base_tp, base_ftp)
         ftp_rep  = True
@@ -1688,7 +1689,8 @@ def weaponskill_info(ws_name, tp, player, enemy, wsc_bonus, dual_wield):
         nhits     = 8-1 # -1 for the off-hand hit
         sc = ["Gravitation","Liquefaction"]
     elif ws_name == "Tornado Kick":
-        # This is a kick weaponskill that may benefit from Footwork. We re-calculate player attack using the "Kick Attacks Attack%" stat, which is 0% without Footwork, or ~26% with Footwork.
+        # This kick weapon skill may benefit from Footwork. Recalculate attack
+        # with Footwork's 25/256 modifier plus any explicit equipment bonus.
         base_ftp = [1.7, 2.8, 4.5]
         ftp      = np.interp(tp, base_tp, base_ftp)
         ftp_rep  = True

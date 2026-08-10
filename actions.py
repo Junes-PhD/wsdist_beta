@@ -1066,10 +1066,14 @@ def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric,
             striking_flourish_DA_damage = get_avg_phys_damage(main_dmg, fstr_main, 0, striking_flourish_pdif1, 1.0, striking_flourish_crit_rate, crit_dmg, 0, 0, 0, sneak_attack_bonus, trick_attack_bonus, climactic_flourish_bonus, striking_flourish_bonus, ternary_flourish_bonus)
             physical_damage += (striking_flourish_DA_damage - main_hit_damage)*hit_rate11 # Add on the difference in damage from a 2nd hit with higher crit.
 
-        # Calculate the damage for off-hand hits, which receive no bonuses. No fancy correction terms are required here.
-        offhand_pdif = get_avg_pdif_melee(attack2, sub_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
-        offhand_damage = get_avg_phys_damage(sub_dmg, fstr_sub, 0, offhand_pdif, 1.0, crit_rate, crit_dmg, 0, 0, 0)
-        physical_damage += offhand_damage*sub_hits
+        # Calculate off-hand damage only when this round can actually produce
+        # an off-hand hit.  Calling pDIF with an Empty/shield skill type is
+        # invalid even though multiplying the result by zero used to hide it
+        # in JIT-enabled runs.
+        if sub_hits > 0:
+            offhand_pdif = get_avg_pdif_melee(attack2, sub_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
+            offhand_damage = get_avg_phys_damage(sub_dmg, fstr_sub, 0, offhand_pdif, 1.0, crit_rate, crit_dmg, 0, 0, 0)
+            physical_damage += offhand_damage*sub_hits
 
         physical_damage *= (1 + da_dmg*da)*(1 + ta_dmg*ta) # Main-hand and off-hand hits from a multi-attack are fully boosted by "DA Damage" and "TA Damage" stats.
 
@@ -1866,10 +1870,13 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
                 striking_flourish_DA_damage = get_avg_phys_damage(main_dmg, fstr_main, wsc, striking_flourish_pdif1, ftp2, striking_flourish_crit_rate, crit_dmg, 0, ws_bonus, ws_trait)
                 physical_damage += (striking_flourish_DA_damage - main_hit_damage)*hit_rate11 # Add on the difference in damage from a 2nd hit with higher crit.
 
-            # Calculate the damage for off-hand hits, which receive no bonuses. No fancy correction terms are required here.
-            offhand_pdif = get_avg_pdif_melee(player_attack2, sub_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
-            offhand_damage = get_avg_phys_damage(sub_dmg, fstr_sub, wsc, offhand_pdif, ftp2, crit_rate, crit_dmg, 0, ws_bonus, ws_trait)
-            physical_damage += offhand_damage*sub_hits
+            # Single-wield sets have no valid off-hand weapon skill type.
+            # Avoid evaluating an unused pDIF value for their zero off-hand
+            # hits; Hand-to-Hand and true dual-wield sets still use this path.
+            if sub_hits > 0:
+                offhand_pdif = get_avg_pdif_melee(player_attack2, sub_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
+                offhand_damage = get_avg_phys_damage(sub_dmg, fstr_sub, wsc, offhand_pdif, ftp2, crit_rate, crit_dmg, 0, ws_bonus, ws_trait)
+                physical_damage += offhand_damage*sub_hits
 
             # print("------------------------------------------------------")
             # print("first_main_hit: ",player_attack1, main_skill_type, first_main_hit_pdif, first_main_hit_damage,main_hits,hit_rate11,hit_rate12,accuracy1,ftp)

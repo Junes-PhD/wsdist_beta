@@ -50,7 +50,13 @@ from lac_profile import (
 
 APP_DIR = Path(__file__).resolve().parent
 CACHE_SOURCE_HASH = source_fingerprint([
-    APP_DIR / "gear.py", APP_DIR / "actions.py", APP_DIR / "create_player.py", APP_DIR / "wsdist.py",
+    APP_DIR / name for name in (
+        "gear.py", "actions.py", "create_player.py", "wsdist.py",
+        "weaponskill_info.py", "get_hit_rate.py", "get_ma_rate.py", "get_fstr.py",
+        "get_pdif.py", "get_phys_damage.py", "weapon_bonus.py", "get_tp.py",
+        "nuking.py", "get_dint_m_v.py", "get_delay_timing.py", "enemies.py",
+        "buffs.py",
+    )
 ])
 SLOTS = (
     "main", "sub", "ranged", "ammo", "head", "neck", "ear1", "ear2",
@@ -199,6 +205,55 @@ def _gearset_payload(gearset: dict) -> dict[str, dict]:
         slot: dict(item) if isinstance(item, dict) else dict(gear.Empty)
         for slot, item in gearset.items()
     }
+
+
+def _quick_cache_request(action: str, gearset: dict, *, main_job: str,
+                         sub_job: str, master_level: int, buffs: dict,
+                         abilities: dict, enemy: dict, tp: int = 0,
+                         ws_name: str = "", ws_type: str = "",
+                         spell_name: str = "", spell_type: str = "") -> dict:
+    """Build the one canonical identity used by Quick Look and cache warming."""
+    request = {
+        "action": action,
+        "gearset": _gearset_payload(gearset),
+        "main_job": main_job,
+        "sub_job": sub_job,
+        "master_level": master_level,
+        "buffs": buffs,
+        "abilities": abilities,
+        "enemy": enemy,
+    }
+    if action == "attack":
+        request["tp"] = tp
+    elif action == "ws":
+        request.update({"tp": tp, "ws_name": ws_name, "ws_type": ws_type})
+    elif action == "spell":
+        request.update({"spell_name": spell_name, "spell_type": spell_type})
+    else:
+        raise ValueError(f"Unknown Quick Look action: {action}")
+    return request
+
+
+def _evaluate_quick_result(player, enemy, action: str, *, tp: int = 0,
+                           ws_name: str = "", ws_type: str = "",
+                           spell_name: str = "", spell_type: str = ""):
+    """Return the exact output/text shape consumed by Quick Look cache hits."""
+    if action == "ws":
+        output = actions.average_ws(
+            player, enemy, ws_name, tp, ws_type, "Damage dealt"
+        )
+        text = f"Average damage: {output[1][0]:,.0f}    TP return: {output[1][1]:,.1f}"
+    elif action == "spell":
+        output = actions.cast_spell(
+            player, enemy, spell_name, spell_type, "Damage dealt"
+        )
+        text = f"Average damage: {output[1][0]:,.0f}    TP return: {output[1][1]:,.1f}"
+    elif action == "attack":
+        output = actions.average_attack_round(player, enemy, 0, tp, "Time to WS")
+        text = f"Time per WS: {output[0]:,.3f}s    TP per round: {output[1][1]:,.1f}"
+    else:
+        raise ValueError(f"Unknown Quick Look action: {action}")
+    return output, text
 
 
 def _serialize_optimizer_player(player) -> dict:
@@ -910,6 +965,93 @@ class OptimizeThread(QThread):
                 manager.shutdown()
 
 
+def _run_overnight_cache_task(task: dict, cache: SimulationCache) -> str:
+    """Evaluate one deterministic cache-warming task.
+
+    The task contains only plain dictionaries so it can safely run outside the
+    GUI thread.  Cache access is opened and closed per operation by
+    ``SimulationCache``; this avoids keeping a SQLite connection tied to Qt's
+    worker thread.
+    """
+    cache_kind = task.get("kind", "quick-look")
+    cache_key = cache.key_for(cache_kind, task["request"])
+    if cache.get(cache_key, cache_kind) is not None:
+        return "cached"
+
+    started_at = time.monotonic()
+    context = task["context"]
+    player = create_player.create_player(
+        context["main_job"], context["sub_job"], context["master_level"],
+        gearset=task["gearset"], buffs=context["buffs"], abilities=context["abilities"],
+    )
+    enemy = create_player.create_enemy(task["enemy"])
+    output, text = _evaluate_quick_result(
+        player, enemy, task["action"], tp=task.get("tp", 0),
+        ws_name=task.get("ws_name", ""), ws_type=task.get("ws_type", ""),
+        spell_name=task.get("spell_name", ""),
+        spell_type=task.get("spell_type", ""),
+    )
+
+    if cache.put(
+        cache_key, cache_kind, {"text": text, "output": output},
+        time.monotonic() - started_at,
+    ):
+        return "stored"
+    return "failed"
+
+
+class OvernightSimulationThread(QThread):
+    """Warm deterministic simulation results without blocking the GUI."""
+
+    progress = pyqtSignal(object)
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    stopped = pyqtSignal(object)
+
+    def __init__(self, tasks: list[dict], cache: SimulationCache, hours: float, parent=None):
+        super().__init__(parent)
+        self.tasks = tasks
+        self.cache = cache
+        self.hours = max(0.1, float(hours))
+        self._stop_requested = threading.Event()
+
+    def request_stop(self):
+        self._stop_requested.set()
+
+    def run(self):
+        started_at = time.monotonic()
+        deadline = started_at + self.hours * 3600
+        summary = {
+            "planned": len(self.tasks), "processed": 0, "stored": 0,
+            "cached": 0, "failed": 0, "errors": [],
+            "elapsed": 0.0, "expired": False,
+        }
+        try:
+            for index, task in enumerate(self.tasks, 1):
+                if self._stop_requested.is_set():
+                    summary["elapsed"] = time.monotonic() - started_at
+                    self.stopped.emit(summary)
+                    return
+                if time.monotonic() >= deadline:
+                    summary["expired"] = True
+                    break
+                try:
+                    result = _run_overnight_cache_task(task, self.cache)
+                    summary[result] = summary.get(result, 0) + 1
+                except Exception as error:
+                    summary["failed"] += 1
+                    if len(summary["errors"]) < 8:
+                        summary["errors"].append(str(error))
+                summary["processed"] = index
+                if index == 1 or index % 10 == 0 or index == len(self.tasks):
+                    summary["elapsed"] = time.monotonic() - started_at
+                    self.progress.emit(dict(summary))
+            summary["elapsed"] = time.monotonic() - started_at
+            self.succeeded.emit(summary)
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
 class PlotThread(QThread):
     completed = pyqtSignal(object)
     failed = pyqtSignal(str)
@@ -1485,6 +1627,7 @@ class MainWindow(QMainWindow):
         self.aspirational_catalog = _aspirational_catalog()
         self.aspirational_selected: set[str] = set()
         self.optimizer_thread: OptimizeThread | None = None
+        self.overnight_thread: OvernightSimulationThread | None = None
         self.report_thread: ProfileReportThread | None = None
         self.best_player = None
         self.best_tp_player = None
@@ -1558,6 +1701,8 @@ class MainWindow(QMainWindow):
         refresh.triggered.connect(self.refresh_bridge)
         blacklist = QAction("Gear blacklist...", self)
         blacklist.triggered.connect(self.open_gear_blacklist)
+        overnight = QAction("Run overnight simulations...", self)
+        overnight.triggered.connect(self.run_overnight_simulations)
         self.cache_enabled_action = QAction("Enable simulation cache", self)
         self.cache_enabled_action.setCheckable(True)
         self.cache_enabled_action.setChecked(self.cache_enabled)
@@ -1576,7 +1721,7 @@ class MainWindow(QMainWindow):
         ))
         close = QAction("Exit", self)
         close.triggered.connect(self.close)
-        file_menu.addActions([select_root, refresh, blacklist])
+        file_menu.addActions([select_root, refresh, blacklist, overnight])
         file_menu.addSeparator()
         file_menu.addActions([self.cache_enabled_action, cache_info, clear_cache])
         file_menu.addSeparator()
@@ -1605,15 +1750,22 @@ class MainWindow(QMainWindow):
         summary = self.simulation_cache.summary()
         enabled = "enabled" if self.cache_enabled else "disabled"
         self.cache_status_value.setText(
-            f"Cache {enabled}: {summary['entries']} entries, {self._format_bytes(summary['bytes'])}"
+            f"Cache {enabled}: {summary['entries']} entries, "
+            f"{self._format_bytes(summary['bytes'])} payload / "
+            f"{self._format_bytes(summary['disk_bytes'])} on disk"
         )
 
     def show_cache_info(self):
         summary = self.simulation_cache.summary()
+        kinds = ", ".join(
+            f"{kind}: {count}" for kind, count in sorted(summary.get("kinds", {}).items())
+        ) or "none"
         QMessageBox.information(
             self, "Simulation cache",
             f"Caching is {'enabled' if self.cache_enabled else 'disabled'}.\n\n"
-            f"{summary['entries']} entries using {self._format_bytes(summary['bytes'])}.\n"
+            f"{summary['entries']} entries using {self._format_bytes(summary['bytes'])} of payload "
+            f"and {self._format_bytes(summary['disk_bytes'])} on disk.\n"
+            f"Entries by type: {kinds}.\n"
             "Completed Quick Look evaluations and seeded optimizer searches are reused when every input and calculation source matches."
         )
 
@@ -2481,6 +2633,17 @@ class MainWindow(QMainWindow):
         self.stop_optimizer_button.setEnabled(False)
         self.stop_optimizer_button.setToolTip("Request a cooperative stop after the current candidate calculation.")
         self.stop_optimizer_button.clicked.connect(self.stop_optimizer)
+        self.overnight_button = QPushButton("Run overnight simulations")
+        self.overnight_button.setMinimumHeight(32)
+        self.overnight_button.setToolTip(
+            "Warm the normal Quick Look cache with current sets and one-item variants "
+            "from selected optimizer candidates. Use Warm cache mode for optimizer rankings."
+        )
+        self.overnight_button.clicked.connect(self.run_overnight_simulations)
+        self.stop_overnight_button = QPushButton("Stop overnight")
+        self.stop_overnight_button.setMinimumHeight(32)
+        self.stop_overnight_button.setEnabled(False)
+        self.stop_overnight_button.clicked.connect(self.stop_overnight_simulations)
         self.equip_best_button = QPushButton("Equip best set")
         self.equip_best_button.setMinimumHeight(32)
         self.equip_best_button.setEnabled(False)
@@ -2489,6 +2652,8 @@ class MainWindow(QMainWindow):
         run_controls.setContentsMargins(0, 0, 0, 0)
         run_controls.addWidget(self.optimize_button)
         run_controls.addWidget(self.stop_optimizer_button)
+        run_controls.addWidget(self.overnight_button)
+        run_controls.addWidget(self.stop_overnight_button)
         form.addRow(run_controls)
         form.addRow(self.equip_best_button)
         top.addWidget(options)
@@ -4648,7 +4813,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         running_threads = [
             thread for thread in (
-                self.optimizer_thread, self.report_thread,
+                self.optimizer_thread, self.overnight_thread, self.report_thread,
                 getattr(self, "plot_thread", None),
             )
             if thread is not None and thread.isRunning()
@@ -4831,17 +4996,12 @@ class MainWindow(QMainWindow):
             "buffs": args[3], "abilities": args[4],
         }
 
-    def _optimizer_cache_request(self, mode: str, args: tuple, kwargs: dict, *,
-                                 action_label: str, pruned: bool) -> dict:
-        """Use post-prune, post-lock engine inputs as the exact cache identity."""
+    def _optimizer_cache_request(self, mode: str, args: tuple, kwargs: dict) -> dict:
+        """Fingerprint only the effective post-filter/post-prune engine inputs."""
         return {
-            "mode": mode,
-            "action_label": action_label,
-            "args": args,
-            "kwargs": kwargs,
-            "candidate_pruning": bool(pruned),
-            "locked_gear": dict(self.locked_gear),
-            "selected_candidates": {slot: sorted(values) for slot, values in self.candidates.items()},
+            "operation": mode,
+            "engine_args": args,
+            "engine_kwargs": kwargs,
         }
 
     def _serialize_optimizer_payload(self, result, *, ranking: bool = False) -> dict:
@@ -4893,14 +5053,17 @@ class MainWindow(QMainWindow):
     def evaluate(self, action: str):
         try:
             player, enemy, _buffs, _abilities = self._context()
-            request = {
-                "action": action, "gearset": _gearset_payload(player.gearset),
-                "main_job": player.main_job, "sub_job": player.sub_job,
-                "master_level": player.master_level, "buffs": player.buffs,
-                "abilities": player.abilities, "enemy": enemy.stats,
-                "weapon_skill": self.ws_combo.currentText(), "spell": self.spell_combo.currentText(),
-                "tp": self.tp_value.value(), "ws_type": self._ws_type(),
-            }
+            spell_name = self.spell_combo.currentText()
+            spell_type = self._spell_type(spell_name)
+            request = _quick_cache_request(
+                action, player.gearset,
+                main_job=player.main_job, sub_job=player.sub_job,
+                master_level=player.master_level, buffs=player.buffs,
+                abilities=player.abilities, enemy=enemy.stats,
+                tp=self.tp_value.value(), ws_name=self.ws_combo.currentText(),
+                ws_type=self._ws_type(), spell_name=spell_name,
+                spell_type=spell_type,
+            )
             cache_key, cached = self._cache_lookup("quick-look", request)
             if cached is not None:
                 saved = cached["payload"]
@@ -4912,23 +5075,11 @@ class MainWindow(QMainWindow):
                 )
                 return
             started_at = time.monotonic()
-            if action == "ws":
-                output = actions.average_ws(
-                    player, enemy, self.ws_combo.currentText(), self.tp_value.value(),
-                    self._ws_type(), "Damage dealt",
-                )
-                text = f"Average damage: {output[1][0]:,.0f}    TP return: {output[1][1]:,.1f}"
-            elif action == "spell":
-                name = self.spell_combo.currentText()
-                output = actions.cast_spell(
-                    player, enemy, name, self._spell_type(name), "Damage dealt"
-                )
-                text = f"Average damage: {output[1][0]:,.0f}    TP return: {output[1][1]:,.1f}"
-            else:
-                output = actions.average_attack_round(
-                    player, enemy, 0, self.tp_value.value(), "Time to WS"
-                )
-                text = f"Time per WS: {output[0]:,.3f}s    TP per round: {output[1][1]:,.1f}"
+            output, text = _evaluate_quick_result(
+                player, enemy, action, tp=self.tp_value.value(),
+                ws_name=self.ws_combo.currentText(), ws_type=self._ws_type(),
+                spell_name=spell_name, spell_type=spell_type,
+            )
             self.result_label.setText(text)
             self._render_quick_stats(player, enemy)
             if cache_key is not None:
@@ -5075,8 +5226,6 @@ class MainWindow(QMainWindow):
             cache_context = self._optimizer_cache_context(args)
             cache_request = self._optimizer_cache_request(
                 cache_kind, args, kwargs,
-                action_label="Rank weapon-type WS" if ranking_mode else action_label,
-                pruned=bool(self.prune_candidates.isChecked()),
             )
             cache_key, cached = (None, None)
             # Blank seeds deliberately retain their current randomized-search behavior.
@@ -5162,6 +5311,218 @@ class MainWindow(QMainWindow):
             self.optimizer_thread.start()
         except Exception as error:
             QMessageBox.critical(self, "Optimizer", str(error))
+
+    def _build_overnight_tasks(self) -> list[dict]:
+        """Build cache tasks for current sets and selected one-item variants."""
+        context = self._report_context()
+        enemy = _report_enemy(context["enemy"], context["debuffs"])
+        enemy_stats = dict(enemy.stats)
+        task_context = {
+            "main_job": context["main_job"], "sub_job": context["sub_job"],
+            "master_level": context["master_level"],
+            "buffs": copy.deepcopy(context["buffs"]),
+            "abilities": copy.deepcopy(context["abilities"]),
+        }
+        tp_values = (1000, 2000, 3000)
+        spell_name = self.spell_combo.currentText().strip()
+        selected_ws = self.ws_combo.currentText().strip()
+        ranged_ws = set(WS_BY_SKILL.get("Marksmanship", []) + WS_BY_SKILL.get("Archery", []))
+        candidate_items = {
+            slot: {
+                item_name(item): item
+                for item in self.optimizer_items_for_slot(slot)
+                if item_name(item) in self.candidates.get(slot, set())
+            }
+            for slot in SLOTS
+        }
+        base_sets = (
+            ("Quick Look", self.quick_set.items),
+            ("TP set", self.tp_set.items),
+            ("WS set", self.ws_set.items),
+        )
+        tasks = []
+        seen = set()
+
+        def add_task(role, gearset, action, tp, *, ws_name="", ws_type="", spell_type=""):
+            request = _quick_cache_request(
+                action, gearset,
+                main_job=task_context["main_job"],
+                sub_job=task_context["sub_job"],
+                master_level=task_context["master_level"],
+                buffs=task_context["buffs"], abilities=task_context["abilities"],
+                enemy=enemy_stats, tp=tp, ws_name=ws_name, ws_type=ws_type,
+                spell_name=spell_name if action == "spell" else "",
+                spell_type=spell_type,
+            )
+            key = self.simulation_cache.key_for("quick-look", request)
+            if key in seen:
+                return
+            seen.add(key)
+            tasks.append({
+                "kind": "quick-look", "request": request, "context": task_context,
+                "enemy": enemy_stats, "gearset": request["gearset"],
+                "role": role,
+                "action": action, "tp": tp, "ws_name": ws_name,
+                "ws_type": ws_type, "spell_name": spell_name,
+                "spell_type": spell_type,
+            })
+
+        for role, base in base_sets:
+            variants = [dict(base)]
+            for slot in SLOTS:
+                base_name = item_name(base[slot])
+                for name, item in candidate_items[slot].items():
+                    if name == base_name:
+                        continue
+                    variant = dict(base)
+                    variant[slot] = item
+                    variants.append(variant)
+            for variant in variants:
+                main_skill = variant["main"].get("Skill Type", "None")
+                ws_names = [
+                    name for name in WS_BY_SKILL.get(main_skill, ())
+                    if name and name != "None"
+                ]
+                if selected_ws and selected_ws in ws_names:
+                    ws_names = [selected_ws, *[name for name in ws_names if name != selected_ws]]
+                elif selected_ws and not ws_names:
+                    ws_names = [selected_ws]
+                for tp in tp_values:
+                    add_task(role, variant, "attack", tp)
+                for ws_name in ws_names:
+                    ws_type = "ranged" if ws_name in ranged_ws else "melee"
+                    for tp in tp_values:
+                        add_task(role, variant, "ws", tp, ws_name=ws_name, ws_type=ws_type)
+                if spell_name and spell_name != "None":
+                    add_task(
+                        role, variant, "spell", 0,
+                        spell_type=self._spell_type(spell_name),
+                    )
+        return tasks
+
+    def run_overnight_simulations(self):
+        if self.optimizer_thread and self.optimizer_thread.isRunning():
+            QMessageBox.information(self, "Background work", "Stop the optimizer before starting overnight simulations.")
+            return
+        if self.overnight_thread and self.overnight_thread.isRunning():
+            return
+        if not self.cache_enabled:
+            QMessageBox.information(
+                self, "Simulation cache disabled",
+                "Enable simulation caching from File before warming the cache.",
+            )
+            return
+        default_hours = self.settings.value("overnight_simulations/hours", 8.0, float)
+        hours, accepted = QInputDialog.getDouble(
+            self, "Run overnight simulations",
+            "Time budget (hours):\nThe queue stops when this budget expires or all selected tasks finish.",
+            max(0.1, float(default_hours)), 0.1, 72.0, 1,
+        )
+        if not accepted:
+            return
+        try:
+            tasks = self._build_overnight_tasks()
+        except Exception as error:
+            QMessageBox.critical(self, "Overnight simulations", str(error))
+            return
+        if not tasks:
+            QMessageBox.information(self, "Overnight simulations", "No simulation tasks were generated.")
+            return
+        self.settings.setValue("overnight_simulations/hours", hours)
+        self.optimizer_log.clear()
+        self._optimizer_run_state = {}
+        self._optimizer_started_at = time.monotonic()
+        self._optimizer_action_in_progress = "Overnight simulations"
+        self._initialize_optimizer_run_cards(1)
+        self.show_optimizer_status()
+        self._optimizer_status_timer.start()
+        self._append_optimizer_log(
+            f"Starting overnight cache queue: {len(tasks):,} deterministic tasks; "
+            f"time budget {hours:g} hour(s)."
+        )
+        self.optimizer_activity.setText("Warming cache")
+        self.optimize_button.setEnabled(False)
+        self.overnight_button.setEnabled(False)
+        self.stop_overnight_button.setEnabled(True)
+        self.overnight_thread = OvernightSimulationThread(
+            tasks, self.simulation_cache, hours, self
+        )
+        self.overnight_thread.progress.connect(self._overnight_progress)
+        self.overnight_thread.succeeded.connect(self._overnight_done)
+        self.overnight_thread.failed.connect(self._overnight_failed)
+        self.overnight_thread.stopped.connect(self._overnight_stopped)
+        self.overnight_thread.start()
+
+    def _overnight_progress(self, summary: dict):
+        planned = max(1, int(summary.get("planned", 0)))
+        processed = int(summary.get("processed", 0))
+        fraction = min(0.98, processed / planned)
+        state = self._optimizer_run_state.setdefault(1, {"index": 1, "total": 1})
+        state.update({
+            "phase": "warming cache", "fraction": fraction,
+            "planned": planned, "tested": processed,
+            "updated": time.monotonic(),
+            "results": (
+                f"Stored {summary.get('stored', 0):,}; already cached "
+                f"{summary.get('cached', 0):,}; failed {summary.get('failed', 0):,}."
+            ),
+        })
+        self.optimizer_activity.setText("Warming cache")
+        self._refresh_optimizer_status()
+        self._append_optimizer_log(
+            f"Cache queue {processed:,}/{planned:,}: stored {summary.get('stored', 0):,}, "
+            f"cached {summary.get('cached', 0):,}, failed {summary.get('failed', 0):,}."
+        )
+
+    def _finish_overnight_ui(self, label: str):
+        self._optimizer_status_timer.stop()
+        self.optimize_button.setEnabled(True)
+        self.overnight_button.setEnabled(True)
+        self.stop_overnight_button.setEnabled(False)
+        self.optimizer_activity.setText(label)
+        self._refresh_cache_status()
+
+    def _overnight_done(self, summary: dict):
+        for state in self._optimizer_run_state.values():
+            state["phase"] = "completed"
+            state["fraction"] = 1.0
+        self._refresh_optimizer_status()
+        self._append_optimizer_log(
+            f"Overnight cache complete: stored {summary.get('stored', 0):,}; "
+            f"already cached {summary.get('cached', 0):,}; failed {summary.get('failed', 0):,}; "
+            f"elapsed {self._format_duration(summary.get('elapsed', 0))}."
+        )
+        self._finish_overnight_ui("Completed")
+        self.optimizer_progress_value.setText("Approx. progress: 100.0%")
+        self.optimizer_eta_value.setText("Estimated time remaining: complete")
+        self.optimizer_phase_value.setText("Current phase: finished")
+        self.statusBar().showMessage("Overnight cache queue completed", 6000)
+
+    def _overnight_failed(self, message: str):
+        for state in self._optimizer_run_state.values():
+            state["phase"] = "failed"
+        self._refresh_optimizer_status()
+        self._append_optimizer_log(f"Overnight cache failed: {message}")
+        self._finish_overnight_ui("Failed")
+        QMessageBox.critical(self, "Overnight simulations", message)
+
+    def _overnight_stopped(self, summary: dict):
+        for state in self._optimizer_run_state.values():
+            state["phase"] = "stopped"
+        self._refresh_optimizer_status()
+        self._append_optimizer_log(
+            f"Overnight cache stopped: processed {summary.get('processed', 0):,}/"
+            f"{summary.get('planned', 0):,}; stored {summary.get('stored', 0):,}."
+        )
+        self._finish_overnight_ui("Stopped")
+        self.statusBar().showMessage("Overnight cache queue stopped", 5000)
+
+    def stop_overnight_simulations(self):
+        if self.overnight_thread and self.overnight_thread.isRunning():
+            self.overnight_thread.request_stop()
+            self.stop_overnight_button.setEnabled(False)
+            self.optimizer_activity.setText("Stopping...")
+            self._append_optimizer_log("Stop requested; finishing the current cache task...")
 
     def _append_optimizer_log(self, message: str):
         """Append a readable, color-coded optimizer status line."""
