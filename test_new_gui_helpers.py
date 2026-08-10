@@ -2,8 +2,9 @@ import unittest
 
 import gear
 from new_gui_main import (
-    _compose_profile_payloads, _profile_category, _profile_set_descriptor,
-    _profile_ws_name, _with_weapon_overlays,
+    REMA_WEAPON_NAMES, _aspirational_catalog, _compose_profile_payloads,
+    _is_r15_variant, _profile_category, _profile_set_descriptor, _profile_ws_name,
+    _with_weapon_overlays,
 )
 
 
@@ -76,7 +77,18 @@ class ProfileReportHelperTests(unittest.TestCase):
         self.assertEqual(combined["gearset"]["ranged"]["Name"], "Gun")
         self.assertEqual(combined["gearset"]["ammo"]["Name"], "Armor ammo")
         self.assertEqual(combined["gearset"]["head"]["Name"], "Armor head")
-        self.assertEqual(combined["weapon_setup"], "Tp_Default â†’ Weapon_DW â†’ Gun_TP")
+        self.assertEqual(combined["weapon_setup"], "Tp_Default -> Weapon_DW -> Gun_TP")
+
+    def test_aspirational_catalog_includes_all_legacy_rema_base_and_r15_models(self):
+        catalog = _aspirational_catalog()
+        for weapon_name in REMA_WEAPON_NAMES:
+            variants = [
+                record["item"] for record in catalog.values()
+                if record["item"].get("Name") == weapon_name
+            ]
+            self.assertTrue(variants, weapon_name)
+            self.assertTrue(any(not _is_r15_variant(item) for item in variants), weapon_name)
+            self.assertTrue(any(_is_r15_variant(item) for item in variants), weapon_name)
 
 
 if __name__ == "__main__":

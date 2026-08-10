@@ -268,6 +268,19 @@ def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric,
     attack1 = player.stats["Attack1"]
     attack2 = player.stats["Attack2"]
 
+    # Footwork's ``Kick Attacks Attack%`` is a modifier to the attack value
+    # used by kicks.  ``Attack1`` already includes normal attack buffs and
+    # food, so mirror the WS calculation here: remove food and the normal
+    # attack multiplier, add flat kick attack, then apply both multipliers.
+    kick_attack_value = attack1 - player.stats.get("Food Attack", 0)
+    kick_attack_value /= 1 + player.stats.get("Attack%", 0)
+    kick_attack_value += player.stats.get("Kick Attacks Attack", 0)
+    kick_attack_value *= (
+        1 + player.stats.get("Attack%", 0)
+        + player.stats.get("Kick Attacks Attack%", 0)
+    )
+    kick_attack_value += player.stats.get("Food Attack", 0)
+
     accuracy1 = player.stats["Accuracy1"]
     accuracy2 = player.stats["Accuracy2"]
 
@@ -927,7 +940,7 @@ def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric,
             if np.random.uniform() < kickattacks and (main_skill_type=="Hand-to-Hand"):
                 attempted_hits += 1
                 if np.random.uniform() < hit_rate11:
-                    kickattacks_pdif, crit = get_pdif_melee(attack1 + player.stats.get("Kick Attacks Attack",0), main_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
+                    kickattacks_pdif, crit = get_pdif_melee(kick_attack_value, main_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
                     phys_dmg_ph = get_phys_damage(kick_dmg, fstr_kick, 0, kickattacks_pdif, 1.0, crit, crit_dmg, 0, 0, 0, 0)
                     kickattacks_damage = phys_dmg_ph * (1 + (np.random.uniform() < dragon_fangs_kick_damage_bonus_proc_rate))
                     tp_ph = get_tp(1, mdelay/2 if (main_skill_type == "Hand-to-Hand") else mdelay, stp)
@@ -1061,7 +1074,7 @@ def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric,
         physical_damage *= (1 + da_dmg*da)*(1 + ta_dmg*ta) # Main-hand and off-hand hits from a multi-attack are fully boosted by "DA Damage" and "TA Damage" stats.
 
         # Now add Kick Attacks damage. Again, nothing fancy here except we use the MNK-specific "Kick Attacks Attack" stat.
-        kickattacks_pdif = get_avg_pdif_melee(attack1 + player.stats.get("Kick Attacks Attack",0), main_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
+        kickattacks_pdif = get_avg_pdif_melee(kick_attack_value, main_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
         kickattacks_damage = get_avg_phys_damage(kick_dmg, fstr_kick, 0, kickattacks_pdif, 1.0, crit_rate, crit_dmg, 0, 0, 0)
         kickattacks_damage *= dragon_fangs_kick_damage_bonus # Kick attacks probably aren't affected by Verethragna aftermath, but they do get Dragon Fangs "occasionally doubles kick attacks damage"
         physical_damage += kickattacks_damage*kickattack_hits

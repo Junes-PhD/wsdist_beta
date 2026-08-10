@@ -40,6 +40,12 @@ BASE_ITEM_MODELS = {
     26275: {"Defense": 20, "Weapon Skill Damage": 11},
     26276: {"Defense": 18, "Magic Damage": 33},
 }
+# Older GearSetBuilder exports classified Halasz Earring's magic critical hit
+# rate as ordinary physical Crit Rate.  Keep loading those exports correctly
+# while new scans use the canonical simulator stat name.
+ITEM_STAT_ALIASES = {
+    27535: {"Crit Rate": "Magic Crit Rate II"},
+}
 SKILL_NAMES = {
     1: "Hand-to-Hand", 2: "Dagger", 3: "Sword", 4: "Great Sword", 5: "Axe",
     6: "Great Axe", 7: "Scythe", 8: "Polearm", 9: "Katana", 10: "Great Katana",
@@ -80,6 +86,13 @@ def file_hash(path: Path) -> str:
 def _copy_stats(record: dict) -> dict:
     stats = record.get("stats") or {}
     return {str(key): value for key, value in stats.items() if isinstance(value, (int, float))}
+
+
+def _canonicalize_item_stats(item_id: int, stats: dict) -> dict:
+    for source, target in ITEM_STAT_ALIASES.get(item_id, {}).items():
+        if source in stats:
+            stats[target] = stats.get(target, 0) + stats.pop(source)
+    return stats
 
 
 def _record_is_unaugmented(record: dict) -> bool:
@@ -151,6 +164,7 @@ def _gear_record(record: dict, *, eligible: bool = True, hoxne_mastery_rank: int
     stats = (deepcopy(BASE_ITEM_MODELS[item_id])
              if item_id in BASE_ITEM_MODELS and _record_is_unaugmented(record)
              else _copy_stats(record))
+    _canonicalize_item_stats(item_id, stats)
     result = deepcopy(stats)
     name = str(record.get("name") or "Unknown")
     name2 = _model_name(record)

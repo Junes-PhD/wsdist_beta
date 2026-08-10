@@ -24,6 +24,15 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(item["Exclusive"])
         self.assertFalse(item["Transferable"])
 
+    def test_halasz_magic_crit_rate_is_not_physical_crit_rate(self):
+        item = _gear_record({
+            "item_id": 27535, "name": "Halasz Earring", "slots_mask": 1 << 11,
+            "jobs_mask": 1 << 1, "accessible_count": 1, "model_complete": True,
+            "stats": {"MP": 45, "Crit Rate": 14},
+        })
+        self.assertEqual(item["Magic Crit Rate II"], 14)
+        self.assertNotIn("Crit Rate", item)
+
     def bridge(self):
         return {
             "schema_version": 1,

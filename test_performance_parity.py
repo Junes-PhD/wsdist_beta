@@ -53,6 +53,16 @@ class PerformanceParityTests(unittest.TestCase):
         self.assertEqual(actions.effective_ws_tp(1000, player), 2550)
         self.assertEqual(actions.effective_ws_tp(2000, player), 3000)
 
+    def test_centovente_stacks_with_moonshade_but_not_itself(self):
+        gearset = empty_gearset()
+        gearset["main"] = Centovente
+        gearset["ear1"] = Moonshade_Earring
+        player = create_player("thf", "war", 50, gearset, {}, {})
+
+        # One Centovente contributes +1000, Moonshade contributes +250, and
+        # the existing Fencer bonus contributes +300.
+        self.assertEqual(player.stats.get("TP Bonus"), 1550)
+
     def test_sagitta_path_a_store_tp_and_double_damage(self):
         gearset = empty_gearset()
         gearset["main"] = Sagitta
@@ -78,7 +88,7 @@ class PerformanceParityTests(unittest.TestCase):
         unenhanced = actions.average_attack_round(baseline_player, enemy, 0, 1000, "Damage dealt")
         self.assertGreater(enhanced[0], unenhanced[0])
 
-    def test_optimizer_rejects_duplicate_plus_1000_tp_bonus_weapon(self):
+    def test_optimizer_rejects_duplicate_centovente(self):
         """Centovente/Centovente2 must not be treated as two copies."""
         gearset = empty_gearset()
         gearset["main"] = Centovente
@@ -221,6 +231,55 @@ class PerformanceParityTests(unittest.TestCase):
         self.assertNotEqual(player.gearset["hands"]["Name"], "Empty")
         self.assertNotEqual(player.gearset["legs"]["Name"], "Empty")
         self.assertNotEqual(player.gearset["feet"]["Name"], "Empty")
+
+    def test_footwork_optimizer_prefers_nonempty_tied_armor_slot(self):
+        """A neutral gear slot must not remain randomly Empty under Footwork."""
+        gearset = empty_gearset()
+        gearset["main"] = Spharai
+        check_gear = {slot: [item] for slot, item in gearset.items()}
+        check_gear["waist"] = [Empty, Null_Belt]
+        enemy = create_enemy(preset_enemies["Apex Toad"])
+        enemy.stats["Base Defense"] = preset_enemies["Apex Toad"]["Defense"]
+        enemy.stats["Magic Defense"] = max(-50, enemy.stats.get("Magic Defense", 0))
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            player, _output, _metric = build_set(
+                "mnk", "war", 50, {}, {"Footwork": True}, enemy,
+                "Victory Smite", "", "attack round", 1000, check_gear,
+                gearset, 199, 199, "Damage dealt", False, 1,
+                seed=20260809, n_iter=1, return_details=True,
+                preserve_starting_gearset=True,
+            )
+
+        self.assertEqual(player.gearset["waist"]["Name"], "Null Belt")
+
+    def test_footwork_kick_attack_modifier_affects_auto_attack_damage(self):
+        gearset = empty_gearset()
+        gearset["main"] = Spharai
+        enemy = create_enemy(preset_enemies["Apex Toad"])
+
+        without_footwork = create_player("mnk", "war", 50, gearset, {}, {})
+        with_footwork = create_player(
+            "mnk", "war", 50, gearset, {}, {"Footwork": True}
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            normal = actions.average_attack_round(
+                without_footwork, enemy, 0, 1000, "Damage dealt"
+            )
+            footwork = actions.average_attack_round(
+                with_footwork, enemy, 0, 1000, "Damage dealt"
+            )
+            normal_time = actions.average_attack_round(
+                without_footwork, enemy, 0, 1000, "Time to WS"
+            )
+            footwork_time = actions.average_attack_round(
+                with_footwork, enemy, 0, 1000, "Time to WS"
+            )
+
+        self.assertGreater(footwork[0], normal[0])
+        self.assertGreater(footwork[1][1], normal[1][1])
+        self.assertLess(footwork_time[0], normal_time[0])
 
     def test_base_stats_cache_is_isolated_and_configuration_sensitive(self):
         player_module._BASE_STATS_CACHE.clear()

@@ -15,6 +15,7 @@ import numpy as np
 from actions import *
 import sys
 from concurrent.futures import ProcessPoolExecutor, wait
+from collections import OrderedDict
 from contextlib import redirect_stdout
 from datetime import datetime # For timestamping new sets to put on BG Wiki
 from itertools import product
@@ -400,6 +401,11 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     sub_job = sub_job.lower()
     verbose_swaps = abilities.get("Verbose Swaps", False)
     damage_taken_item_cache = {}
+    # This cache is intentionally local to one build_set call/worker.  It
+    # avoids recomputing a player and action when multiple slot-pair paths
+    # revisit the same gear set, without any cross-process SQLite contention.
+    evaluation_cache = OrderedDict()
+    evaluation_cache_limit = 512
     rng = np.random.default_rng(seed) if seed is not None else np.random
     best_set = None
     best_output = None
@@ -426,6 +432,43 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                 partial_output=best_output,
                 partial_metric=best_metric,
             )
+
+    def evaluation_key(gearset):
+        return tuple(
+            (slot, tuple(sorted((str(key), repr(value)) for key, value in item.items())))
+            for slot, item in sorted(gearset.items())
+        )
+
+    def evaluate_gearset(gearset):
+        key = evaluation_key(gearset)
+        cached = evaluation_cache.get(key)
+        if cached is not None:
+            evaluation_cache.move_to_end(key)
+            return cached
+        player = create_player(main_job, sub_job, master_level, gearset, buffs, abilities)
+        if action_type == "weapon skill":
+            metric_base, output = average_ws(player, enemy, ws_name, min_tp, ws_type, input_metric)
+            metric = metric_base ** output[-1]
+        elif action_type == "combined tp/ws":
+            if combined_ws_player is None:
+                metric, output = _combined_tp_ws_metric(player, enemy, ws_name, min_tp, ws_type)
+            else:
+                metric, output = _combined_tp_ws_metric_pair(
+                    player, combined_ws_player, enemy, ws_name, min_tp, ws_type
+                )
+        elif action_type == "spell cast":
+            metric_base, output = cast_spell(player, enemy, spell_name, spell_type, input_metric)
+            metric = metric_base ** output[-1]
+        elif action_type == "attack round":
+            metric_base, output, _ = average_attack_round(player, enemy, 0, min_tp, input_metric)
+            metric = metric_base ** output[-1]
+        else:
+            raise ValueError(f"Unknown action_type ({action_type})")
+        result = player, metric, output
+        evaluation_cache[key] = result
+        if len(evaluation_cache) > evaluation_cache_limit:
+            evaluation_cache.popitem(last=False)
+        return result
 
     def progress_results_text():
         """Format already-calculated combat output for live status updates."""
@@ -495,6 +538,20 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                     and float(sub.get("TP Bonus", 0)) >= 1000)
         except (TypeError, ValueError):
             return False
+
+    def empty_nonweapon_slots(gearset):
+        """Prefer a real armor/accessory on otherwise identical results.
+
+        Empty is still valid for weapon slots and forced-empty equipment.  This
+        only resolves exact score ties caused by an item with no modeled effect
+        during the current action, preventing a randomized starting Empty slot
+        from being presented as the winning Footwork/TP set.
+        """
+        return sum(
+            1 for slot, item in gearset.items()
+            if slot not in {"main", "sub", "ranged", "ammo"}
+            and item.get("Name", "Empty") == "Empty"
+        )
 
     ws_dict = {"Katana": ["Blade: Retsu", "Blade: Teki", "Blade: To", "Blade: Chi", "Blade: Ei", "Blade: Jin", "Blade: Ten", "Blade: Ku", "Blade: Yu", "Blade: Metsu", "Blade: Kamu", "Blade: Hi", "Blade: Shun", "Zesho Meppo",],
         "Great Katana": ["Tachi: Enpi", "Tachi: Goten", "Tachi: Kagero", "Tachi: Jinpu", "Tachi: Koki","Tachi: Yukikaze", "Tachi: Gekko", "Tachi: Kasha", "Tachi: Ageha","Tachi: Kaiten", "Tachi: Rana", "Tachi: Fudo", "Tachi: Shoha", "Tachi: Mumei"],
@@ -709,30 +766,19 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                 )
             elif (base_pdt <= pdt_thresh_temp and base_mdt <= mdt_thresh_temp
                     and base_dt <= dt_thresh_temp):
-                base_player = create_player(main_job, sub_job, master_level, converged_set, buffs, abilities)
+                base_player, metric_base, best_output = evaluate_gearset(converged_set)
                 if action_type == "weapon skill":
                     decimals = 1
                     nondecimals = 8
-                    metric_base, best_output = average_ws(base_player, enemy, ws_name, min_tp, ws_type, input_metric)
                 elif action_type == "combined tp/ws":
                     decimals = 1
                     nondecimals = 8
-                    if combined_ws_player is None:
-                        metric_base, best_output = _combined_tp_ws_metric(
-                            base_player, enemy, ws_name, min_tp, ws_type
-                        )
-                    else:
-                        metric_base, best_output = _combined_tp_ws_metric_pair(
-                            base_player, combined_ws_player, enemy, ws_name, min_tp, ws_type
-                        )
                 elif action_type == "spell cast":
                     decimals = 1
                     nondecimals = 8
-                    metric_base, best_output = cast_spell(base_player, enemy, spell_name, spell_type, input_metric)
                 elif action_type == "attack round":
                     decimals = 3
                     nondecimals = 8
-                    metric_base, best_output, _ = average_attack_round(base_player, enemy, 0, min_tp, input_metric)
                 else:
                     raise ValueError(f"Unknown action_type ({action_type})")
                 invert = best_output[-1]
@@ -977,7 +1023,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             valid_count += 1
 
                             # Sets that survive this long are valid and satisfy the temporary PDT/MDT requirements.
-                            player = create_player(main_job, sub_job, master_level, test_set, buffs, abilities)
+                            player, metric, output = evaluate_gearset(test_set)
 
 
                             # Prepare to test the set.
@@ -985,35 +1031,16 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             if action_type=="weapon skill":
                                 decimals = 1
                                 nondecimals = 8
-                                metric_base, output = average_ws(player, enemy, ws_name, min_tp, ws_type, input_metric)
-                                invert = output[-1]
-                                metric = metric_base**invert
                             elif action_type=="spell cast":
                                 decimals = 1
                                 nondecimals = 8
-                                metric_base, output = cast_spell(player, enemy, spell_name, spell_type, input_metric)
-                                invert = output[-1]
-                                metric = metric_base**invert
                             elif action_type=="attack round":
                                 decimals = 3 # How many decimals to show in the output.
                                 nondecimals = 8
-                                metric_base, output, _ = average_attack_round(player, enemy, 0, min_tp, input_metric)
-                                invert = output[-1]
-                                metric = metric_base**invert
 
                             elif action_type == "combined tp/ws":
                                 decimals = 1
                                 nondecimals = 8
-                                if combined_ws_player is None:
-                                    metric_base, output = _combined_tp_ws_metric(
-                                        player, enemy, ws_name, min_tp, ws_type
-                                    )
-                                else:
-                                    metric_base, output = _combined_tp_ws_metric_pair(
-                                        player, combined_ws_player, enemy, ws_name, min_tp, ws_type
-                                    )
-                                invert = 1.0
-                                metric = metric_base
 
                             else:
                                 print(f"Unknown action_type  ({action_type})")
@@ -1039,7 +1066,11 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                 and metric == best_metric
                                 and (best_primary_metric is None or primary_metric > best_primary_metric)
                             )
-                            if better_substat or tied_substat_better_damage or (not substat_spec and metric > best_metric):
+                            tied_nonempty_gear = (
+                                not substat_spec and metric == best_metric
+                                and empty_nonweapon_slots(test_set) < empty_nonweapon_slots(best_set)
+                            )
+                            if better_substat or tied_substat_better_damage or tied_nonempty_gear:
                                 if item1==item2:
                                     print(f"[{slot1:<15s}]: [{best_set[slot1]['Name2']} ->  {item1['Name2']}   [{best_metric**invert:>{nondecimals}.{decimals}f} -> {metric**invert:>{nondecimals}.{decimals}f}]") if verbose_swaps else None
                                 else:

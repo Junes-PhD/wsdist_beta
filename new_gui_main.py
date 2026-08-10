@@ -16,16 +16,17 @@ import json
 import multiprocessing
 import os
 import re
+import secrets
 import sys
 import threading
 import time
 import zipfile
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QSettings, QSize, Qt, QStandardPaths, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFontMetrics, QIcon, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QInputDialog, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPlainTextEdit, QPushButton, QScrollArea, QDoubleSpinBox, QSpinBox, QSplitter,
@@ -39,6 +40,7 @@ import enemies
 import fancy_plot
 import gear
 import wsdist
+from simulation_cache import SimulationCache, source_fingerprint
 from wsdist_bridge import BridgeStore
 from lac_profile import (
     prepare_managed_update, prepare_set_renames, write_managed_sets,
@@ -47,6 +49,9 @@ from lac_profile import (
 
 
 APP_DIR = Path(__file__).resolve().parent
+CACHE_SOURCE_HASH = source_fingerprint([
+    APP_DIR / "gear.py", APP_DIR / "actions.py", APP_DIR / "create_player.py", APP_DIR / "wsdist.py",
+])
 SLOTS = (
     "main", "sub", "ranged", "ammo", "head", "neck", "ear1", "ear2",
     "body", "hands", "ring1", "ring2", "back", "waist", "legs", "feet",
@@ -153,6 +158,7 @@ def _legacy_literal(attribute: str, fallback):
 
 WS_BY_SKILL = _legacy_literal("ws_dict", {"None": ["None"]})
 SPELLS_BY_JOB = _legacy_literal("spells_dict", {})
+REMA_WEAPON_NAMES = frozenset(_legacy_literal("rema_weapons", ()))
 ALL_WS_NAMES = sorted(
     {name for names in WS_BY_SKILL.values() for name in names if name != "None"},
     key=len,
@@ -184,6 +190,63 @@ SUBSTAT_OPTIONS = (
     "Subtle Blow", "Counter", "Store TP", "Accuracy", "Magic Accuracy",
     "Attack", "Magic Attack", "HP", "MP", "Enmity",
 )
+WARM_CACHE_ACTION = "Warm cache - WS ranking (1k/2k/3k TP)"
+
+
+def _gearset_payload(gearset: dict) -> dict[str, dict]:
+    """Copy plain item data so cached results never hold live player objects."""
+    return {
+        slot: dict(item) if isinstance(item, dict) else dict(gear.Empty)
+        for slot, item in gearset.items()
+    }
+
+
+def _serialize_optimizer_player(player) -> dict:
+    if isinstance(player, wsdist.CombinedSetResult):
+        return {
+            "combined": True,
+            "tp_gearset": _gearset_payload(player.tp_player.gearset),
+            "ws_gearset": _gearset_payload(player.ws_player.gearset),
+        }
+    return {"combined": False, "gearset": _gearset_payload(player.gearset)}
+
+
+def _cached_player(data: dict, context: dict):
+    def build(gearset):
+        return create_player.create_player(
+            context["main_job"], context["sub_job"], context["master_level"],
+            gearset=gearset, buffs=context["buffs"], abilities=context["abilities"],
+        )
+    if data.get("combined"):
+        return wsdist.CombinedSetResult(build(data["tp_gearset"]), build(data["ws_gearset"]))
+    return build(data["gearset"])
+
+
+def _serialize_top_results(results: list[dict]) -> list[dict]:
+    saved = []
+    for entry in results:
+        row = {}
+        for key, value in entry.items():
+            if key == "player" and value is not None:
+                row[key] = {"__player__": _serialize_optimizer_player(value)}
+            elif key in {"tp_player", "ws_player"} and value is not None:
+                row[key] = {"__player__": _serialize_optimizer_player(value)}
+            else:
+                row[key] = value
+        saved.append(row)
+    return saved
+
+
+def _restore_top_results(results: list[dict], context: dict) -> list[dict]:
+    restored = []
+    for entry in results or ():
+        row = dict(entry)
+        for key in ("player", "tp_player", "ws_player"):
+            wrapped = row.get(key)
+            if isinstance(wrapped, dict) and "__player__" in wrapped:
+                row[key] = _cached_player(wrapped["__player__"], context)
+        restored.append(row)
+    return restored
 
 
 def _optimizer_check_gear(candidates: dict[str, set[str]], items_by_slot: dict[str, list[dict]], quick_gear: dict[str, dict]):
@@ -383,7 +446,7 @@ def _with_weapon_overlays(payload: dict, main_weapon: dict | None,
     labels = [entry["name"] for entry in (main_weapon, ranged_weapon) if entry]
     provenance = list(payload.get("layers") or [payload.get("name", "As listed")])
     provenance.extend(labels)
-    result["weapon_setup"] = " â†’ ".join(provenance)
+    result["weapon_setup"] = " -> ".join(provenance)
     return result
 
 
@@ -417,12 +480,34 @@ def _blacklist_matches(item: dict, blacklist: set[str]) -> bool:
 
 
 def item_tooltip(item: dict) -> str:
-    ignored = {"Name", "Name2", "Jobs", "Slots", "Bridge Key", "Eligible"}
+    ignored = {
+        "Name", "Name2", "Jobs", "Slots", "Bridge Key", "Eligible",
+        "Shared Only", "Shared Characters", "Aspirational Only",
+    }
     lines = [str(item.get("Name") or item_name(item))]
     for key, value in item.items():
         if key not in ignored and value not in (None, "", 0, False, [], {}):
             lines.append(f"{key}: {value}")
     return "\n".join(lines)
+
+
+def _is_r15_variant(item: dict) -> bool:
+    """Recognize both modeled R15 names and bridge-export rank labels."""
+    text = " ".join(str(item.get(key) or "") for key in ("Name", "Name2"))
+    return bool(re.search(r"\br15\b|rank\s*=\s*15", text, re.IGNORECASE))
+
+
+def _aspirational_catalog() -> dict[str, dict]:
+    """Return the legacy modeled catalog grouped by gear variant name."""
+    catalog: dict[str, dict] = {}
+    for slot, items in _base_equipment().items():
+        for item in items:
+            name = item_name(item)
+            if name == "Empty":
+                continue
+            entry = catalog.setdefault(name, {"item": item, "slots": set()})
+            entry["slots"].add(slot)
+    return catalog
 
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -594,19 +679,27 @@ class CandidatePicker(QDialog):
                  icons: GearIconProvider, locked_name: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Optimizer candidates: {slot.title()}")
+        self.setMinimumSize(520, 440)
         self.resize(600, 680)
         self._items = sorted(items, key=lambda value: item_name(value).lower())
-        self._player_items = [item for item in self._items if not item.get("Shared Only")]
+        self._player_items = [
+            item for item in self._items
+            if not item.get("Shared Only") and not item.get("Aspirational Only")
+        ]
+        self._aspirational_items = [item for item in self._items if item.get("Aspirational Only")]
         self._transferable_items = [item for item in self._items if item.get("Shared Only")]
         self.selected_names = set(selected)
         self.locked_name = str(locked_name or "")
         self.icons = icons
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Filter candidates...")
         self.list = QListWidget()
-        self.list.setUniformItemSizes(True)
         self.list.setIconSize(QSize(32, 32))
+        self.list.setSpacing(1)
+        self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
         layout.addWidget(self.search)
         lock_row = QHBoxLayout()
         lock_row.addWidget(QLabel("Lock this slot"))
@@ -640,18 +733,22 @@ class CandidatePicker(QDialog):
         self.search.textChanged.connect(self._populate)
         self._populate()
 
+    @staticmethod
+    def _is_candidate_row(row: QListWidgetItem) -> bool:
+        return bool(row.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+
     def _remember_visible(self):
         for index in range(self.list.count()):
             row = self.list.item(index)
-            name = row.data(Qt.ItemDataRole.UserRole)
-            if not name:
+            if not self._is_candidate_row(row):
                 continue
+            name = str(row.data(Qt.ItemDataRole.UserRole) or "")
             if row.checkState() == Qt.CheckState.Checked:
                 self.selected_names.add(name)
             else:
                 self.selected_names.discard(name)
 
-    def _append_items(self, items, query):
+    def _append_items(self, items: list[dict], query: str):
         for item in items:
             if query and query not in item_tooltip(item).lower():
                 continue
@@ -665,11 +762,18 @@ class CandidatePicker(QDialog):
                 Qt.CheckState.Checked if name in self.selected_names
                 else Qt.CheckState.Unchecked
             )
+            row.setSizeHint(QSize(0, 40))
             self.list.addItem(row)
-        return any(
-            not query or query in item_tooltip(item).lower()
-            for item in items
-        )
+
+    def _append_section_header(self, title: str):
+        header = QListWidgetItem(title)
+        header.setFlags(Qt.ItemFlag.NoItemFlags)
+        header.setForeground(QColor("#475467"))
+        font = header.font()
+        font.setBold(True)
+        header.setFont(font)
+        header.setSizeHint(QSize(0, 26))
+        self.list.addItem(header)
 
     def _populate(self):
         self._remember_visible()
@@ -681,20 +785,21 @@ class CandidatePicker(QDialog):
             if not query or query in item_tooltip(item).lower()
         ]
         if transferable:
-            separator = QListWidgetItem("Transferable gear")
-            separator.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            separator.setForeground(QColor("#667085"))
-            font = separator.font()
-            font.setBold(True)
-            separator.setFont(font)
-            self.list.addItem(separator)
+            self._append_section_header("Transferable gear")
             self._append_items(transferable, "")
+        aspirational = [
+            item for item in self._aspirational_items
+            if not query or query in item_tooltip(item).lower()
+        ]
+        if aspirational:
+            self._append_section_header("Aspirational gear")
+            self._append_items(aspirational, "")
 
     def _check_visible(self, checked: bool):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for index in range(self.list.count()):
             row = self.list.item(index)
-            if row.data(Qt.ItemDataRole.UserRole):
+            if self._is_candidate_row(row):
                 row.setCheckState(state)
 
     def _accept_selection(self):
@@ -1328,7 +1433,7 @@ class ProfileReportThread(QThread):
                     pair_index += 1
                     self.progress.emit(
                         f"Comparing TP/WS pair {pair_index}/{total_pairs}: "
-                        f"{tp_row['name']} â†’ {ws_row['name']}"
+                        f"{tp_row['name']} -> {ws_row['name']}"
                     )
                     try:
                         total_dps, cycle = actions.average_tp_ws_cycle(
@@ -1338,7 +1443,7 @@ class ProfileReportThread(QThread):
                     except Exception:
                         continue
                     candidate = {
-                        "name": f"{tp_row['name']} â†’ {ws_row['name']}",
+                        "name": f"{tp_row['name']} -> {ws_row['name']}",
                         "category": "Best Pair", "ws_name": ws_row["ws_name"],
                         "weapon_setup": ws_row["weapon_setup"],
                         "tp_dps": tp_row["tp_dps"], "time_to_ws": cycle[2],
@@ -1367,10 +1472,18 @@ class MainWindow(QMainWindow):
         if not window_icon.isNull():
             self.setWindowIcon(window_icon)
         self.settings = QSettings("WSDist", "QtGui")
+        cache_path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
+        self.simulation_cache = SimulationCache(
+            Path(cache_path) if cache_path else APP_DIR / ".cache", source_hash=CACHE_SOURCE_HASH
+        )
+        self.cache_enabled = self.settings.value("simulation_cache/enabled", True, bool)
+        self._active_optimizer_cache: dict | None = None
         self.bridge_store = BridgeStore()
         self.character_paths: dict[str, Path] = {}
         self._active_character_key = ""
         self.equipment = _base_equipment()
+        self.aspirational_catalog = _aspirational_catalog()
+        self.aspirational_selected: set[str] = set()
         self.optimizer_thread: OptimizeThread | None = None
         self.report_thread: ProfileReportThread | None = None
         self.best_player = None
@@ -1420,13 +1533,11 @@ class MainWindow(QMainWindow):
             }
             QLabel#candidateSlot {
                 color: #344054;
-                font-size: 11px;
                 font-weight: 700;
                 letter-spacing: 0.5px;
             }
             QLabel#candidatePlayer {
                 color: #667085;
-                font-size: 10px;
             }
             QPushButton#candidateButton {
                 background: #eef2f6;
@@ -1447,6 +1558,17 @@ class MainWindow(QMainWindow):
         refresh.triggered.connect(self.refresh_bridge)
         blacklist = QAction("Gear blacklist...", self)
         blacklist.triggered.connect(self.open_gear_blacklist)
+        self.cache_enabled_action = QAction("Enable simulation cache", self)
+        self.cache_enabled_action.setCheckable(True)
+        self.cache_enabled_action.setChecked(self.cache_enabled)
+        self.cache_enabled_action.setToolTip(
+            "Reuse completed deterministic Quick Look and seeded optimizer results."
+        )
+        self.cache_enabled_action.toggled.connect(self._set_cache_enabled)
+        cache_info = QAction("Simulation cache...", self)
+        cache_info.triggered.connect(self.show_cache_info)
+        clear_cache = QAction("Clear simulation cache", self)
+        clear_cache.triggered.connect(self.clear_simulation_cache)
         legacy = QAction("About legacy interface", self)
         legacy.triggered.connect(lambda: QMessageBox.information(
             self, "Legacy interface",
@@ -1454,9 +1576,53 @@ class MainWindow(QMainWindow):
         ))
         close = QAction("Exit", self)
         close.triggered.connect(self.close)
-        file_menu.addActions([select_root, refresh, blacklist, legacy])
+        file_menu.addActions([select_root, refresh, blacklist])
+        file_menu.addSeparator()
+        file_menu.addActions([self.cache_enabled_action, cache_info, clear_cache])
+        file_menu.addSeparator()
+        file_menu.addAction(legacy)
         file_menu.addSeparator()
         file_menu.addAction(close)
+
+    def _set_cache_enabled(self, enabled: bool):
+        self.cache_enabled = bool(enabled)
+        self.settings.setValue("simulation_cache/enabled", self.cache_enabled)
+        self.statusBar().showMessage(
+            "Simulation cache enabled" if self.cache_enabled else "Simulation cache disabled", 4000
+        )
+        if hasattr(self, "cache_status_value"):
+            self._refresh_cache_status()
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        if value < 1024 * 1024:
+            return f"{value / 1024:.1f} KiB"
+        return f"{value / (1024 * 1024):.1f} MiB"
+
+    def _refresh_cache_status(self):
+        if not hasattr(self, "cache_status_value"):
+            return
+        summary = self.simulation_cache.summary()
+        enabled = "enabled" if self.cache_enabled else "disabled"
+        self.cache_status_value.setText(
+            f"Cache {enabled}: {summary['entries']} entries, {self._format_bytes(summary['bytes'])}"
+        )
+
+    def show_cache_info(self):
+        summary = self.simulation_cache.summary()
+        QMessageBox.information(
+            self, "Simulation cache",
+            f"Caching is {'enabled' if self.cache_enabled else 'disabled'}.\n\n"
+            f"{summary['entries']} entries using {self._format_bytes(summary['bytes'])}.\n"
+            "Completed Quick Look evaluations and seeded optimizer searches are reused when every input and calculation source matches."
+        )
+
+    def clear_simulation_cache(self):
+        if self.simulation_cache.clear():
+            self._refresh_cache_status()
+            self.statusBar().showMessage("Simulation cache cleared", 4000)
+        else:
+            QMessageBox.warning(self, "Simulation cache", "The cache could not be cleared.")
 
     def _load_gear_blacklist(self) -> set[str]:
         raw = self.settings.value("global_gear_blacklist", "")
@@ -1477,7 +1643,7 @@ class MainWindow(QMainWindow):
         }
 
     def available_blacklist_records(self) -> dict[str, dict]:
-        """Return one representative item record for each blacklist name."""
+        """Return one representative item record per name in display order."""
         available: dict[str, dict] = {}
 
         def add(item: dict):
@@ -1504,9 +1670,34 @@ class MainWindow(QMainWindow):
             for item in store.catalog.values():
                 if item.get("Eligible"):
                     add(item)
+        slot_order = {slot: index for index, slot in enumerate(SLOTS)}
+        type_slots = {
+            "weapon": "main",
+            "shield": "sub",
+            "grip": "sub",
+            "ranged": "ranged",
+            "ammo": "ammo",
+        }
+
+        def slot_rank(item: dict) -> int:
+            slots = item.get("Slots") or ()
+            if isinstance(slots, str):
+                slots = (slots,)
+            ranks = [slot_order[slot] for slot in slots if slot in slot_order]
+            if ranks:
+                return min(ranks)
+            return slot_order.get(type_slots.get(str(item.get("Type") or "").casefold()), len(SLOTS))
+
+        def level_rank(item: dict) -> int:
+            return self._item_level(item) or -1
+
         return dict(sorted(
             available.items(),
-            key=lambda entry: str(entry[1].get("Name") or entry[1].get("Name2") or entry[0]).casefold(),
+            key=lambda entry: (
+                slot_rank(entry[1]),
+                -level_rank(entry[1]),
+                str(entry[1].get("Name") or entry[1].get("Name2") or entry[0]).casefold(),
+            ),
         ))
 
     def set_gear_blacklist(self, values: set[str]) -> None:
@@ -1625,6 +1816,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._quick_tab(), "Quick Look")
         self.tabs.addTab(self._quick_abilities_tab(), "JA")
         self.tabs.addTab(self._optimizer_tab(), "Optimizer")
+        self.tabs.addTab(self._aspirational_tab(), "Aspirational")
         self.tabs.addTab(self._sets_tab(), "TP / WS Sets")
         self.tabs.addTab(self._buffs_tab(), "Buffs")
         self.tabs.addTab(self._profile_report_tab(), "LAC Report")
@@ -2126,7 +2318,6 @@ class MainWindow(QMainWindow):
             detail = QLabel()
             detail.setObjectName("candidatePlayer")
             detail.setWordWrap(False)
-            detail.setFixedHeight(20)
             cell.addWidget(detail)
             cell.addWidget(button)
             grid.addWidget(card, row, column)
@@ -2176,12 +2367,14 @@ class MainWindow(QMainWindow):
         self.optimize_action = QComboBox()
         self.optimize_action.addItems([
             "Weapon skill", "Rank weapon-type WS", "Attack round", "Spell",
-            "Combined TP + WS", "Sub-stat optimization",
+            "Combined TP + WS", "Sub-stat optimization", WARM_CACHE_ACTION,
         ])
         self.optimize_action.setToolTip(
             "Combined TP + WS finds the best WS set first, then optimizes the TP set "
             "against that WS set using the same main/sub weapons and full-cycle DPS "
-            "(TP-round damage plus WS damage, divided by TP time plus the 2-second WS delay)."
+            "(TP-round damage plus WS damage, divided by TP time plus the 2-second WS delay). "
+            "Warm cache runs the selected weapon-type WS at 1,000/2,000/3,000 TP with a "
+            "stable seed so later identical rankings restore immediately."
         )
         self.metric_combo = QComboBox()
         self.ranking_weapon_type = QComboBox()
@@ -2253,7 +2446,10 @@ class MainWindow(QMainWindow):
         )
         self.seed = QLineEdit()
         self.seed.setPlaceholderText("random")
-        self.seed.setToolTip("Optional repeatable seed. Blank creates a new search sequence.")
+        self.seed.setToolTip(
+            "Optional repeatable seed. Enter a number to enable durable result caching; "
+            "blank creates a new random search and is not cached."
+        )
         self.prune_candidates = QCheckBox("Prune dominated candidates")
         self.prune_candidates.setChecked(True)
         self.prune_candidates.setToolTip(
@@ -2297,11 +2493,45 @@ class MainWindow(QMainWindow):
         form.addRow(self.equip_best_button)
         top.addWidget(options)
         layout.addLayout(top)
+        status_controls = QHBoxLayout()
+        self.show_optimizer_status_button = QPushButton("Show simulation status")
+        self.show_optimizer_status_button.setToolTip(
+            "Open the optimizer log, overall progress, and per-run status in a separate window."
+        )
+        self.show_optimizer_status_button.clicked.connect(self.show_optimizer_status)
+        status_controls.addWidget(self.show_optimizer_status_button)
+        status_controls.addStretch(1)
+        self.show_top_sets_button = QPushButton("Show best sets (up to 5)")
+        self.show_top_sets_button.setEnabled(False)
+        self.show_top_sets_button.clicked.connect(self.show_top_sets)
+        status_controls.addWidget(self.show_top_sets_button)
+        layout.addLayout(status_controls)
+        layout.addStretch(1)
+        self._build_optimizer_status_dialog()
+        self._refresh_optimizer_metrics(self.optimize_action.currentText())
+        self._refresh_ranking_weapon_types()
+        self._refresh_combined_options(self.optimize_action.currentText())
+        self._refresh_parallel_mode(self.parallel_mode.currentText())
+        self._refresh_candidate_preset_names()
+        for slot in SLOTS:
+            self._update_candidate_button(slot)
+        return tab
+
+    def _build_optimizer_status_dialog(self):
+        """Keep progress details out of the candidate-selection layout."""
+        self.optimizer_status_dialog = QDialog(self)
+        self.optimizer_status_dialog.setWindowTitle("Simulation status")
+        self.optimizer_status_dialog.setMinimumSize(640, 460)
+        self.optimizer_status_dialog.resize(900, 720)
+        self.optimizer_status_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        status_layout = QVBoxLayout(self.optimizer_status_dialog)
+        status_layout.setContentsMargins(12, 12, 12, 12)
+        status_layout.setSpacing(10)
         self.optimizer_log = QTextEdit()
         self.optimizer_log.setReadOnly(True)
         self.optimizer_log.setAcceptRichText(True)
         self.optimizer_log.setPlaceholderText("Optimizer progress appears here.")
-        layout.addWidget(self.optimizer_log, 1)
+        status_layout.addWidget(self.optimizer_log, 1)
         status_box = QGroupBox("Search status")
         status_grid = QGridLayout(status_box)
         status_grid.setContentsMargins(12, 12, 12, 12)
@@ -2321,7 +2551,7 @@ class MainWindow(QMainWindow):
         status_grid.addWidget(self.optimizer_eta_value, 0, 1)
         status_grid.addWidget(self.optimizer_best_value, 1, 0)
         status_grid.addWidget(self.optimizer_phase_value, 1, 1)
-        layout.addWidget(status_box)
+        status_layout.addWidget(status_box)
         self.optimizer_runs_box = QGroupBox("Per-run status")
         self.optimizer_runs_layout = QGridLayout(self.optimizer_runs_box)
         self.optimizer_runs_layout.setContentsMargins(8, 8, 8, 8)
@@ -2329,27 +2559,213 @@ class MainWindow(QMainWindow):
             "Run the optimizer to show a fixed status section for each search run."
         )
         self.optimizer_runs_layout.addWidget(self.optimizer_runs_placeholder, 0, 0)
-        layout.addWidget(self.optimizer_runs_box)
+        status_layout.addWidget(self.optimizer_runs_box)
         self.optimizer_activity = QLabel("Idle")
         self.optimizer_activity.setAlignment(Qt.AlignmentFlag.AlignRight)
-        layout.addWidget(self.optimizer_activity)
-        self.show_top_sets_button = QPushButton("Show best sets (up to 5)")
-        self.show_top_sets_button.setEnabled(False)
-        self.show_top_sets_button.clicked.connect(self.show_top_sets)
-        layout.addWidget(self.show_top_sets_button, 0, Qt.AlignmentFlag.AlignRight)
-        self._refresh_optimizer_metrics(self.optimize_action.currentText())
-        self._refresh_ranking_weapon_types()
-        self._refresh_combined_options(self.optimize_action.currentText())
-        self._refresh_parallel_mode(self.parallel_mode.currentText())
-        self._refresh_candidate_preset_names()
+        status_layout.addWidget(self.optimizer_activity)
+        cache_controls = QHBoxLayout()
+        self.cache_status_value = QLabel()
+        clear_cache = QPushButton("Clear cache")
+        clear_cache.setToolTip("Remove saved simulation results without changing character settings or bridge data.")
+        clear_cache.clicked.connect(self.clear_simulation_cache)
+        cache_controls.addWidget(self.cache_status_value)
+        cache_controls.addStretch(1)
+        cache_controls.addWidget(clear_cache)
+        status_layout.addLayout(cache_controls)
+        self._refresh_cache_status()
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.optimizer_status_dialog.hide)
+        status_layout.addWidget(buttons)
+
+    def show_optimizer_status(self):
+        self._refresh_cache_status()
+        self.optimizer_status_dialog.show()
+        self.optimizer_status_dialog.raise_()
+        self.optimizer_status_dialog.activateWindow()
+
+    def _aspirational_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        note = QLabel(
+            "Modeled gear from the legacy GUI that is not in the current character's bridge inventory. "
+            "Add an item to make it an optimizer candidate; aspirational items cannot be equipped in Quick Look."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        controls = QHBoxLayout()
+        self.aspirational_filter = QLineEdit()
+        self.aspirational_filter.setPlaceholderText("Filter item name or stats...")
+        self.aspirational_filter.textChanged.connect(self._refresh_aspirational_table)
+        self.aspirational_slot = QComboBox()
+        self.aspirational_slot.addItem("All slots", "")
         for slot in SLOTS:
-            self._update_candidate_button(slot)
+            self.aspirational_slot.addItem(slot.upper(), slot)
+        self.aspirational_slot.currentIndexChanged.connect(self._refresh_aspirational_table)
+        self.aspirational_rema_only = QCheckBox("REMA 119 III only")
+        self.aspirational_rema_only.setToolTip(
+            "Show the legacy REMA catalog, including base and R15 modeled variants."
+        )
+        self.aspirational_rema_only.toggled.connect(self._refresh_aspirational_table)
+        controls.addWidget(self.aspirational_filter, 1)
+        controls.addWidget(self.aspirational_slot)
+        controls.addWidget(self.aspirational_rema_only)
+        layout.addLayout(controls)
+        self.aspirational_table = QTableWidget(0, 5)
+        self.aspirational_table.setHorizontalHeaderLabels(
+            ["Slot(s)", "Item", "Variant", "Candidate", "Modeled stats"]
+        )
+        self.aspirational_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.aspirational_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.aspirational_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.aspirational_table.setAlternatingRowColors(True)
+        self.aspirational_table.setIconSize(QSize(32, 32))
+        self.aspirational_table.setColumnWidth(0, 96)
+        self.aspirational_table.setColumnWidth(1, 190)
+        self.aspirational_table.setColumnWidth(2, 120)
+        self.aspirational_table.setColumnWidth(3, 142)
+        self.aspirational_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.aspirational_table, 1)
+        actions = QHBoxLayout()
+        add_selected = QPushButton("Add selected to optimizer")
+        add_selected.clicked.connect(self._add_selected_aspirational_items)
+        add_rema = QPushButton("Add all listed REMA")
+        add_rema.setToolTip("Add every currently visible REMA base/R15 variant to the optimizer candidates.")
+        add_rema.clicked.connect(self._add_visible_rema_items)
+        remove_selected = QPushButton("Remove selected")
+        remove_selected.clicked.connect(self._remove_selected_aspirational_items)
+        self.aspirational_summary = QLabel()
+        actions.addWidget(add_selected)
+        actions.addWidget(add_rema)
+        actions.addWidget(remove_selected)
+        actions.addStretch(1)
+        actions.addWidget(self.aspirational_summary)
+        layout.addLayout(actions)
+        self._refresh_aspirational_table()
         return tab
+
+    def _aspirational_item_is_owned(self, item: dict) -> bool:
+        """Treat a base item as owned at any rank; R15 requires an R15 bridge row."""
+        name = _normalized_item_name(item.get("Name"))
+        wants_r15 = _is_r15_variant(item)
+        for owned in self.bridge_store.catalog.values():
+            if _normalized_item_name(owned.get("Name")) != name:
+                continue
+            if not wants_r15 or _is_r15_variant(owned):
+                return True
+        return False
+
+    def _aspirational_records(self) -> list[tuple[str, dict]]:
+        job = JOBS.get(self.main_job.currentText(), "")
+        slot_filter = str(self.aspirational_slot.currentData() or "")
+        query = self.aspirational_filter.text().strip().casefold()
+        rema_only = self.aspirational_rema_only.isChecked()
+        records = []
+        for name, record in self.aspirational_catalog.items():
+            item = record["item"]
+            jobs = [str(value).casefold() for value in item.get("Jobs", gear.all_jobs)]
+            if job not in jobs or self._aspirational_item_is_owned(item):
+                continue
+            if slot_filter and slot_filter not in record["slots"]:
+                continue
+            is_rema = str(item.get("Name") or "") in REMA_WEAPON_NAMES
+            if rema_only and not is_rema:
+                continue
+            if query and query not in item_tooltip(item).casefold():
+                continue
+            records.append((name, record))
+        return sorted(records, key=lambda entry: (min(SLOTS.index(slot) for slot in entry[1]["slots"]), entry[0].casefold()))
+
+    @staticmethod
+    def _aspirational_stat_summary(item: dict) -> str:
+        ignored = {"Name", "Name2", "Jobs", "Type", "Skill Type", "Rank"}
+        parts = [
+            f"{key} {value:+g}" for key, value in item.items()
+            if key not in ignored and isinstance(value, (int, float)) and value
+        ]
+        return " · ".join(parts[:6]) + (" …" if len(parts) > 6 else "")
+
+    def _refresh_aspirational_table(self, *_args):
+        if not hasattr(self, "aspirational_table"):
+            return
+        records = self._aspirational_records()
+        self.aspirational_table.setSortingEnabled(False)
+        self.aspirational_table.setRowCount(len(records))
+        for row, (name, record) in enumerate(records):
+            item = record["item"]
+            tooltip = item_tooltip(item)
+            slots = ", ".join(slot.upper() for slot in SLOTS if slot in record["slots"])
+            variant = "R15" if _is_r15_variant(item) else "Base"
+            if str(item.get("Name") or "") in REMA_WEAPON_NAMES:
+                variant = f"REMA 119 III · {variant}"
+            cells = (
+                QTableWidgetItem(slots),
+                QTableWidgetItem(str(item.get("Name") or name)),
+                QTableWidgetItem(variant),
+                QTableWidgetItem("Added" if name in self.aspirational_selected else "Not added"),
+                QTableWidgetItem(self._aspirational_stat_summary(item)),
+            )
+            cells[1].setIcon(self.icons.icon(item))
+            for cell in cells:
+                cell.setData(Qt.ItemDataRole.UserRole, name)
+                cell.setToolTip(tooltip)
+            for column, cell in enumerate(cells):
+                self.aspirational_table.setItem(row, column, cell)
+        self.aspirational_summary.setText(
+            f"{len(records)} unowned modeled variants · {len(self.aspirational_selected)} added"
+        )
+
+    def _selected_aspirational_names(self) -> set[str]:
+        return {
+            str(self.aspirational_table.item(index.row(), 1).data(Qt.ItemDataRole.UserRole) or "")
+            for index in self.aspirational_table.selectionModel().selectedRows()
+        }
+
+    def _set_aspirational_candidates(self, names: set[str], enabled: bool):
+        changed = 0
+        for name in names:
+            record = self.aspirational_catalog.get(name)
+            if record is None:
+                continue
+            if enabled:
+                if name in self.aspirational_selected:
+                    continue
+                self.aspirational_selected.add(name)
+            else:
+                if name not in self.aspirational_selected:
+                    continue
+                self.aspirational_selected.discard(name)
+            changed += 1
+            for slot in record["slots"]:
+                if enabled:
+                    self.candidates[slot].add(name)
+                else:
+                    self.candidates[slot].discard(name)
+                self._update_candidate_button(slot)
+        if not changed:
+            return
+        self._refresh_locked_gear_options()
+        self._refresh_aspirational_table()
+        action = "Added" if enabled else "Removed"
+        self.statusBar().showMessage(f"{action} {changed} aspirational item{'s' if changed != 1 else ''} in optimizer candidates.", 5000)
+
+    def _add_selected_aspirational_items(self):
+        self._set_aspirational_candidates(self._selected_aspirational_names(), True)
+
+    def _add_visible_rema_items(self):
+        names = {
+            name for name, record in self._aspirational_records()
+            if str(record["item"].get("Name") or "") in REMA_WEAPON_NAMES
+        }
+        self._set_aspirational_candidates(names, True)
+
+    def _remove_selected_aspirational_items(self):
+        self._set_aspirational_candidates(self._selected_aspirational_names(), False)
 
     def _refresh_optimizer_metrics(self, action: str):
         metrics = {
             "Weapon skill": ["Damage dealt", "TP return", "Magic accuracy"],
             "Rank weapon-type WS": ["Average damage at 1000 / 2000 / 3000 TP"],
+            WARM_CACHE_ACTION: ["Average damage at 1000 / 2000 / 3000 TP"],
             "Attack round": ["Time to WS", "Damage dealt", "TP return", "DPS"],
             "Spell": ["Damage dealt", "TP return"],
             "Combined TP + WS": ["Combined DPS"],
@@ -2368,7 +2784,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_combined_options(self, action: str):
         self.combined_defense_both.setVisible(action == "Combined TP + WS")
-        ranking = action == "Rank weapon-type WS"
+        ranking = action in {"Rank weapon-type WS", WARM_CACHE_ACTION}
         self.ranking_weapon_type.setVisible(ranking)
         label = self.ranking_weapon_type.parentWidget().layout().labelForField(
             self.ranking_weapon_type
@@ -3688,6 +4104,18 @@ class MainWindow(QMainWindow):
             result.append(item)
         return result
 
+    def aspirational_items_for_slot(self, slot: str) -> list[dict]:
+        """Return opted-in unowned models for optimizer use only."""
+        result = []
+        for name in sorted(self.aspirational_selected, key=str.casefold):
+            record = self.aspirational_catalog.get(name)
+            if record is None or slot not in record["slots"]:
+                continue
+            item = copy.deepcopy(record["item"])
+            item["Aspirational Only"] = True
+            result.append(item)
+        return result
+
     @staticmethod
     def _item_level(item: dict) -> int | None:
         """Read item-level metadata supplied by GearSetBuilder/bridge exports."""
@@ -3704,9 +4132,9 @@ class MainWindow(QMainWindow):
         return int(match.group(1)) if match else None
 
     def optimizer_items_for_slot(self, slot: str) -> list[dict]:
-        # Include transferable gear in the slot-selection popup. The main
-        # screen only shows candidate counts and the selected player item.
-        items = self.items_for_slot(slot)
+        # Transferable gear can be equipped from a normal picker; opted-in
+        # aspirational gear is candidate-only and never enters Quick Look.
+        items = [*self.items_for_slot(slot), *self.aspirational_items_for_slot(slot)]
         if not getattr(self, "exclude_under_119", None) or not self.exclude_under_119.isChecked():
             return items
         if slot not in ITEM_LEVEL_FILTER_SLOTS:
@@ -3801,6 +4229,7 @@ class MainWindow(QMainWindow):
         return {
             "exclude_under_119": bool(self.exclude_under_119.isChecked()),
             "include_shared_gear": bool(self.include_shared_gear.isChecked()),
+            "aspirational": sorted(self.aspirational_selected),
             "locks": {
                 slot: str(value or "")
                 for slot, value in self.locked_gear.items()
@@ -3843,6 +4272,11 @@ class MainWindow(QMainWindow):
             for slot in SLOTS:
                 values = candidates.get(slot, [])
                 self.candidates[slot] = set(values) if isinstance(values, list) else {"Empty"}
+        aspirational = state.get("aspirational", [])
+        self.aspirational_selected = {
+            str(name) for name in aspirational
+            if isinstance(name, str) and name in self.aspirational_catalog
+        } if isinstance(aspirational, list) else set()
         self.exclude_under_119.blockSignals(True)
         self.exclude_under_119.setChecked(bool(state.get("exclude_under_119", False)))
         self.exclude_under_119.blockSignals(False)
@@ -3858,6 +4292,7 @@ class MainWindow(QMainWindow):
         self._candidate_filter_changed(self.exclude_under_119.isChecked())
         for slot in SLOTS:
             self._update_candidate_button(slot)
+        self._refresh_aspirational_table()
         self.statusBar().showMessage(f"Loaded candidate preset: {name}", 5000)
 
     def save_candidate_preset(self):
@@ -3929,6 +4364,15 @@ class MainWindow(QMainWindow):
             detail_label.setToolTip(tooltip)
             button.setToolTip("Choose optimizer candidates for this slot.\n" + tooltip)
 
+    def _refresh_candidate_buttons(self):
+        for slot in SLOTS:
+            self._update_candidate_button(slot)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "candidate_buttons"):
+            QTimer.singleShot(0, self._refresh_candidate_buttons)
+
     def choose_bridge_root(self):
         initial = self.settings.value("ashita_root", "", str)
         directory = QFileDialog.getExistingDirectory(
@@ -3997,6 +4441,7 @@ class MainWindow(QMainWindow):
             self._apply_bridge_master_level()
             self._active_character_key = character_key
             self._load_character_state(character_key)
+            self._refresh_aspirational_table()
             self.refresh_quick_stats()
             self.statusBar().showMessage(f"Loaded {label}", 5000)
         except Exception as error:
@@ -4166,6 +4611,11 @@ class MainWindow(QMainWindow):
                 for slot in SLOTS:
                     values = saved_candidates.get(slot, [])
                     self.candidates[slot] = set(values) if isinstance(values, list) else {"Empty"}
+            aspirational = candidate_state.get("aspirational", [])
+            self.aspirational_selected = {
+                str(name) for name in aspirational
+                if isinstance(name, str) and name in self.aspirational_catalog
+            } if isinstance(aspirational, list) else set()
             self.exclude_under_119.setChecked(bool(candidate_state.get("exclude_under_119", False)))
             self.include_shared_gear.setChecked(bool(candidate_state.get("include_shared_gear", False)))
             self._refresh_shared_gear()
@@ -4177,6 +4627,7 @@ class MainWindow(QMainWindow):
             self._candidate_filter_changed(self.exclude_under_119.isChecked())
         for slot in SLOTS:
             self._update_candidate_button(slot)
+        self._refresh_aspirational_table()
         simulation = state.get("simulation") if isinstance(state.get("simulation"), dict) else {}
         self.plot_dps_checkbox.setChecked(bool(simulation.get("plot_dps", False)))
 
@@ -4234,6 +4685,7 @@ class MainWindow(QMainWindow):
         self._refresh_ws_choices()
         self._apply_bridge_master_level()
         self._rebuild_quick_ability_controls()
+        self._refresh_aspirational_table()
         self.refresh_quick_stats()
 
     def _refresh_quick_ability_job(self, *_args):
@@ -4281,6 +4733,7 @@ class MainWindow(QMainWindow):
         self._refresh_locked_gear_options()
         self._refresh_ws_choices()
         self._refresh_ranking_weapon_types()
+        self._refresh_aspirational_table()
         self.refresh_quick_stats()
 
     def _gear_changed(self):
@@ -4354,6 +4807,73 @@ class MainWindow(QMainWindow):
         enemy = _report_enemy(context["enemy"], context["debuffs"])
         return player, enemy, buffs, abilities
 
+    def _cache_lookup(self, kind: str, request: dict) -> tuple[str | None, dict | None]:
+        """Return a saved deterministic result only while caching is enabled."""
+        if not self.cache_enabled:
+            return None, None
+        key = self.simulation_cache.key_for(kind, request)
+        return key, self.simulation_cache.get(key, kind)
+
+    def _cache_store(self, active: dict | None, payload: dict, runtime_seconds: float):
+        if active is None or not self.cache_enabled:
+            return
+        if self.simulation_cache.put(active["key"], active["kind"], payload, runtime_seconds):
+            self._refresh_cache_status()
+
+    @staticmethod
+    def _cache_age_text(created_at: float) -> str:
+        return MainWindow._format_duration(max(0, time.time() - created_at)) + " ago"
+
+    @staticmethod
+    def _optimizer_cache_context(args: tuple) -> dict:
+        return {
+            "main_job": args[0], "sub_job": args[1], "master_level": args[2],
+            "buffs": args[3], "abilities": args[4],
+        }
+
+    def _optimizer_cache_request(self, mode: str, args: tuple, kwargs: dict, *,
+                                 action_label: str, pruned: bool) -> dict:
+        """Use post-prune, post-lock engine inputs as the exact cache identity."""
+        return {
+            "mode": mode,
+            "action_label": action_label,
+            "args": args,
+            "kwargs": kwargs,
+            "candidate_pruning": bool(pruned),
+            "locked_gear": dict(self.locked_gear),
+            "selected_candidates": {slot: sorted(values) for slot, values in self.candidates.items()},
+        }
+
+    def _serialize_optimizer_payload(self, result, *, ranking: bool = False) -> dict:
+        if ranking:
+            saved = dict(result)
+            rankings = {}
+            for tp_value, rows in (result.get("rankings") or {}).items():
+                rankings[str(tp_value)] = _serialize_top_results(list(rows))
+            saved["rankings"] = rankings
+            return saved
+        substat_summary = result[5] if isinstance(result, (tuple, list)) and len(result) > 5 else []
+        return {
+            "player": _serialize_optimizer_player(result[0]),
+            "output": result[1], "metric": result[2], "seed": result[3],
+            "top_results": _serialize_top_results(list(result[4] or [])),
+            "substat_summary": list(substat_summary or []),
+        }
+
+    def _restore_optimizer_payload(self, payload: dict, context: dict, *, ranking: bool = False):
+        if ranking:
+            restored = dict(payload)
+            restored["rankings"] = {
+                int(tp_value): _restore_top_results(rows, context)
+                for tp_value, rows in (payload.get("rankings") or {}).items()
+            }
+            return restored
+        return (
+            _cached_player(payload["player"], context), payload["output"], payload["metric"], payload["seed"],
+            _restore_top_results(payload.get("top_results") or [], context),
+            list(payload.get("substat_summary") or []),
+        )
+
     def _ws_type(self) -> str:
         ranged = set(WS_BY_SKILL.get("Marksmanship", []) + WS_BY_SKILL.get("Archery", []))
         return "ranged" if self.ws_combo.currentText() in ranged else "melee"
@@ -4373,6 +4893,25 @@ class MainWindow(QMainWindow):
     def evaluate(self, action: str):
         try:
             player, enemy, _buffs, _abilities = self._context()
+            request = {
+                "action": action, "gearset": _gearset_payload(player.gearset),
+                "main_job": player.main_job, "sub_job": player.sub_job,
+                "master_level": player.master_level, "buffs": player.buffs,
+                "abilities": player.abilities, "enemy": enemy.stats,
+                "weapon_skill": self.ws_combo.currentText(), "spell": self.spell_combo.currentText(),
+                "tp": self.tp_value.value(), "ws_type": self._ws_type(),
+            }
+            cache_key, cached = self._cache_lookup("quick-look", request)
+            if cached is not None:
+                saved = cached["payload"]
+                self.result_label.setText(str(saved["text"]))
+                self._render_quick_stats(player, enemy)
+                self.statusBar().showMessage(
+                    f"Quick Look restored from cache ({self._cache_age_text(cached['created_at'])}; "
+                    f"saved {self._format_duration(cached['runtime_seconds'])})", 6000
+                )
+                return
+            started_at = time.monotonic()
             if action == "ws":
                 output = actions.average_ws(
                     player, enemy, self.ws_combo.currentText(), self.tp_value.value(),
@@ -4392,6 +4931,11 @@ class MainWindow(QMainWindow):
                 text = f"Time per WS: {output[0]:,.3f}s    TP per round: {output[1][1]:,.1f}"
             self.result_label.setText(text)
             self._render_quick_stats(player, enemy)
+            if cache_key is not None:
+                self._cache_store(
+                    {"kind": "quick-look", "key": cache_key}, {"text": text, "output": output},
+                    time.monotonic() - started_at,
+                )
         except Exception as error:
             QMessageBox.critical(self, "Evaluation failed", str(error))
 
@@ -4411,10 +4955,13 @@ class MainWindow(QMainWindow):
                 raise ValueError(
                     f"No optimizer candidates are selected for {labels}. "
                     "Select a weapon or explicitly select Empty; the current Quick Look weapon will not be added automatically."
-                )
+            )
             action_label = self.optimize_action.currentText()
-            ranking_mode = action_label == "Rank weapon-type WS"
+            warm_cache_mode = action_label == WARM_CACHE_ACTION
+            ranking_mode = action_label in {"Rank weapon-type WS", WARM_CACHE_ACTION}
             substat_mode = action_label == "Sub-stat optimization"
+            if warm_cache_mode and not self.cache_enabled:
+                raise ValueError("Enable simulation caching from File before running Warm cache.")
             ranking_skill = self.ranking_weapon_type.currentText().strip() if ranking_mode else ""
             if ranking_mode:
                 if ranking_skill not in WS_BY_SKILL:
@@ -4436,11 +4983,21 @@ class MainWindow(QMainWindow):
                 check_gear, pruned_count = wsdist.prune_dominated_candidates(check_gear)
             seed_text = self.seed.text().strip()
             seed = int(seed_text) if seed_text else None
+            if warm_cache_mode and seed is None:
+                seed = secrets.randbits(31)
+                self.seed.setText(str(seed))
+                cache_seed_note = f"Warm cache generated optimizer seed {seed}."
+            else:
+                cache_seed_note = (
+                    "Caching skipped: Optimizer seed is blank. Enter a numeric seed to save and reuse this result."
+                    if self.cache_enabled and seed is None else ""
+                )
             action_type = {
                 "Weapon skill": "weapon skill", "Attack round": "attack round",
                 "Spell": "spell cast",
                 "Combined TP + WS": "combined tp/ws",
                 "Rank weapon-type WS": "rank weapon skills",
+                WARM_CACHE_ACTION: "rank weapon skills",
             }.get(action_label)
             if substat_mode:
                 action_type = {
@@ -4514,6 +5071,45 @@ class MainWindow(QMainWindow):
                     "ws_starting_gearset": dict(self.ws_set.items),
                     "parallel_mode": parallel_mode,
                 }
+            cache_kind = "ws-ranking" if ranking_mode else "optimizer"
+            cache_context = self._optimizer_cache_context(args)
+            cache_request = self._optimizer_cache_request(
+                cache_kind, args, kwargs,
+                action_label="Rank weapon-type WS" if ranking_mode else action_label,
+                pruned=bool(self.prune_candidates.isChecked()),
+            )
+            cache_key, cached = (None, None)
+            # Blank seeds deliberately retain their current randomized-search behavior.
+            if seed is not None:
+                cache_key, cached = self._cache_lookup(cache_kind, cache_request)
+            self._active_optimizer_cache = None
+            if cached is not None:
+                self.optimizer_log.clear()
+                self._optimizer_run_state = {}
+                self._optimizer_started_at = None
+                self._initialize_optimizer_run_cards(1)
+                self._ranking_skill_in_progress = ranking_skill if ranking_mode else None
+                self._optimizer_action_in_progress = action_label
+                self.show_optimizer_status()
+                restored = self._restore_optimizer_payload(
+                    cached["payload"], cache_context, ranking=ranking_mode
+                )
+                if ranking_mode:
+                    self._ws_ranking_done(restored)
+                else:
+                    self._optimizer_done(restored)
+                self._append_optimizer_log(
+                    f"Restored from cache ({self._cache_age_text(cached['created_at'])}; "
+                    f"saved runtime {self._format_duration(cached['runtime_seconds'])})."
+                )
+                self.optimizer_activity.setText("Restored from cache")
+                self.statusBar().showMessage("Optimizer result restored from cache", 6000)
+                return
+            if cache_key is not None:
+                self._active_optimizer_cache = {
+                    "kind": cache_kind, "key": cache_key, "context": cache_context,
+                    "ranking": ranking_mode,
+                }
             checks = wsdist.estimate_candidate_checks(
                 check_gear, JOBS[self.main_job.currentText()], optimizer_ws_type
             )
@@ -4523,6 +5119,7 @@ class MainWindow(QMainWindow):
             self._optimizer_started_at = time.monotonic()
             run_count = 1 if ranking_mode or kwargs["parallel_mode"] == "single_run" else self.restarts.value()
             self._initialize_optimizer_run_cards(run_count)
+            self.show_optimizer_status()
             self._optimizer_status_timer.start()
             self.show_top_sets_button.setEnabled(False)
             self.optimizer_progress_value.setText("Approx. progress: 0.0%")
@@ -4533,6 +5130,8 @@ class MainWindow(QMainWindow):
                 f"Starting optimizer · ~{checks:,} candidates per pass"
             )
             self.optimizer_activity.setText("Starting…")
+            if cache_seed_note:
+                self._append_optimizer_log(cache_seed_note)
             if pruned_count:
                 reduction = (1 - checks / raw_checks) * 100 if raw_checks else 0
                 self._append_optimizer_log(
@@ -4843,6 +5442,12 @@ class MainWindow(QMainWindow):
         self._refresh_optimizer_status()
         result = dict(result)
         result["skill_type"] = self._ranking_skill_in_progress or "Selected weapon"
+        active_cache = self._active_optimizer_cache
+        self._active_optimizer_cache = None
+        self._cache_store(
+            active_cache, self._serialize_optimizer_payload(result, ranking=True),
+            time.monotonic() - (self._optimizer_started_at or time.monotonic()),
+        )
         self._ranking_skill_in_progress = None
         errors = list(result.get("errors") or ())
         for error in errors:
@@ -4876,6 +5481,12 @@ class MainWindow(QMainWindow):
             state["phase"] = "completed"
             state["fraction"] = 1.0
         self._refresh_optimizer_status()
+        active_cache = self._active_optimizer_cache
+        self._active_optimizer_cache = None
+        self._cache_store(
+            active_cache, self._serialize_optimizer_payload(result),
+            time.monotonic() - (self._optimizer_started_at or time.monotonic()),
+        )
         substat_summary = result[5] if isinstance(result, (tuple, list)) and len(result) > 5 else []
         self.best_player, _output, metric, winning_seed, self.optimizer_top_results = result[:5]
         self.best_tp_player = getattr(self.best_player, "tp_player", self.best_player)
@@ -4908,6 +5519,7 @@ class MainWindow(QMainWindow):
 
     def _optimizer_failed(self, message: str):
         self._optimizer_status_timer.stop()
+        self._active_optimizer_cache = None
         self._ranking_skill_in_progress = None
         for state in self._optimizer_run_state.values():
             if state.get("phase") not in {"completed", "stopped"}:
@@ -4922,6 +5534,7 @@ class MainWindow(QMainWindow):
 
     def _optimizer_stopped(self, payload):
         self._optimizer_status_timer.stop()
+        self._active_optimizer_cache = None
         self._ranking_skill_in_progress = None
         for state in self._optimizer_run_state.values():
             if state.get("phase") != "completed":
