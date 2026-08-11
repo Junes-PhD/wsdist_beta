@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from lac_profile import (
-    bridge_hash, parse_set_entries, prepare_managed_update, prepare_set_renames,
+    bridge_hash, parse_set_entries, prepare_managed_update, prepare_profile_builder_update, prepare_set_renames,
     serialize_set, write_set,
 )
 from wsdist_bridge import BridgeStore, _gear_record, hoxne_stat_bonus
@@ -169,6 +169,33 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("['Tp_WSDist']", updated)
         self.assertIn("['Savage_WSDist']", updated)
         parse_set_entries(updated)
+
+    def test_profile_builder_update_is_idempotent_and_adds_defense_adapter(self):
+        source = (
+            "local sets = { Tp_Default = { Head = 'Old' }, Dt = {}, };\n"
+            "profile.OnLoad = function()\n"
+            "  gcinclude.Initialize(T{'weapon'});\n"
+            "  gcdisplay.CreateCycle('MeleeSet', {[1] = 'Default', [2] = 'Hybrid'});\n"
+            "end\n"
+            "profile.HandleDefault = function()\n"
+            "  gcinclude.CheckDefault();\n"
+            "end\nreturn profile;\n"
+        )
+        first = prepare_profile_builder_update(source, {
+            "Tp_Default": {"head": {"Name": "New TP"}},
+            "Tp_HighAcc": {"body": {"Name": "New Acc"}},
+            "Evasion": {"feet": {"Name": "Evasion Boots"}},
+        })
+        second = prepare_profile_builder_update(first, {
+            "Tp_Default": {"head": {"Name": "New TP"}},
+            "Tp_HighAcc": {"body": {"Name": "New Acc"}},
+            "Evasion": {"feet": {"Name": "Evasion Boots"}},
+        })
+        self.assertEqual(first, second)
+        self.assertIn("WSDIST-PROFILE-BUILDER v1", first)
+        self.assertIn("DefenseSet", first)
+        self.assertIn("HighAcc", first)
+        parse_set_entries(first)
 
     def test_guided_rename_updates_static_and_dynamic_references(self):
         source = (

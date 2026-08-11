@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import zipfile
+from collections import OrderedDict
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings, QSize, Qt, QStandardPaths, QThread, QTimer, pyqtSignal
@@ -43,15 +44,20 @@ import wsdist
 from simulation_cache import SimulationCache, source_fingerprint
 from wsdist_bridge import BridgeStore
 from lac_profile import (
-    prepare_managed_update, prepare_set_renames, write_managed_sets,
+    prepare_managed_update, prepare_profile_builder_update, prepare_set_renames,
+    write_managed_sets, write_profile_builder_sets,
     write_reload_request, write_renamed_profile,
+)
+from profile_builder import (
+    GearSources, ProfileRecipe, bridge_candidates, build_stat_set, child_seed, pin_unmodeled_slots,
+    optimizer_scenario, profile_recipes, weapon_category, weapon_overlays,
 )
 
 
 APP_DIR = Path(__file__).resolve().parent
 CACHE_SOURCE_HASH = source_fingerprint([
-    APP_DIR / name for name in (
-        "gear.py", "actions.py", "create_player.py", "wsdist.py",
+            APP_DIR / name for name in (
+        "gear.py", "equipment_rules.py", "actions.py", "attack_round_model.py", "create_player.py", "wsdist.py",
         "weaponskill_info.py", "get_hit_rate.py", "get_ma_rate.py", "get_fstr.py",
         "get_pdif.py", "get_phys_damage.py", "weapon_bonus.py", "get_tp.py",
         "nuking.py", "get_dint_m_v.py", "get_delay_timing.py", "enemies.py",
@@ -256,25 +262,98 @@ def _evaluate_quick_result(player, enemy, action: str, *, tp: int = 0,
     return output, text
 
 
+def _reduction_text(value) -> str:
+    """Present the optimizer's negative damage-taken convention as a reduction."""
+    try:
+        return f"{max(0.0, -float(value)):g}%"
+    except (TypeError, ValueError):
+        return "0%"
+
+
+def _optimizer_result_summary(action_type: str, output, metric: float,
+                              metric_name: str = "", ws_name: str = "") -> str:
+    """Return player-facing combat results instead of an internal score."""
+    try:
+        values = list(output or ())
+        if action_type == "attack round" and len(values) >= 3:
+            damage, tp_per_round, round_time = map(float, values[:3])
+            parts = [
+                f"Melee {damage / round_time:,.1f} DPS" if round_time > 0 else "Melee DPS unavailable",
+                f"{damage:,.0f} damage/round",
+                f"{tp_per_round:,.1f} TP/round",
+                f"{round_time:.2f}s/round",
+            ]
+            if metric_name == "Time to WS" and metric > 0:
+                parts.append(f"{1.0 / metric:.1f}s to WS")
+            return " · ".join(parts)
+        if action_type == "combined tp/ws" and len(values) >= 5:
+            return (
+                f"TP+WS {float(metric):,.1f} DPS · {float(values[2]):.1f}s to WS · "
+                f"{float(values[3]):,.0f} {ws_name or 'WS'} damage · {float(values[4]):.1f}s cycle"
+            )
+        if action_type in {"weapon skill", "spell cast"} and len(values) >= 2:
+            label = ws_name or ("Spell" if action_type == "spell cast" else "WS")
+            return f"{label}: {float(values[0]):,.0f} average damage · {float(values[1]):,.1f} TP return"
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return "Simulation completed; detailed combat breakdown is unavailable."
+
+
+def _optimizer_defense_summary(player) -> dict:
+    """Get persisted optimizer defense data or calculate it for older results."""
+    stored = getattr(player, "optimizer_defense", None)
+    if isinstance(stored, dict) and isinstance(stored.get("actual"), dict):
+        return stored
+    try:
+        gearset = player.gearset
+        totals = create_player.damage_taken_totals(gearset, player.buffs)
+        pdt, mdt = create_player.damage_taken_from_totals(
+            totals, gearset["main"], player.abilities
+        )
+        dt = create_player.damage_taken_dt_from_totals(
+            totals, gearset["main"], player.abilities
+        )
+        return {"requested": {}, "actual": {"PDT": pdt, "MDT": mdt, "DT": dt}, "fallback": False}
+    except (AttributeError, KeyError, TypeError):
+        return {"requested": {}, "actual": {}, "fallback": False}
+
+
 def _serialize_optimizer_player(player) -> dict:
+    def metadata(value) -> dict:
+        defense = getattr(value, "optimizer_defense", None)
+        return {"optimizer_defense": defense} if isinstance(defense, dict) else {}
+
     if isinstance(player, wsdist.CombinedSetResult):
         return {
             "combined": True,
             "tp_gearset": _gearset_payload(player.tp_player.gearset),
             "ws_gearset": _gearset_payload(player.ws_player.gearset),
+            "tp_metadata": metadata(player.tp_player),
+            "ws_metadata": metadata(player.ws_player),
         }
-    return {"combined": False, "gearset": _gearset_payload(player.gearset)}
+    return {
+        "combined": False,
+        "gearset": _gearset_payload(player.gearset),
+        "metadata": metadata(player),
+    }
 
 
 def _cached_player(data: dict, context: dict):
-    def build(gearset):
-        return create_player.create_player(
+    def build(gearset, metadata=None):
+        player = create_player.create_player(
             context["main_job"], context["sub_job"], context["master_level"],
             gearset=gearset, buffs=context["buffs"], abilities=context["abilities"],
         )
+        defense = (metadata or {}).get("optimizer_defense")
+        if isinstance(defense, dict):
+            player.optimizer_defense = defense
+        return player
     if data.get("combined"):
-        return wsdist.CombinedSetResult(build(data["tp_gearset"]), build(data["ws_gearset"]))
-    return build(data["gearset"])
+        return wsdist.CombinedSetResult(
+            build(data["tp_gearset"], data.get("tp_metadata")),
+            build(data["ws_gearset"], data.get("ws_metadata")),
+        )
+    return build(data["gearset"], data.get("metadata"))
 
 
 def _serialize_top_results(results: list[dict]) -> list[dict]:
@@ -1096,7 +1175,7 @@ class TopSetsDialog(QDialog):
         self.setWindowTitle("Best optimizer sets")
         self.resize(1050, 760)
         self.icons = icons
-        self.results = list(results[:5])
+        self.results = list(results[:40])
         layout = QVBoxLayout(self)
         note = QLabel(
             "Combined TP + WS results show the TP and WS sets side by side. "
@@ -1134,7 +1213,10 @@ class TopSetsDialog(QDialog):
                 for target in result.get("substat_targets", result.get("substats", {})):
                     if target not in targets:
                         targets.append(target)
-            comparison = QGroupBox("Secondary-stat comparison")
+            comparison = QGroupBox(
+                "Tradeoff frontier" if any(result.get("tradeoff") for result in substat_results)
+                else "Secondary-stat comparison"
+            )
             comparison_layout = QVBoxLayout(comparison)
             comparison_note = QLabel(
                 "Values are compared using the same modeled player stats as each set. "
@@ -1142,10 +1224,15 @@ class TopSetsDialog(QDialog):
             )
             comparison_note.setWordWrap(True)
             comparison_layout.addWidget(comparison_note)
-            table = QTableWidget(len(targets), 3)
-            table.setHorizontalHeaderLabels([
-                "Secondary stat", "Best damage set", "Sub-stat optimized / delta"
-            ])
+            tradeoff = any(result.get("tradeoff") for result in substat_results)
+            table = QTableWidget(
+                len(substat_results) if tradeoff else len(targets),
+                3 + len(targets) if tradeoff else 3,
+            )
+            table.setHorizontalHeaderLabels(
+                ["Set", "Primary", "Loss %", *targets] if tradeoff else
+                ["Secondary stat", "Best damage set", "Sub-stat optimized / delta"]
+            )
             table.verticalHeader().setVisible(False)
             table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
             optimized = next(
@@ -1154,18 +1241,23 @@ class TopSetsDialog(QDialog):
                 substat_results[-1],
             )
             baseline_values = baseline.get("substats", {})
-            optimized_values = optimized.get("substats", {})
-            for row, target in enumerate(targets):
-                base_value = float(baseline_values.get(target, 0.0))
-                optimized_value = float(optimized_values.get(target, 0.0))
-                table.setItem(row, 0, QTableWidgetItem(str(target)))
-                table.setItem(row, 1, QTableWidgetItem(f"{base_value:,.1f}"))
-                table.setItem(
-                    row, 2,
-                    QTableWidgetItem(
-                        f"{optimized_value:,.1f}  ({optimized_value - base_value:+,.1f})"
-                    ),
-                )
+            if tradeoff:
+                for row, result in enumerate(substat_results):
+                    table.setItem(row, 0, QTableWidgetItem(str(result.get("label") or f"Tradeoff {row + 1}")))
+                    table.setItem(row, 1, QTableWidgetItem(f"{float(result.get('metric') or 0):,.4f}"))
+                    table.setItem(row, 2, QTableWidgetItem(f"{float(result.get('primary_loss') or 0):.2f}"))
+                    for column, target in enumerate(targets, start=3):
+                        value = float(result.get("substats", {}).get(target, 0.0))
+                        delta = value - float(baseline_values.get(target, 0.0))
+                        table.setItem(row, column, QTableWidgetItem(f"{value:,.1f} ({delta:+,.1f})"))
+            else:
+                optimized_values = optimized.get("substats", {})
+                for row, target in enumerate(targets):
+                    base_value = float(baseline_values.get(target, 0.0))
+                    optimized_value = float(optimized_values.get(target, 0.0))
+                    table.setItem(row, 0, QTableWidgetItem(str(target)))
+                    table.setItem(row, 1, QTableWidgetItem(f"{base_value:,.1f}"))
+                    table.setItem(row, 2, QTableWidgetItem(f"{optimized_value:,.1f}  ({optimized_value - base_value:+,.1f})"))
             table.resizeColumnsToContents()
             comparison_layout.addWidget(table)
             layout.addWidget(comparison)
@@ -1253,7 +1345,8 @@ class GearBlacklistDialog(QDialog):
         layout = QVBoxLayout(self)
         note = QLabel(
             "Blacklisted base names are hidden from every character's gear pickers "
-            "and optimizer candidates. Augmented variants are covered by their base name."
+            "and optimizer candidates. Augmented variants are covered by their base name. "
+            "The automatic helper only compares gear within each character's own inventory."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -1279,9 +1372,20 @@ class GearBlacklistDialog(QDialog):
             )
             self.items.addItem(item)
         layout.addWidget(self.items, 1)
+        self.auto_status = QLabel()
+        self.auto_status.setWordWrap(True)
+        layout.addWidget(self.auto_status)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
+        self.auto_blacklist = QPushButton("Auto-blacklist obvious non-upgrades")
+        self.auto_blacklist.setToolTip(
+            "Marks only base items for which every known owned variant is strictly dominated "
+            "by another item owned by that same character in every compatible slot. "
+            "Save applies the marked entries."
+        )
+        self.auto_blacklist.clicked.connect(self._mark_obvious_non_upgrades)
+        buttons.addButton(self.auto_blacklist, QDialogButtonBox.ButtonRole.ActionRole)
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -1291,6 +1395,23 @@ class GearBlacklistDialog(QDialog):
         for index in range(self.items.count()):
             item = self.items.item(index)
             item.setHidden(bool(needle) and needle not in item.text().casefold())
+
+    def _mark_obvious_non_upgrades(self):
+        suggestions = self.parent().obvious_blacklist_suggestions()
+        if not suggestions:
+            self.auto_status.setText("No globally safe non-upgrades were found.")
+            return
+        marked = 0
+        for index in range(self.items.count()):
+            item = self.items.item(index)
+            key = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            if key in suggestions and item.checkState() != Qt.CheckState.Checked:
+                item.setCheckState(Qt.CheckState.Checked)
+                marked += 1
+        self.auto_status.setText(
+            f"Marked {marked} clearly dominated base item(s). Save to apply. "
+            "Existing checks were left unchanged."
+        )
 
     def _save(self):
         values = {
@@ -1603,6 +1724,70 @@ class ProfileReportThread(QThread):
             self.failed.emit(str(error))
 
 
+class OvernightScenarioDialog(QDialog):
+    """Choose the enemy scenarios included in an overnight cache batch."""
+
+    def __init__(self, enemy_names: list[str], current_enemy: str, selected: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Overnight simulation scenarios")
+        self.resize(420, 520)
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Select one or more enemies. The current enemy keeps its edited stats; "
+            "other entries use their preset stats. The current character, buffs, "
+            "abilities, gear candidates, TP values, and WS coverage are reused for each enemy."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.enemy_list = QListWidget()
+        selected_names = set(selected)
+        for name in enemy_names:
+            row = QListWidgetItem(name)
+            row.setFlags(row.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            row.setCheckState(
+                Qt.CheckState.Checked if name in selected_names
+                else Qt.CheckState.Unchecked
+            )
+            self.enemy_list.addItem(row)
+        layout.addWidget(self.enemy_list, 1)
+
+        controls = QHBoxLayout()
+        select_current = QPushButton("Current only")
+        select_current.clicked.connect(lambda: self._set_checked({current_enemy}))
+        select_all = QPushButton("Select all")
+        select_all.clicked.connect(
+            lambda: self._set_checked(set(enemy_names))
+        )
+        controls.addWidget(select_current)
+        controls.addWidget(select_all)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _set_checked(self, names: set[str]):
+        for index in range(self.enemy_list.count()):
+            row = self.enemy_list.item(index)
+            row.setCheckState(
+                Qt.CheckState.Checked if row.text() in names
+                else Qt.CheckState.Unchecked
+            )
+
+    def selected_names(self) -> list[str]:
+        return [
+            self.enemy_list.item(index).text()
+            for index in range(self.enemy_list.count())
+            if self.enemy_list.item(index).checkState() == Qt.CheckState.Checked
+        ]
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1619,6 +1804,11 @@ class MainWindow(QMainWindow):
             Path(cache_path) if cache_path else APP_DIR / ".cache", source_hash=CACHE_SOURCE_HASH
         )
         self.cache_enabled = self.settings.value("simulation_cache/enabled", True, bool)
+        # Quick Look calculations are typically millisecond-scale.  Keep them
+        # responsive within this process without filling the durable optimizer
+        # cache with opaque one-off rows.
+        self._quick_lookup_cache: OrderedDict[str, dict] = OrderedDict()
+        self._quick_lookup_cache_limit = 256
         self._active_optimizer_cache: dict | None = None
         self.bridge_store = BridgeStore()
         self.character_paths: dict[str, Path] = {}
@@ -1852,6 +2042,52 @@ class MainWindow(QMainWindow):
             ),
         ))
 
+    def obvious_blacklist_suggestions(self) -> dict[str, set[str]]:
+        """Find global suggestions without letting one character hide another's gear."""
+        items_by_owner: dict[str, dict[str, list[dict]]] = {}
+
+        def add_item(items_by_slot: dict[str, list[dict]], item: dict, slots=None):
+            if not isinstance(item, dict) or item_name(item) == "Empty":
+                return
+            slots = slots if slots is not None else item.get("Slots") or ()
+            if isinstance(slots, str):
+                slots = (slots,)
+            for slot in slots:
+                if slot in items_by_slot:
+                    items_by_slot[slot].append(item)
+
+        current_owner = str(self.bridge_store.bridge_path or "current character")
+        current_items = {slot: [] for slot in SLOTS}
+        items_by_owner[current_owner] = current_items
+        # ``equipment`` gives the selected character's slot-normalized data.
+        for slot, values in self.equipment.items():
+            for item in values:
+                add_item(current_items, item, (slot,))
+
+        def add_catalog(items_by_slot: dict[str, list[dict]], catalog):
+            for item in catalog.values():
+                if item.get("Eligible"):
+                    add_item(items_by_slot, item)
+
+        add_catalog(current_items, self.bridge_store.catalog)
+        for path in self.character_paths.values():
+            if self.bridge_store.bridge_path and path.resolve() == self.bridge_store.bridge_path.resolve():
+                continue
+            try:
+                store = BridgeStore(self.bridge_store.ashita_root)
+                store.load(path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            owner_items = {slot: [] for slot in SLOTS}
+            items_by_owner[str(path)] = owner_items
+            add_catalog(owner_items, store.catalog)
+
+        suggestions = wsdist.universal_blacklist_suggestions(items_by_owner)
+        return {
+            name: dominators for name, dominators in suggestions.items()
+            if name not in self.gear_blacklist
+        }
+
     def set_gear_blacklist(self, values: set[str]) -> None:
         self.gear_blacklist = {
             _normalized_item_name(value) for value in values if _normalized_item_name(value)
@@ -1971,7 +2207,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._aspirational_tab(), "Aspirational")
         self.tabs.addTab(self._sets_tab(), "TP / WS Sets")
         self.tabs.addTab(self._buffs_tab(), "Buffs")
-        self.tabs.addTab(self._profile_report_tab(), "LAC Report")
+        self.tabs.addTab(self._profile_builder_tab(), "Profile Builder")
+        self.tabs.addTab(self._profile_report_tab(), "Old LAC")
         layout.addWidget(self.tabs, 1)
         return container
 
@@ -2519,7 +2756,7 @@ class MainWindow(QMainWindow):
         self.optimize_action = QComboBox()
         self.optimize_action.addItems([
             "Weapon skill", "Rank weapon-type WS", "Attack round", "Spell",
-            "Combined TP + WS", "Sub-stat optimization", WARM_CACHE_ACTION,
+            "Combined TP + WS", "Tradeoff optimization", WARM_CACHE_ACTION,
         ])
         self.optimize_action.setToolTip(
             "Combined TP + WS finds the best WS set first, then optimizes the TP set "
@@ -2548,7 +2785,13 @@ class MainWindow(QMainWindow):
         self.substat_loss_percent.setValue(10.0)
         self.substat_loss_percent.setSuffix(" %")
         self.substat_loss_percent.setToolTip(
-            "Maximum allowed damage loss from the best primary-damage set."
+            "Maximum allowed primary-performance loss from the best primary set."
+        )
+        self.tradeoff_depth = QComboBox()
+        self.tradeoff_depth.addItems(["Fast", "Deep"])
+        self.tradeoff_depth.setToolTip(
+            "Fast keeps the normal optimizer's tradeoffs. Deep explores additional "
+            "primary-loss bands and is intended for overnight searches."
         )
         self.substat_combos = []
         for _index, default_stat in enumerate(("Magic Evasion", "Evasion", "Defense")):
@@ -2614,6 +2857,7 @@ class MainWindow(QMainWindow):
         form.addRow("Ranking weapon type", self.ranking_weapon_type)
         form.addRow("Sub-stat damage action", self.substat_base_action)
         form.addRow("Max damage loss from best", self.substat_loss_percent)
+        form.addRow("Tradeoff search depth", self.tradeoff_depth)
         for index, combo in enumerate(self.substat_combos, start=1):
             form.addRow(f"Secondary stat priority {index}", combo)
         form.addRow("Minimum PDT reduction %", self.pdt)
@@ -2725,6 +2969,20 @@ class MainWindow(QMainWindow):
         )
         self.optimizer_runs_layout.addWidget(self.optimizer_runs_placeholder, 0, 0)
         status_layout.addWidget(self.optimizer_runs_box)
+        self.profile_builder_batch_box = QGroupBox("Profile Builder loadout batch")
+        profile_batch_layout = QGridLayout(self.profile_builder_batch_box)
+        self.profile_builder_batch_section = QLabel("No Profile Builder batch is active.")
+        self.profile_builder_batch_progress = QLabel()
+        self.profile_builder_batch_depth = QLabel()
+        for row, label in enumerate((
+            self.profile_builder_batch_section,
+            self.profile_builder_batch_progress,
+            self.profile_builder_batch_depth,
+        )):
+            label.setWordWrap(True)
+            profile_batch_layout.addWidget(label, row, 0)
+        self.profile_builder_batch_box.setVisible(False)
+        status_layout.addWidget(self.profile_builder_batch_box)
         self.optimizer_activity = QLabel("Idle")
         self.optimizer_activity.setAlignment(Qt.AlignmentFlag.AlignRight)
         status_layout.addWidget(self.optimizer_activity)
@@ -2744,9 +3002,49 @@ class MainWindow(QMainWindow):
 
     def show_optimizer_status(self):
         self._refresh_cache_status()
+        self._refresh_profile_builder_batch_status()
         self.optimizer_status_dialog.show()
         self.optimizer_status_dialog.raise_()
         self.optimizer_status_dialog.activateWindow()
+
+    def _refresh_profile_builder_batch_status(self):
+        if not hasattr(self, "profile_builder_batch_box"):
+            return
+        active = getattr(self, "_profile_builder_optimizer_active", None)
+        queue = list(getattr(self, "_profile_builder_optimizer_queue", []))
+        total = int(getattr(self, "_profile_builder_optimizer_total", 0) or 0)
+        completed = int(getattr(self, "_profile_builder_optimizer_completed_count", 0) or 0)
+        state = str(getattr(self, "_profile_builder_optimizer_batch_state", "") or "")
+        visible = bool(active or queue or total or state)
+        self.profile_builder_batch_box.setVisible(visible)
+        if not visible:
+            return
+        depth = self.profile_builder_depth.currentText() if hasattr(self, "profile_builder_depth") else "Fast"
+        passes, restarts = (4, 1) if depth == "Fast" else (10, 3)
+        if active:
+            details = ((getattr(self, "_profile_builder_result", {}) or {}).get("recipe_details") or {}).get(active, {})
+            scenario = details.get("optimizer") or {}
+            floors = ", ".join(
+                f"{label} {int(scenario.get(label.casefold(), 0) or 0)}%"
+                for label in ("PDT", "MDT", "DT")
+                if int(scenario.get(label.casefold(), 0) or 0) > 0
+            ) or "no reduction floor"
+            self.profile_builder_batch_section.setText(
+                f"Current loadout: {active} · {scenario.get('enemy', 'current enemy')} · "
+                f"{int(scenario.get('tp', 1000) or 1000):,} TP · {floors}"
+            )
+        elif state == "stopped":
+            self.profile_builder_batch_section.setText("Profile Builder loadout batch stopped.")
+        elif completed >= total and total:
+            self.profile_builder_batch_section.setText("Profile Builder loadout batch complete.")
+        else:
+            self.profile_builder_batch_section.setText("Preparing next Profile Builder loadout...")
+        self.profile_builder_batch_progress.setText(
+            f"Loadouts: {completed}/{total or completed} complete · {len(queue)} queued"
+        )
+        self.profile_builder_batch_depth.setText(
+            f"Search depth: {depth} · {restarts} seeded run(s) × {passes} passes per combat loadout."
+        )
 
     def _aspirational_tab(self) -> QWidget:
         tab = QWidget()
@@ -2934,7 +3232,7 @@ class MainWindow(QMainWindow):
             "Attack round": ["Time to WS", "Damage dealt", "TP return", "DPS"],
             "Spell": ["Damage dealt", "TP return"],
             "Combined TP + WS": ["Combined DPS"],
-            "Sub-stat optimization": {
+            "Tradeoff optimization": {
                 "Weapon skill": ["Damage dealt", "TP return", "Magic accuracy"],
                 "Attack round": ["Time to WS", "Damage dealt", "TP return", "DPS"],
                 "Spell": ["Damage dealt", "TP return"],
@@ -2956,10 +3254,10 @@ class MainWindow(QMainWindow):
         )
         if label is not None:
             label.setVisible(ranking)
-        substats = action == "Sub-stat optimization"
-        for widget in (self.substat_base_action, self.substat_loss_percent, *self.substat_combos):
+        substats = action in {"Tradeoff optimization", "Sub-stat optimization"}
+        for widget in (self.substat_base_action, self.substat_loss_percent, self.tradeoff_depth, *self.substat_combos):
             widget.setVisible(substats)
-        for widget in (self.substat_base_action, self.substat_loss_percent, *self.substat_combos):
+        for widget in (self.substat_base_action, self.substat_loss_percent, self.tradeoff_depth, *self.substat_combos):
             label = self.substat_base_action.parentWidget().layout().labelForField(widget)
             if label is not None:
                 label.setVisible(substats)
@@ -3498,12 +3796,108 @@ class MainWindow(QMainWindow):
             else:
                 selected.add(value)
 
+    def _profile_builder_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        profile_controls = QHBoxLayout()
+        self.profile_job_combo = QComboBox()
+        self.profile_job_combo.currentTextChanged.connect(self._populate_profile_report)
+        refresh = QPushButton("Refresh profile data")
+        refresh.clicked.connect(self.refresh_bridge)
+        profile_controls.addWidget(QLabel("LuAshitacast job:"))
+        profile_controls.addWidget(self.profile_job_combo)
+        profile_controls.addWidget(refresh)
+        profile_controls.addStretch(1)
+        layout.addLayout(profile_controls)
+
+        builder = QGroupBox("One-button profile build")
+        builder_form = QFormLayout(builder)
+        self.profile_source_accessible = QCheckBox("Accessible owned gear")
+        self.profile_source_accessible.setChecked(True)
+        self.profile_source_porter = QCheckBox("Porter / stored owned gear")
+        self.profile_source_porter.setChecked(True)
+        self.profile_source_transferable = QCheckBox("Transferable gear")
+        self.profile_builder_depth = QComboBox()
+        self.profile_builder_depth.addItems(["Fast", "Deep"])
+        self.profile_builder_depth.setToolTip(
+            "Fast: 1 seeded search run with 4 optimizer passes per combat section. "
+            "Deep: 3 seeded search runs with 10 passes each; slower but explores more local gear combinations."
+        )
+        depth_help = QPushButton("?")
+        depth_help.setFixedWidth(28)
+        depth_help.setToolTip("Explain Profile Builder search depth.")
+        depth_help.clicked.connect(self.show_profile_builder_depth_help)
+        depth_row = QHBoxLayout()
+        depth_row.addWidget(self.profile_builder_depth, 1)
+        depth_row.addWidget(depth_help)
+        self.profile_builder_seed = QLineEdit()
+        self.profile_builder_seed.setPlaceholderText("generate deterministic batch seed")
+        self.profile_builder_tp = QSpinBox()
+        self.profile_builder_tp.setRange(1000, 3000)
+        self.profile_builder_tp.setSingleStep(1000)
+        self.profile_builder_tp.setValue(1000)
+        self.profile_builder_buff = QComboBox()
+        self.profile_builder_buff.addItems(self._all_buff_presets().keys())
+        self.profile_build_button = QPushButton("Build complete LAC profile")
+        self.profile_build_button.clicked.connect(self.build_complete_lac_profile)
+        self.profile_optimize_all_button = QPushButton("Optimize all combat sections")
+        self.profile_optimize_all_button.setEnabled(False)
+        self.profile_optimize_all_button.setToolTip(
+            "Run the normal simulator/optimizer sequentially for every generated TP and weapon-skill section. "
+            "Each section applies its own Apex enemy tier, TP target, metric, and PDT/MDT/DT floors. "
+            "Specialty stat recipes remain direct-stat selections."
+        )
+        self.profile_optimize_all_button.clicked.connect(self.optimize_all_profile_builder_sections)
+        self.profile_publish_button = QPushButton("Review and publish generated profile")
+        self.profile_publish_button.setEnabled(False)
+        self.profile_publish_button.clicked.connect(self.publish_profile_builder_result)
+        self.profile_builder_status = QLabel(
+            "Builds armor-only managed sets. Weapon overlay slots stay fixed; aspirational gear is reported separately."
+        )
+        self.profile_builder_status.setWordWrap(True)
+        builder_form.addRow(self.profile_source_accessible)
+        builder_form.addRow(self.profile_source_porter)
+        builder_form.addRow(self.profile_source_transferable)
+        builder_form.addRow("Buff preset", self.profile_builder_buff)
+        builder_form.addRow("WS TP", self.profile_builder_tp)
+        builder_form.addRow("Search depth", depth_row)
+        builder_form.addRow("Batch seed", self.profile_builder_seed)
+        builder_form.addRow(self.profile_build_button)
+        builder_form.addRow(self.profile_optimize_all_button)
+        builder_form.addRow(self.profile_publish_button)
+        builder_form.addRow(self.profile_builder_status)
+        layout.addWidget(builder)
+        builder_note = QLabel(
+            "Build settings and publishing live here. Use Old LAC only for the previous report and set-inspection tools. "
+            "The initial build uses bounded stat recipes; use Run optimizer for this section or Optimize all combat sections "
+            "to replace TP and WS previews with simulator-backed results. Default, Acc, HighAcc, and Hybrid sections "
+            "automatically use their own enemy and defensive scenario; Hybrid uses PDT 50% and MDT 25%."
+        )
+        builder_note.setWordWrap(True)
+        layout.addWidget(builder_note)
+        generated = QGroupBox("Generated gear sets")
+        generated_layout = QVBoxLayout(generated)
+        self.profile_builder_results = QScrollArea()
+        self.profile_builder_results.setWidgetResizable(True)
+        self.profile_builder_results.setMinimumHeight(320)
+        self.profile_builder_results_widget = QWidget()
+        self.profile_builder_results_layout = QVBoxLayout(self.profile_builder_results_widget)
+        self.profile_builder_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        empty_results = QLabel(
+            "Press Build complete LAC profile to preview the generated sets here."
+        )
+        empty_results.setObjectName("sectionTitle")
+        empty_results.setWordWrap(True)
+        self.profile_builder_results_layout.addWidget(empty_results)
+        self.profile_builder_results.setWidget(self.profile_builder_results_widget)
+        generated_layout.addWidget(self.profile_builder_results)
+        layout.addWidget(generated, 1)
+        return tab
+
     def _profile_report_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         controls = QHBoxLayout()
-        self.profile_job_combo = QComboBox()
-        self.profile_job_combo.currentTextChanged.connect(self._populate_profile_report)
         refresh = QPushButton("Refresh profile sets")
         refresh.clicked.connect(self.refresh_bridge)
         run = QPushButton("Run profile report")
@@ -3511,13 +3905,14 @@ class MainWindow(QMainWindow):
         self.cancel_profile_report_button = QPushButton("Cancel")
         self.cancel_profile_report_button.setEnabled(False)
         self.cancel_profile_report_button.clicked.connect(self.stop_profile_report)
-        controls.addWidget(QLabel("LuAshitacast job:"))
-        controls.addWidget(self.profile_job_combo)
         controls.addWidget(refresh)
         controls.addWidget(run)
         controls.addWidget(self.cancel_profile_report_button)
         controls.addStretch(1)
         layout.addLayout(controls)
+        legacy_note = QLabel("Uses the LuAshitacast job selected in Profile Builder.")
+        legacy_note.setWordWrap(True)
+        layout.addWidget(legacy_note)
 
         self.profile_report_status = QLabel(
             "Load a character bridge to inspect its LuAshitacast profiles."
@@ -3601,6 +3996,7 @@ class MainWindow(QMainWindow):
         self.selected_report_result.setWordWrap(True)
         selected_form.addRow(self.selected_report_result)
         layout.addWidget(selected)
+        self._populate_profile_report()
         return tab
 
     def _confirm_profile_diff(self, title: str, diff_text: str) -> bool:
@@ -3624,6 +4020,548 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         return dialog.exec() == QDialog.DialogCode.Accepted
+
+    def _profile_builder_sources(self) -> GearSources:
+        return GearSources(
+            accessible=self.profile_source_accessible.isChecked(),
+            porter=self.profile_source_porter.isChecked(),
+            transferable=self.profile_source_transferable.isChecked(),
+        )
+
+    def show_profile_builder_depth_help(self):
+        QMessageBox.information(
+            self,
+            "Profile Builder search depth",
+            "Fast runs one deterministic optimizer search with four passes for each TP or WS section. "
+            "It is intended for a quick first catalog and usually finds strong local upgrades.\n\n"
+            "Deep runs three deterministic restarts with ten passes each. It costs substantially more time, "
+            "but starts from more paths and has a better chance of finding a different local optimum.\n\n"
+            "Both modes keep the selected weapon overlay locked and use the visible batch seed. "
+            "Direct-stat specialty recipes such as Fast Cast, SIR, DT, Evasion, and MEVA do not use combat searches.",
+        )
+
+    def _clear_profile_builder_results(self):
+        while self.profile_builder_results_layout.count():
+            child = self.profile_builder_results_layout.takeAt(0)
+            widget = child.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _profile_builder_gear_tile(self, slot: str, item: dict) -> QWidget:
+        tile = QFrame()
+        tile.setFrameShape(QFrame.Shape.StyledPanel)
+        tile.setToolTip(item_tooltip(item))
+        tile_layout = QHBoxLayout(tile)
+        tile_layout.setContentsMargins(5, 3, 5, 3)
+        icon_label = QLabel()
+        icon_label.setFixedSize(38, 38)
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon = self.icons.icon(item)
+        if not icon.isNull():
+            icon_label.setPixmap(icon.pixmap(QSize(36, 36)))
+        tile_layout.addWidget(icon_label)
+        name = QLabel(f"{slot.upper()}\n{item_name(item)}")
+        name.setWordWrap(True)
+        name.setToolTip(item_tooltip(item))
+        tile_layout.addWidget(name, 1)
+        return tile
+
+    def _populate_profile_builder_results(self, build: dict):
+        """Render the completed catalog so the build is reviewable before publishing."""
+        self._clear_profile_builder_results()
+        sets = build.get("sets") or {}
+        overlays = build.get("overlay_items") or []
+        summary = QLabel(
+            f"{len(sets)} generated armor sets · {len(overlays)} fixed weapon overlays · "
+            f"seed {build.get('seed')} · runtime {float(build.get('runtime', 0.0)):.2f}s"
+        )
+        summary.setObjectName("sectionTitle")
+        summary.setWordWrap(True)
+        self.profile_builder_results_layout.addWidget(summary)
+        method_note = QLabel(
+            "Initial generation method: bounded direct-stat recipe selection. Use the optimizer controls on TP and WS sections "
+            "to replace those previews with combat-simulation winners; specialty sets remain cap-aware stat recipes."
+        )
+        method_note.setWordWrap(True)
+        method_note.setStyleSheet("color: #8a4b08;")
+        self.profile_builder_results_layout.addWidget(method_note)
+
+        if overlays:
+            overlay_box = QGroupBox("Fixed weapon overlays (kept ahead of armor)")
+            overlay_layout = QGridLayout(overlay_box)
+            overlay_layout.setColumnStretch(1, 1)
+            for row, overlay in enumerate(overlays):
+                label = QLabel(
+                    f"{overlay.get('name', 'Overlay')} · "
+                    f"{weapon_category(overlay)}"
+                )
+                label.setToolTip(
+                    "These slots remain controlled by the existing LuAshitacast weapon cycle."
+                )
+                overlay_layout.addWidget(label, row, 0)
+                slots = overlay.get("gearset") or {}
+                visible_slots = [
+                    slot for slot in ("main", "sub", "ranged", "ammo")
+                    if slot in slots and item_name(slots[slot]) != "Empty"
+                ]
+                for column, slot in enumerate(visible_slots, start=1):
+                    overlay_layout.addWidget(
+                        self._profile_builder_gear_tile(slot, slots[slot]), row, column
+                    )
+                if not visible_slots:
+                    overlay_layout.addWidget(QLabel("No weapon slots found"), row, 1)
+            self.profile_builder_results_layout.addWidget(overlay_box)
+
+        for set_name, equipment in sets.items():
+            set_box = QGroupBox(str(set_name))
+            set_layout = QGridLayout(set_box)
+            set_layout.setContentsMargins(6, 6, 6, 6)
+            details = build.get("recipe_details", {}).get(set_name, {})
+            objective = ", ".join(details.get("objective") or ()) or "No priority stats recorded"
+            caps = ", ".join(
+                f"{stat} {target:g}" for stat, target in details.get("caps") or ()
+            )
+            note_lines = [
+                f"Priority: {objective}"
+                + (f" · Required caps: {caps}" if caps else "")
+                + (" · Defensive reduction requirement" if details.get("require_damage_cap") else "")
+            ]
+            if details.get("simulation_summary"):
+                note_lines.append(f"Simulation: {details['simulation_summary']}")
+            optimizer_info = details.get("optimizer") or {}
+            if optimizer_info:
+                reductions = " · ".join(
+                    f"{label} ≥{int(optimizer_info.get(label.casefold(), 0) or 0)}%"
+                    for label in ("PDT", "MDT", "DT")
+                    if int(optimizer_info.get(label.casefold(), 0) or 0) > 0
+                ) or "no reduction floor"
+                note_lines.append(
+                    f"Optimizer scenario: {optimizer_info.get('enemy', 'current enemy')} · "
+                    f"{int(optimizer_info.get('tp', 1000) or 1000):,} TP · {reductions}"
+                )
+            defense = details.get("simulation_defense") or {}
+            actual = defense.get("actual") or {}
+            if actual:
+                note_lines.append(
+                    "Defense: " + " · ".join(
+                        f"{label} {_reduction_text(actual.get(label, 0))}"
+                        for label in ("PDT", "MDT", "DT")
+                    )
+                )
+            if defense.get("fallback"):
+                requested = defense.get("requested") or {}
+                requested_labels = [
+                    f"{label} {_reduction_text(requested.get(label, 0))}"
+                    for label in ("PDT", "MDT", "DT")
+                    if float(requested.get(label, 0) or 0) < 0
+                ]
+                note_lines.append(
+                    "⚠ Defensive minimum unavailable; using the best legal set"
+                    + (" (requested " + ", ".join(requested_labels) + ")." if requested_labels else ".")
+                )
+            recipe_note = QLabel("\n".join(note_lines))
+            recipe_note.setWordWrap(True)
+            recipe_note.setStyleSheet(
+                "color: #9a3412; font-weight: 600;" if defense.get("fallback") else "color: #555555;"
+            )
+            set_layout.addWidget(recipe_note, 0, 0, 1, 3)
+            if optimizer_info:
+                run_button = QPushButton("Run optimizer for this section")
+                run_button.setToolTip(
+                    "Load this starting set, keep its weapon overlay locked, and run the normal simulator/optimizer."
+                )
+                run_button.clicked.connect(
+                    lambda _checked=False, name=str(set_name):
+                    self.run_profile_builder_section_optimizer(name)
+                )
+                set_layout.addWidget(run_button, 0, 3)
+            else:
+                direct_label = QLabel("Direct-stat specialty recipe")
+                direct_label.setStyleSheet("color: #8a4b08;")
+                direct_label.setToolTip(
+                    "This set uses a stat/cap recipe because it does not have a complete combat formula."
+                )
+                set_layout.addWidget(direct_label, 0, 3)
+            for index, slot in enumerate(ARMOR_SLOTS):
+                row, column = divmod(index, 3)
+                set_layout.addWidget(
+                    self._profile_builder_gear_tile(slot, equipment.get(slot, gear.Empty)),
+                    row + 1, column,
+                )
+            self.profile_builder_results_layout.addWidget(set_box)
+
+        if not sets:
+            self.profile_builder_results_layout.addWidget(QLabel("The build returned no sets."))
+        warnings = build.get("warnings") or []
+        if warnings:
+            warning_box = QGroupBox(f"Build warnings ({len(warnings)})")
+            warning_layout = QVBoxLayout(warning_box)
+            warning_text = QLabel("\n".join(f"• {warning}" for warning in warnings))
+            warning_text.setWordWrap(True)
+            warning_layout.addWidget(warning_text)
+            self.profile_builder_results_layout.addWidget(warning_box)
+        self.profile_builder_results_layout.addStretch(1)
+
+    @staticmethod
+    def _profile_builder_overlay_for_set(set_name: str, overlays: list[dict]) -> dict | None:
+        """Select the matching fixed weapon cycle for a generated override."""
+        for overlay in overlays:
+            category = weapon_category(overlay)
+            if str(set_name).endswith(f"_{category}"):
+                return overlay
+            suffix = re.sub(r"^(Weapon|Gun|Range|Ranged)_?", "", str(overlay.get("name") or ""))
+            if suffix and str(set_name).endswith(f"_{suffix}"):
+                return overlay
+        return overlays[0] if overlays else None
+
+    def _configure_profile_builder_set_for_optimizer(self, set_name: str, *, show_optimizer: bool) -> bool:
+        """Load one generated combat section as an optimizer-ready starting point."""
+        build = getattr(self, "_profile_builder_result", None) or {}
+        equipment = (build.get("sets") or {}).get(set_name)
+        details = (build.get("recipe_details") or {}).get(set_name) or {}
+        optimizer_info = details.get("optimizer") or {}
+        if equipment is None or not optimizer_info:
+            QMessageBox.information(
+                self, "Profile Builder",
+                f"{set_name} is a direct-stat specialty recipe and has no combat optimizer action.",
+            )
+            return False
+        job_code = str(build.get("job") or "").casefold()
+        job_name = next((name for name, code in JOBS.items() if code == job_code), None)
+        if job_name is None:
+            QMessageBox.warning(self, "Profile Builder", f"Cannot map job {build.get('job')!r} to the optimizer.")
+            return False
+        self.main_job.setCurrentText(job_name)
+        scenario = optimizer_scenario(set_name, self.profile_builder_tp.value())
+        scenario.update({
+            key: value for key, value in optimizer_info.items()
+            if key in {"enemy", "tp", "pdt", "mdt", "dt", "metric"}
+        })
+        preset_name = str(build.get("buff_preset") or self.profile_builder_buff.currentText())
+        preset = self._all_buff_presets().get(preset_name)
+        if preset:
+            self._apply_buff_state(preset)
+        enemy_name = str(scenario.get("enemy") or "")
+        if enemy_name in enemies.preset_enemies:
+            self.enemy_combo.setCurrentText(enemy_name)
+            # Saved buff presets suppress combo signals while applying their
+            # own enemy. Re-apply the recipe's fixed scenario afterwards.
+            self._load_enemy(enemy_name)
+        self.tp_value.setValue(int(scenario.get("tp") or 1000))
+        self.pdt.setValue(int(scenario.get("pdt") or 0))
+        self.mdt.setValue(int(scenario.get("mdt") or 0))
+        self.dt.setValue(int(scenario.get("dt") or 0))
+        combined = dict(equipment)
+        overlays = build.get("overlay_items") or []
+        overlay = self._profile_builder_overlay_for_set(set_name, overlays)
+        if overlay:
+            # Armor-only generated sets intentionally inherit the first fixed
+            # weapon cycle so the optimizer starts from the real profile setup.
+            overlay_gearset = overlay.get("gearset") or {}
+            specified_slots = set(overlay.get("specified_slots") or ())
+            combined.update({
+                slot: overlay_gearset[slot]
+                for slot in WEAPON_SLOTS
+                if slot in specified_slots and slot in overlay_gearset
+            })
+        self.quick_set.set_gearset(combined)
+        self.select_all_candidates()
+        for slot in WEAPON_SLOTS:
+            item = combined.get(slot, gear.Empty)
+            self.locked_gear[slot] = "" if item_name(item) == "Empty" else item_name(item)
+        self._refresh_candidate_buttons()
+        action = str(optimizer_info.get("action") or "")
+        if action == "attack round":
+            self.optimize_action.setCurrentText("Attack round")
+        elif action == "weapon skill":
+            self.optimize_action.setCurrentText("Weapon skill")
+            ws_name = str(optimizer_info.get("ws_name") or "")
+            if ws_name:
+                self.ws_combo.setCurrentText(ws_name)
+        self._set_combo_value(
+            self.metric_combo, scenario.get("metric"), self.metric_combo.currentText()
+        )
+        self.seed.setText(str(build.get("seed") or ""))
+        if show_optimizer:
+            for index in range(self.tabs.count()):
+                if self.tabs.tabText(index) == "Optimizer":
+                    self.tabs.setCurrentIndex(index)
+                    break
+        self.statusBar().showMessage(
+            f"Prepared {set_name}: {enemy_name or 'current enemy'}, {self.tp_value.value():,} TP, "
+            f"PDT {self.pdt.value()}% / MDT {self.mdt.value()}% / DT {self.dt.value()}%, fixed weapon slots.", 7000,
+        )
+        return True
+
+    def run_profile_builder_section_optimizer(self, set_name: str):
+        if self.optimizer_thread and self.optimizer_thread.isRunning():
+            QMessageBox.information(self, "Profile Builder", "Wait for the current optimizer run to finish.")
+            return
+        if not self._configure_profile_builder_set_for_optimizer(set_name, show_optimizer=True):
+            return
+        self._profile_builder_optimizer_active = str(set_name)
+        self._profile_builder_optimizer_queue = []
+        self._profile_builder_optimizer_total = 1
+        self._profile_builder_optimizer_completed_count = 0
+        self._profile_builder_optimizer_batch_state = "running"
+        self._refresh_profile_builder_batch_status()
+        self.profile_builder_status.setText(f"Simulating {set_name} through the optimizer...")
+        self.run_optimizer()
+
+    def optimize_all_profile_builder_sections(self):
+        if self.optimizer_thread and self.optimizer_thread.isRunning():
+            QMessageBox.information(self, "Profile Builder", "Wait for the current optimizer run to finish.")
+            return
+        build = getattr(self, "_profile_builder_result", None) or {}
+        queue = [
+            str(name) for name, details in (build.get("recipe_details") or {}).items()
+            if details.get("optimizer") and name in (build.get("sets") or {})
+        ]
+        if not queue:
+            QMessageBox.information(self, "Profile Builder", "Build the profile before optimizing its combat sections.")
+            return
+        self._profile_builder_optimizer_queue = queue
+        self._profile_builder_optimizer_active = None
+        self._profile_builder_optimizer_total = len(queue)
+        self._profile_builder_optimizer_completed_count = 0
+        self._profile_builder_optimizer_batch_state = "running"
+        self.profile_optimize_all_button.setEnabled(False)
+        self._refresh_profile_builder_batch_status()
+        self._start_next_profile_builder_optimizer_section()
+
+    def _start_next_profile_builder_optimizer_section(self):
+        queue = getattr(self, "_profile_builder_optimizer_queue", [])
+        if not queue:
+            self._profile_builder_optimizer_active = None
+            self._profile_builder_optimizer_batch_state = "complete"
+            self.profile_optimize_all_button.setEnabled(True)
+            self.profile_builder_status.setText("All requested combat sections were simulated. Review the updated gear preview before publishing.")
+            self._refresh_profile_builder_batch_status()
+            return
+        set_name = queue.pop(0)
+        if not self._configure_profile_builder_set_for_optimizer(set_name, show_optimizer=False):
+            QTimer.singleShot(0, self._start_next_profile_builder_optimizer_section)
+            return
+        self._profile_builder_optimizer_active = set_name
+        total = len(queue) + 1
+        self._refresh_profile_builder_batch_status()
+        self.profile_builder_status.setText(
+            f"Simulating {set_name} against {self.enemy_combo.currentText()} at {self.tp_value.value():,} TP "
+            f"with PDT {self.pdt.value()}% / MDT {self.mdt.value()}% / DT {self.dt.value()}% "
+            f"({total} section(s) remaining)..."
+        )
+        self.run_optimizer()
+
+    def _profile_builder_optimizer_completed(self, metric: float):
+        """Store one real optimizer winner, then advance an optional all-section queue."""
+        set_name = getattr(self, "_profile_builder_optimizer_active", None)
+        if not set_name:
+            return
+        build = getattr(self, "_profile_builder_result", None) or {}
+        player = self.best_player
+        if player is not None and set_name in (build.get("sets") or {}):
+            build["sets"][set_name] = {
+                slot: player.gearset.get(slot, gear.Empty) for slot in ARMOR_SLOTS
+            }
+            details = (build.get("recipe_details") or {}).get(set_name)
+            if details is not None:
+                action = str((details.get("optimizer") or {}).get("action") or "")
+                ws_name = str((details.get("optimizer") or {}).get("ws_name") or "")
+                details["simulation_summary"] = _optimizer_result_summary(
+                    action, getattr(self, "_last_optimizer_output", None), float(metric),
+                    self.metric_combo.currentText(), ws_name,
+                )
+                details["simulation_defense"] = _optimizer_defense_summary(player)
+            self._populate_profile_builder_results(build)
+        self._profile_builder_optimizer_active = None
+        self._profile_builder_optimizer_completed_count = (
+            int(getattr(self, "_profile_builder_optimizer_completed_count", 0)) + 1
+        )
+        self._refresh_profile_builder_batch_status()
+        if getattr(self, "_profile_builder_optimizer_queue", []):
+            QTimer.singleShot(0, self._start_next_profile_builder_optimizer_section)
+        else:
+            self.profile_optimize_all_button.setEnabled(True)
+            self._profile_builder_optimizer_batch_state = "complete"
+            self.profile_builder_status.setText(
+                f"Optimizer result applied to {set_name}. Review the updated preview before publishing."
+            )
+            self._refresh_profile_builder_batch_status()
+
+    def _cancel_profile_builder_optimizer_queue(self, reason: str):
+        if not getattr(self, "_profile_builder_optimizer_active", None):
+            return
+        self._profile_builder_optimizer_active = None
+        self._profile_builder_optimizer_queue = []
+        self._profile_builder_optimizer_batch_state = "stopped"
+        self.profile_optimize_all_button.setEnabled(True)
+        self.profile_builder_status.setText(f"Profile Builder optimization stopped: {reason}")
+        self._refresh_profile_builder_batch_status()
+
+    def build_complete_lac_profile(self):
+        """Build a deterministic owned-gear catalog before any profile write."""
+        started = time.perf_counter()
+        profile = self._profile_for_job()
+        if profile is None or not self.bridge_store.data:
+            QMessageBox.information(self, "Profile Builder", "Load a character-specific LAC profile first.")
+            return
+        try:
+            job = str(profile.get("job") or "").casefold()
+            payloads = self._profile_payloads()
+            sources = self._profile_builder_sources()
+            candidates = bridge_candidates(self.bridge_store, job, sources)
+            if not any(len(values) > 1 for values in candidates.values()):
+                raise ValueError("The selected gear sources contain no modeled armor for this job.")
+            seed_text = self.profile_builder_seed.text().strip()
+            batch_seed = int(seed_text) if seed_text else secrets.randbits(31)
+            self.profile_builder_seed.setText(str(batch_seed))
+            names = {payload["name"] for payload in payloads}
+            recipes = profile_recipes(job, names)
+            recipes.extend((
+                # Combat armor is intentionally generated as armor-only. Weapon
+                # overlays remain LAC's source of truth and are never replaced.
+                ProfileRecipe("Tp_Default", ("DA", "TA", "QA", "Store TP", "Attack", "Accuracy")),
+                ProfileRecipe("Tp_Acc", ("Accuracy", "Attack", "Store TP", "DA", "TA")),
+                ProfileRecipe("Tp_HighAcc", ("Accuracy", "Store TP", "Attack", "DA")),
+                ProfileRecipe("Tp_Hybrid", ("DA", "TA", "Store TP", "Attack", "Accuracy"), require_damage_cap=True),
+            ))
+            overlays = weapon_overlays(payloads)
+            result = {}
+            warnings = []
+            category_results = {}
+            recipe_details = {}
+
+            def add_recipe(recipe):
+                """Build a base armor set plus only meaningful weapon overrides."""
+                recipe_details[recipe.name] = {
+                    "objective": recipe.objective,
+                    "caps": recipe.caps,
+                    "require_damage_cap": recipe.require_damage_cap,
+                }
+                pinned = pin_unmodeled_slots(payloads, recipe.name)
+                base = build_stat_set(recipe.name, candidates, recipe, pinned=pinned)
+                result[recipe.name] = base.equipment
+                warnings.extend(f"{recipe.name}: {warning}" for warning in base.warnings)
+                for overlay in overlays:
+                    weapons = {
+                        slot: overlay["gearset"][slot]
+                        for slot in overlay.get("specified_slots", ()) if slot in {"main", "sub", "ranged", "ammo"}
+                    }
+                    built = build_stat_set(recipe.name, candidates, recipe, weapons=weapons, pinned=pinned)
+                    if built.equipment == base.equipment:
+                        continue
+                    category = weapon_category(overlay)
+                    category_name = f"{recipe.name}_{category}"
+                    prior = category_results.get(category_name)
+                    if prior is None:
+                        result[category_name] = built.equipment
+                        category_results[category_name] = built.equipment
+                        recipe_details[category_name] = dict(recipe_details[recipe.name])
+                    elif prior != built.equipment:
+                        suffix = re.sub(r"^(Weapon|Gun|Range|Ranged)_?", "", overlay["name"])
+                        result[f"{recipe.name}_{suffix}"] = built.equipment
+                        recipe_details[f"{recipe.name}_{suffix}"] = dict(recipe_details[recipe.name])
+                    warnings.extend(f"{recipe.name}/{overlay['name']}: {warning}" for warning in built.warnings)
+
+            combat_tp_names = {"Tp_Default", "Tp_Acc", "Tp_HighAcc", "Tp_Hybrid"}
+            for recipe in recipes:
+                add_recipe(recipe)
+                if recipe.name in combat_tp_names:
+                    for section_name, details in recipe_details.items():
+                        if section_name == recipe.name or section_name.startswith(f"{recipe.name}_"):
+                            details["optimizer"] = {
+                                "action": "attack round", "metric": "Time to WS",
+                                **optimizer_scenario(section_name, self.profile_builder_tp.value()),
+                            }
+            # Existing named WS handlers determine the WS family catalog. The
+            # same deterministic armor recipes are emitted for every supported
+            # variant; a later combat build can replace these through the
+            # normal optimizer without changing LAC structure.
+            ws_families = {}
+            for payload in payloads:
+                descriptor = payload.get("descriptor") or {}
+                family = str(descriptor.get("family") or "")
+                ws_name = str(descriptor.get("ws_name") or "")
+                if descriptor.get("role") == "ws" and family and ws_name:
+                    ws_families.setdefault(family, ws_name)
+            for family, ws_name in sorted(ws_families.items(), key=lambda item: item[0].casefold()):
+                for variant, objective, defensive in (
+                    ("Default", ("Weapon Skill Damage", "STR", "DEX", "VIT", "Attack", "Accuracy"), False),
+                    ("Acc", ("Accuracy", "Weapon Skill Accuracy", "Attack", "STR"), False),
+                    ("HighAcc", ("Accuracy", "Weapon Skill Accuracy", "Attack"), False),
+                    ("Hybrid", ("Weapon Skill Damage", "STR", "Attack", "Accuracy"), True),
+                ):
+                    set_name = f"{family}_{variant}"
+                    recipe = ProfileRecipe(set_name, objective, require_damage_cap=defensive)
+                    add_recipe(recipe)
+                    for section_name, details in recipe_details.items():
+                        if section_name == set_name or section_name.startswith(f"{set_name}_"):
+                            details["optimizer"] = {
+                                "action": "weapon skill", "ws_name": ws_name,
+                                "metric": "Damage dealt",
+                                **optimizer_scenario(section_name, self.profile_builder_tp.value()),
+                            }
+            self._profile_builder_result = {
+                "sets": result, "seed": batch_seed, "job": job.upper(), "profile": profile,
+                "warnings": warnings, "overlays": [(item["name"], weapon_category(item)) for item in overlays],
+                "overlay_items": overlays,
+                "recipe_details": recipe_details,
+                "runtime": time.perf_counter() - started,
+                "sources": sources,
+                "buff_preset": self.profile_builder_buff.currentText(),
+            }
+            self._profile_builder_optimizer_active = None
+            self._profile_builder_optimizer_queue = []
+            self._profile_builder_optimizer_total = 0
+            self._profile_builder_optimizer_completed_count = 0
+            self._profile_builder_optimizer_batch_state = ""
+            self._refresh_profile_builder_batch_status()
+            self._populate_profile_builder_results(self._profile_builder_result)
+            overlay_text = ", ".join(name for name, _category in self._profile_builder_result["overlays"]) or "no weapon overlays"
+            self.profile_builder_status.setText(
+                f"Built {len(result)} managed armor sets in {self._profile_builder_result['runtime']:.2f}s "
+                f"using direct-stat recipes · seed {batch_seed} · fixed overlays: {overlay_text}. "
+                + (f"{len(warnings)} warning(s); review before publishing." if warnings else "Ready for review and atomic publish.")
+            )
+            self.profile_publish_button.setEnabled(True)
+            self.profile_optimize_all_button.setEnabled(
+                any(details.get("optimizer") for details in recipe_details.values())
+            )
+        except Exception as error:
+            QMessageBox.critical(self, "Profile Builder", str(error))
+
+    def publish_profile_builder_result(self):
+        build = getattr(self, "_profile_builder_result", None)
+        if not build:
+            return
+        profile = build["profile"]
+        try:
+            path = self.bridge_store.profile_path(build["job"])
+            source = path.read_text(encoding="utf-8")
+            updated = prepare_profile_builder_update(source, build["sets"])
+            diff = "".join(difflib.unified_diff(
+                source.splitlines(keepends=True), updated.splitlines(keepends=True),
+                fromfile=f"{path.name} (current)", tofile=f"{path.name} (Profile Builder)",
+            ))
+            if not self._confirm_profile_diff("Publish complete Profile Builder catalog", diff):
+                return
+            backup, new_hash = write_profile_builder_sets(
+                path, build["sets"], expected_hash=str(profile.get("source_hash") or ""),
+            )
+            profile["source_hash"] = new_hash
+            write_reload_request(self.bridge_store.bridge_path.parent, {
+                "schema_version": 3,
+                "character_key": (self.bridge_store.data.get("character") or {}).get("key"),
+                "job": build["job"], "profile": path.name, "profile_hash": new_hash,
+                "set": "Profile Builder managed catalog", "seed": build["seed"],
+            })
+            QMessageBox.information(
+                self, "Profile Builder",
+                f"Published {len(build['sets'])} managed armor sets to {path.name}.\nBackup: {backup.name}",
+            )
+            self.profile_publish_button.setEnabled(False)
+        except Exception as error:
+            QMessageBox.critical(self, "Profile Builder", str(error))
 
     def publish_optimizer_pair_to_lac(self):
         profile = self._profile_for_job()
@@ -3817,7 +4755,12 @@ class MainWindow(QMainWindow):
         ]
 
     def _populate_profile_report(self, *_args):
-        if not hasattr(self, "profile_job_combo"):
+        required_widgets = (
+            "profile_job_combo", "report_tp_combo", "report_ws_set_combo",
+            "report_main_weapon_combo", "report_ranged_weapon_combo",
+            "report_defense_combo", "profile_diagnostic_table",
+        )
+        if not all(hasattr(self, name) for name in required_widgets):
             return
         profiles = self.bridge_store.profile_records() if self.bridge_store.data else []
         jobs = []
@@ -4683,6 +5626,7 @@ class MainWindow(QMainWindow):
                 "metric": self.metric_combo.currentText(),
                 "substat_base_action": self.substat_base_action.currentText(),
                 "substat_loss_percent": self.substat_loss_percent.value(),
+                "tradeoff_depth": self.tradeoff_depth.currentText(),
                 "substat_stats": [combo.currentText() for combo in self.substat_combos],
                 "pdt": self.pdt.value(), "mdt": self.mdt.value(), "dt": self.dt.value(),
                 "combined_defense_both": self.combined_defense_both.isChecked(),
@@ -4700,6 +5644,13 @@ class MainWindow(QMainWindow):
                 "tp_set": self.report_tp_combo.currentText(),
                 "ws_set": self.report_ws_set_combo.currentText(),
                 "weapon_skill": self.report_ws_name_combo.currentText(),
+                "builder_accessible": self.profile_source_accessible.isChecked(),
+                "builder_porter": self.profile_source_porter.isChecked(),
+                "builder_transferable": self.profile_source_transferable.isChecked(),
+                "builder_buff": self.profile_builder_buff.currentText(),
+                "builder_tp": self.profile_builder_tp.value(),
+                "builder_depth": self.profile_builder_depth.currentText(),
+                "builder_seed": self.profile_builder_seed.text(),
             },
             "tab": self.tabs.currentIndex(),
         }
@@ -4744,7 +5695,11 @@ class MainWindow(QMainWindow):
         self._set_combo_value(self.spell_combo, player.get("spell"), "None")
 
         optimizer = state.get("optimizer") if isinstance(state.get("optimizer"), dict) else {}
-        self._set_combo_value(self.optimize_action, optimizer.get("action"), self.optimize_action.currentText())
+        saved_action = optimizer.get("action")
+        # Saved profiles predate the renamed user-facing mode.
+        if saved_action == "Sub-stat optimization":
+            saved_action = "Tradeoff optimization"
+        self._set_combo_value(self.optimize_action, saved_action, self.optimize_action.currentText())
         self._set_combo_value(self.metric_combo, optimizer.get("metric"), self.metric_combo.currentText())
         self._set_combo_value(
             self.substat_base_action, optimizer.get("substat_base_action"),
@@ -4756,6 +5711,7 @@ class MainWindow(QMainWindow):
             ))
         except (TypeError, ValueError):
             pass
+        self._set_combo_value(self.tradeoff_depth, optimizer.get("tradeoff_depth"), "Fast")
         saved_substats = optimizer.get("substat_stats")
         if isinstance(saved_substats, list):
             for combo, value in zip(self.substat_combos, saved_substats):
@@ -4805,6 +5761,16 @@ class MainWindow(QMainWindow):
         self._set_combo_value(self.report_tp_combo, report.get("tp_set"), self.report_tp_combo.currentText())
         self._set_combo_value(self.report_ws_set_combo, report.get("ws_set"), self.report_ws_set_combo.currentText())
         self._set_combo_value(self.report_ws_name_combo, report.get("weapon_skill"), "None")
+        self.profile_source_accessible.setChecked(bool(report.get("builder_accessible", True)))
+        self.profile_source_porter.setChecked(bool(report.get("builder_porter", True)))
+        self.profile_source_transferable.setChecked(bool(report.get("builder_transferable", False)))
+        self._set_combo_value(self.profile_builder_buff, report.get("builder_buff"), self.profile_builder_buff.currentText())
+        self._set_combo_value(self.profile_builder_depth, report.get("builder_depth"), "Fast")
+        try:
+            self.profile_builder_tp.setValue(int(report.get("builder_tp", self.profile_builder_tp.value())))
+        except (TypeError, ValueError):
+            pass
+        self.profile_builder_seed.setText(str(report.get("builder_seed", "")))
         try:
             self.tabs.setCurrentIndex(max(0, min(self.tabs.count() - 1, int(state.get("tab", 0)))))
         except (TypeError, ValueError):
@@ -4982,7 +5948,10 @@ class MainWindow(QMainWindow):
     def _cache_store(self, active: dict | None, payload: dict, runtime_seconds: float):
         if active is None or not self.cache_enabled:
             return
-        if self.simulation_cache.put(active["key"], active["kind"], payload, runtime_seconds):
+        if self.simulation_cache.put(
+            active["key"], active["kind"], payload, runtime_seconds,
+            request_summary=active.get("request_summary"), batch_id=active.get("batch_id", ""),
+        ):
             self._refresh_cache_status()
 
     @staticmethod
@@ -5004,6 +5973,16 @@ class MainWindow(QMainWindow):
             "engine_kwargs": kwargs,
         }
 
+    @staticmethod
+    def _optimizer_cache_summary(mode: str, args: tuple, kwargs: dict) -> dict:
+        """Small human-readable metadata for cache inspection, not cache identity."""
+        return {
+            "mode": mode, "job": f"{args[0]}/{args[1]}",
+            "action": str(args[8]) if len(args) > 8 else mode,
+            "tp": int(args[9]) if len(args) > 9 and isinstance(args[9], (int, float)) else None,
+            "seed": kwargs.get("seed"), "search_mode": kwargs.get("search_mode", ""),
+        }
+
     def _serialize_optimizer_payload(self, result, *, ranking: bool = False) -> dict:
         if ranking:
             saved = dict(result)
@@ -5017,7 +5996,7 @@ class MainWindow(QMainWindow):
             "player": _serialize_optimizer_player(result[0]),
             "output": result[1], "metric": result[2], "seed": result[3],
             "top_results": _serialize_top_results(list(result[4] or [])),
-            "substat_summary": list(substat_summary or []),
+            "substat_summary": substat_summary or [],
         }
 
     def _restore_optimizer_payload(self, payload: dict, context: dict, *, ranking: bool = False):
@@ -5031,7 +6010,7 @@ class MainWindow(QMainWindow):
         return (
             _cached_player(payload["player"], context), payload["output"], payload["metric"], payload["seed"],
             _restore_top_results(payload.get("top_results") or [], context),
-            list(payload.get("substat_summary") or []),
+            payload.get("substat_summary") or [],
         )
 
     def _ws_type(self) -> str:
@@ -5064,15 +6043,14 @@ class MainWindow(QMainWindow):
                 ws_type=self._ws_type(), spell_name=spell_name,
                 spell_type=spell_type,
             )
-            cache_key, cached = self._cache_lookup("quick-look", request)
+            cache_key = self.simulation_cache.key_for("quick-look", request)
+            cached = self._quick_lookup_cache.get(cache_key)
             if cached is not None:
-                saved = cached["payload"]
+                self._quick_lookup_cache.move_to_end(cache_key)
+                saved = cached
                 self.result_label.setText(str(saved["text"]))
                 self._render_quick_stats(player, enemy)
-                self.statusBar().showMessage(
-                    f"Quick Look restored from cache ({self._cache_age_text(cached['created_at'])}; "
-                    f"saved {self._format_duration(cached['runtime_seconds'])})", 6000
-                )
+                self.statusBar().showMessage("Quick Look restored from this session's cache", 4000)
                 return
             started_at = time.monotonic()
             output, text = _evaluate_quick_result(
@@ -5082,11 +6060,10 @@ class MainWindow(QMainWindow):
             )
             self.result_label.setText(text)
             self._render_quick_stats(player, enemy)
-            if cache_key is not None:
-                self._cache_store(
-                    {"kind": "quick-look", "key": cache_key}, {"text": text, "output": output},
-                    time.monotonic() - started_at,
-                )
+            self._quick_lookup_cache[cache_key] = {"text": text, "output": output}
+            self._quick_lookup_cache.move_to_end(cache_key)
+            while len(self._quick_lookup_cache) > self._quick_lookup_cache_limit:
+                self._quick_lookup_cache.popitem(last=False)
         except Exception as error:
             QMessageBox.critical(self, "Evaluation failed", str(error))
 
@@ -5110,7 +6087,7 @@ class MainWindow(QMainWindow):
             action_label = self.optimize_action.currentText()
             warm_cache_mode = action_label == WARM_CACHE_ACTION
             ranking_mode = action_label in {"Rank weapon-type WS", WARM_CACHE_ACTION}
-            substat_mode = action_label == "Sub-stat optimization"
+            substat_mode = action_label in {"Tradeoff optimization", "Sub-stat optimization"}
             if warm_cache_mode and not self.cache_enabled:
                 raise ValueError("Enable simulation caching from File before running Warm cache.")
             ranking_skill = self.ranking_weapon_type.currentText().strip() if ranking_mode else ""
@@ -5206,6 +6183,7 @@ class MainWindow(QMainWindow):
                     "restarts": self.restarts.value(), "workers": self.workers.value(),
                     "seed": seed, "return_details": True, "return_top_results": True,
                     "dt_requirement": dt_requirement, "parallel_mode": parallel_mode,
+                    "search_mode": self.tradeoff_depth.currentText().lower(),
                 }
             else:
                 args = common + (
@@ -5222,6 +6200,15 @@ class MainWindow(QMainWindow):
                     "ws_starting_gearset": dict(self.ws_set.items),
                     "parallel_mode": parallel_mode,
                 }
+            profile_builder_active = bool(getattr(self, "_profile_builder_optimizer_active", None))
+            profile_builder_search_note = ""
+            if profile_builder_active and not ranking_mode:
+                depth = self.profile_builder_depth.currentText()
+                passes, restarts = (4, 1) if depth == "Fast" else (10, 3)
+                kwargs.update({"n_iter": passes, "restarts": restarts})
+                profile_builder_search_note = (
+                    f"Profile Builder {depth} depth: {restarts} seeded run(s) × {passes} passes."
+                )
             cache_kind = "ws-ranking" if ranking_mode else "optimizer"
             cache_context = self._optimizer_cache_context(args)
             cache_request = self._optimizer_cache_request(
@@ -5258,6 +6245,7 @@ class MainWindow(QMainWindow):
                 self._active_optimizer_cache = {
                     "kind": cache_kind, "key": cache_key, "context": cache_context,
                     "ranking": ranking_mode,
+                    "request_summary": self._optimizer_cache_summary(cache_kind, args, kwargs),
                 }
             checks = wsdist.estimate_candidate_checks(
                 check_gear, JOBS[self.main_job.currentText()], optimizer_ws_type
@@ -5266,7 +6254,7 @@ class MainWindow(QMainWindow):
             self.optimizer_top_results = []
             self._optimizer_run_state = {}
             self._optimizer_started_at = time.monotonic()
-            run_count = 1 if ranking_mode or kwargs["parallel_mode"] == "single_run" else self.restarts.value()
+            run_count = 1 if ranking_mode or kwargs["parallel_mode"] == "single_run" else kwargs["restarts"]
             self._initialize_optimizer_run_cards(run_count)
             self.show_optimizer_status()
             self._optimizer_status_timer.start()
@@ -5281,6 +6269,8 @@ class MainWindow(QMainWindow):
             self.optimizer_activity.setText("Starting…")
             if cache_seed_note:
                 self._append_optimizer_log(cache_seed_note)
+            if profile_builder_search_note:
+                self._append_optimizer_log(profile_builder_search_note)
             if pruned_count:
                 reduction = (1 - checks / raw_checks) * 100 if raw_checks else 0
                 self._append_optimizer_log(
@@ -5298,7 +6288,7 @@ class MainWindow(QMainWindow):
                 args, kwargs, self,
                 target=(
                     wsdist.rank_weapon_skills if ranking_mode
-                    else wsdist.optimize_substats if substat_mode
+                    else wsdist.optimize_tradeoffs if substat_mode
                     else None
                 ),
             )
@@ -5312,17 +6302,29 @@ class MainWindow(QMainWindow):
         except Exception as error:
             QMessageBox.critical(self, "Optimizer", str(error))
 
-    def _build_overnight_tasks(self) -> list[dict]:
-        """Build cache tasks for current sets and selected one-item variants."""
+    def _build_overnight_tasks(self, scenario_names: list[str] | None = None) -> list[dict]:
+        """Build cache tasks for selected enemies, sets, and one-item variants."""
         context = self._report_context()
-        enemy = _report_enemy(context["enemy"], context["debuffs"])
-        enemy_stats = dict(enemy.stats)
         task_context = {
             "main_job": context["main_job"], "sub_job": context["sub_job"],
             "master_level": context["master_level"],
             "buffs": copy.deepcopy(context["buffs"]),
             "abilities": copy.deepcopy(context["abilities"]),
         }
+        current_enemy_name = self.enemy_combo.currentText().strip()
+        scenario_names = list(scenario_names or [current_enemy_name])
+        scenarios = []
+        for scenario_name in scenario_names:
+            if scenario_name == current_enemy_name:
+                scenario_enemy = _report_enemy(context["enemy"], context["debuffs"])
+            else:
+                preset = enemies.preset_enemies.get(scenario_name)
+                if not preset:
+                    continue
+                scenario_enemy = _report_enemy(dict(preset), context["debuffs"])
+            scenarios.append((scenario_name, dict(scenario_enemy.stats)))
+        if not scenarios:
+            raise ValueError("Select at least one valid overnight enemy scenario.")
         tp_values = (1000, 2000, 3000)
         spell_name = self.spell_combo.currentText().strip()
         selected_ws = self.ws_combo.currentText().strip()
@@ -5343,7 +6345,7 @@ class MainWindow(QMainWindow):
         tasks = []
         seen = set()
 
-        def add_task(role, gearset, action, tp, *, ws_name="", ws_type="", spell_type=""):
+        def add_task(role, gearset, action, tp, *, enemy_stats, ws_name="", ws_type="", spell_type=""):
             request = _quick_cache_request(
                 action, gearset,
                 main_job=task_context["main_job"],
@@ -5367,37 +6369,43 @@ class MainWindow(QMainWindow):
                 "spell_type": spell_type,
             })
 
-        for role, base in base_sets:
-            variants = [dict(base)]
-            for slot in SLOTS:
-                base_name = item_name(base[slot])
-                for name, item in candidate_items[slot].items():
-                    if name == base_name:
-                        continue
-                    variant = dict(base)
-                    variant[slot] = item
-                    variants.append(variant)
-            for variant in variants:
-                main_skill = variant["main"].get("Skill Type", "None")
-                ws_names = [
-                    name for name in WS_BY_SKILL.get(main_skill, ())
-                    if name and name != "None"
-                ]
-                if selected_ws and selected_ws in ws_names:
-                    ws_names = [selected_ws, *[name for name in ws_names if name != selected_ws]]
-                elif selected_ws and not ws_names:
-                    ws_names = [selected_ws]
-                for tp in tp_values:
-                    add_task(role, variant, "attack", tp)
-                for ws_name in ws_names:
-                    ws_type = "ranged" if ws_name in ranged_ws else "melee"
+        for scenario_name, enemy_stats in scenarios:
+            for role, base in base_sets:
+                variants = [dict(base)]
+                for slot in SLOTS:
+                    base_name = item_name(base[slot])
+                    for name, item in candidate_items[slot].items():
+                        if name == base_name:
+                            continue
+                        variant = dict(base)
+                        variant[slot] = item
+                        variants.append(variant)
+                for variant in variants:
+                    main_skill = variant["main"].get("Skill Type", "None")
+                    ws_names = [
+                        name for name in WS_BY_SKILL.get(main_skill, ())
+                        if name and name != "None"
+                    ]
+                    if selected_ws and selected_ws in ws_names:
+                        ws_names = [selected_ws, *[name for name in ws_names if name != selected_ws]]
+                    elif selected_ws and not ws_names:
+                        ws_names = [selected_ws]
+                    task_role = f"{scenario_name} / {role}"
                     for tp in tp_values:
-                        add_task(role, variant, "ws", tp, ws_name=ws_name, ws_type=ws_type)
-                if spell_name and spell_name != "None":
-                    add_task(
-                        role, variant, "spell", 0,
-                        spell_type=self._spell_type(spell_name),
-                    )
+                        add_task(task_role, variant, "attack", tp, enemy_stats=enemy_stats)
+                    for ws_name in ws_names:
+                        ws_type = "ranged" if ws_name in ranged_ws else "melee"
+                        for tp in tp_values:
+                            add_task(
+                                task_role, variant, "ws", tp,
+                                enemy_stats=enemy_stats, ws_name=ws_name, ws_type=ws_type,
+                            )
+                    if spell_name and spell_name != "None":
+                        add_task(
+                            task_role, variant, "spell", 0,
+                            enemy_stats=enemy_stats,
+                            spell_type=self._spell_type(spell_name),
+                        )
         return tasks
 
     def run_overnight_simulations(self):
@@ -5412,6 +6420,25 @@ class MainWindow(QMainWindow):
                 "Enable simulation caching from File before warming the cache.",
             )
             return
+        enemy_names = list(enemies.preset_enemies)
+        current_enemy = self.enemy_combo.currentText().strip()
+        saved_scenarios = self.settings.value("overnight_simulations/enemies", [], list)
+        if not isinstance(saved_scenarios, list):
+            saved_scenarios = []
+        saved_scenarios = [str(name) for name in saved_scenarios if str(name) in enemy_names]
+        if current_enemy not in saved_scenarios:
+            saved_scenarios.insert(0, current_enemy)
+        scenario_dialog = OvernightScenarioDialog(
+            enemy_names, current_enemy, saved_scenarios, self
+        )
+        if scenario_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        scenario_names = scenario_dialog.selected_names()
+        if not scenario_names:
+            QMessageBox.information(
+                self, "Overnight simulations", "Select at least one enemy scenario."
+            )
+            return
         default_hours = self.settings.value("overnight_simulations/hours", 8.0, float)
         hours, accepted = QInputDialog.getDouble(
             self, "Run overnight simulations",
@@ -5421,7 +6448,7 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         try:
-            tasks = self._build_overnight_tasks()
+            tasks = self._build_overnight_tasks(scenario_names)
         except Exception as error:
             QMessageBox.critical(self, "Overnight simulations", str(error))
             return
@@ -5429,6 +6456,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Overnight simulations", "No simulation tasks were generated.")
             return
         self.settings.setValue("overnight_simulations/hours", hours)
+        self.settings.setValue("overnight_simulations/enemies", scenario_names)
         self.optimizer_log.clear()
         self._optimizer_run_state = {}
         self._optimizer_started_at = time.monotonic()
@@ -5437,7 +6465,8 @@ class MainWindow(QMainWindow):
         self.show_optimizer_status()
         self._optimizer_status_timer.start()
         self._append_optimizer_log(
-            f"Starting overnight cache queue: {len(tasks):,} deterministic tasks; "
+            f"Starting overnight cache queue: {len(tasks):,} deterministic tasks across "
+            f"{len(scenario_names)} enemy scenario(s); "
             f"time budget {hours:g} hour(s)."
         )
         self.optimizer_activity.setText("Warming cache")
@@ -5850,13 +6879,14 @@ class MainWindow(QMainWindow):
         )
         substat_summary = result[5] if isinstance(result, (tuple, list)) and len(result) > 5 else []
         self.best_player, _output, metric, winning_seed, self.optimizer_top_results = result[:5]
+        self._last_optimizer_output = _output
         self.best_tp_player = getattr(self.best_player, "tp_player", self.best_player)
         self.best_ws_player = getattr(self.best_player, "ws_player", self.best_player)
         self._last_completed_optimizer_action = self._optimizer_action_in_progress
-        self._last_substat_summary = list(substat_summary or [])
+        self._last_substat_summary = substat_summary or []
         self.optimizer_top_results = list(self.optimizer_top_results or [])
         self._append_optimizer_log(
-            f"Completed · metric {metric:.6f} · seed {winning_seed}"
+            f"Completed · seed {winning_seed}"
         )
         self.optimize_button.setEnabled(True)
         self.stop_optimizer_button.setEnabled(False)
@@ -5865,18 +6895,40 @@ class MainWindow(QMainWindow):
         self.optimizer_activity.setText("Completed")
         self.optimizer_progress_value.setText("Approx. progress: 100.0%")
         self.optimizer_eta_value.setText("Estimated time remaining: complete")
-        self.optimizer_best_value.setText(f"Best metric: {metric:,.4f}")
-        if self._last_substat_summary:
+        action_type = {
+            "Weapon skill": "weapon skill", "Attack round": "attack round",
+            "Spell": "spell cast", "Combined TP + WS": "combined tp/ws",
+        }.get(self._optimizer_action_in_progress, "")
+        result_summary = _optimizer_result_summary(
+            action_type, _output, float(metric), self.metric_combo.currentText(),
+            self.ws_combo.currentText(),
+        )
+        defense_summary = _optimizer_defense_summary(self.best_player)
+        if defense_summary.get("fallback"):
+            result_summary += " · ⚠ best available defense (requested floors not met)"
+        self.optimizer_best_value.setText(result_summary)
+        self._append_optimizer_log(f"Result · {result_summary}")
+        if isinstance(self._last_substat_summary, dict) and self._last_substat_summary.get("mode") == "tradeoff":
+            summary = self._last_substat_summary
+            self._append_optimizer_log(
+                f"Tradeoff frontier: {summary.get('frontier_count', 0)} non-dominated sets "
+                f"across {', '.join(summary.get('targets') or [])}."
+            )
+            self.optimizer_best_value.setText(
+                f"Balanced frontier result · {summary.get('search_mode', 'fast').title()} · {result_summary}"
+            )
+        elif self._last_substat_summary:
             for row in self._last_substat_summary:
                 self._append_optimizer_log(
                     f"Priority {row['stat']}: {row['value']:,.1f} "
                     f"(damage {row['damage']:,.4f}; floor {row['damage_floor']:,.4f})"
                 )
             self.optimizer_best_value.setText(
-                f"Damage floor: {self._last_substat_summary[-1]['damage_floor']:,.4f}"
+                f"Tradeoff result · {result_summary}"
             )
         self.optimizer_phase_value.setText("Current phase: finished")
         self.statusBar().showMessage("Optimizer completed", 5000)
+        self._profile_builder_optimizer_completed(metric)
 
     def _optimizer_failed(self, message: str):
         self._optimizer_status_timer.stop()
@@ -5891,6 +6943,7 @@ class MainWindow(QMainWindow):
         self.stop_optimizer_button.setEnabled(False)
         self.optimizer_activity.setText("Failed")
         self.optimizer_eta_value.setText("Estimated time remaining: unavailable")
+        self._cancel_profile_builder_optimizer_queue("optimizer failed")
         QMessageBox.critical(self, "Optimizer failed", message)
 
     def _optimizer_stopped(self, payload):
@@ -5915,6 +6968,7 @@ class MainWindow(QMainWindow):
         self.optimizer_eta_value.setText("Estimated time remaining: stopped")
         self.optimizer_phase_value.setText("Current phase: stopped")
         self.statusBar().showMessage("Optimizer stopped", 5000)
+        self._cancel_profile_builder_optimizer_queue("optimizer stopped")
 
     def stop_optimizer(self):
         if self.optimizer_thread and self.optimizer_thread.isRunning():

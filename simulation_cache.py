@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 DEFAULT_MAX_BYTES = 250 * 1024 * 1024
 DEFAULT_MAX_AGE_SECONDS = 90 * 24 * 60 * 60
 
@@ -110,10 +110,21 @@ class SimulationCache:
                     accessed_at REAL NOT NULL,
                     runtime_seconds REAL NOT NULL,
                     payload TEXT NOT NULL,
-                    payload_bytes INTEGER NOT NULL
+                    payload_bytes INTEGER NOT NULL,
+                    request_summary TEXT NOT NULL DEFAULT '{}',
+                    batch_id TEXT NOT NULL DEFAULT '',
+                    hit_count INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(simulation_results)")}
+            for name, definition in (
+                ("request_summary", "TEXT NOT NULL DEFAULT '{}'"),
+                ("batch_id", "TEXT NOT NULL DEFAULT ''"),
+                ("hit_count", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE simulation_results ADD COLUMN {name} {definition}")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS simulation_results_lru "
                 "ON simulation_results(source_hash, accessed_at)"
@@ -181,15 +192,16 @@ class SimulationCache:
                     connection.execute("DELETE FROM simulation_results WHERE cache_key = ?", (key,))
                     return None
                 connection.execute(
-                    "UPDATE simulation_results SET accessed_at = ? "
-                    "WHERE cache_key = ? AND accessed_at < ?",
-                    (now, key, now - 60),
+                    "UPDATE simulation_results SET accessed_at = ?, hit_count = hit_count + 1 "
+                    "WHERE cache_key = ?",
+                    (now, key),
                 )
                 return {"payload": decoded, "created_at": float(created_at), "runtime_seconds": float(runtime_seconds)}
         except (OSError, sqlite3.DatabaseError):
             return None
 
-    def put(self, key: str, kind: str, payload: Any, runtime_seconds: float) -> bool:
+    def put(self, key: str, kind: str, payload: Any, runtime_seconds: float,
+            *, request_summary: Any = None, batch_id: str = "") -> bool:
         try:
             encoded = canonical_json(payload)
             size = len(encoded.encode("utf-8"))
@@ -198,10 +210,12 @@ class SimulationCache:
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO simulation_results
-                    (cache_key, kind, source_hash, created_at, accessed_at, runtime_seconds, payload, payload_bytes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (cache_key, kind, source_hash, created_at, accessed_at, runtime_seconds, payload, payload_bytes,
+                     request_summary, batch_id, hit_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                     """,
-                    (key, kind, self.source_hash, now, now, max(0.0, float(runtime_seconds)), encoded, size),
+                    (key, kind, self.source_hash, now, now, max(0.0, float(runtime_seconds)), encoded, size,
+                     canonical_json(request_summary or {}), str(batch_id or "")),
                 )
                 self._prune(connection, now)
             return True
@@ -264,8 +278,8 @@ class SimulationCache:
     def summary(self) -> dict[str, Any]:
         try:
             with self._connection() as connection:
-                entries, payload_bytes = connection.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM simulation_results"
+                entries, payload_bytes, hits = connection.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0), COALESCE(SUM(hit_count), 0) FROM simulation_results"
                 ).fetchone()
                 kinds = {
                     str(kind): int(count) for kind, count in connection.execute(
@@ -274,7 +288,7 @@ class SimulationCache:
                 }
             return {
                 "entries": int(entries), "bytes": int(payload_bytes),
-                "disk_bytes": self.disk_bytes(), "kinds": kinds,
+                "disk_bytes": self.disk_bytes(), "kinds": kinds, "hits": int(hits),
             }
         except (OSError, sqlite3.DatabaseError):
-            return {"entries": 0, "bytes": 0, "disk_bytes": self.disk_bytes(), "kinds": {}}
+            return {"entries": 0, "bytes": 0, "disk_bytes": self.disk_bytes(), "kinds": {}, "hits": 0}

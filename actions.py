@@ -19,6 +19,8 @@ from get_tp import get_tp
 from nuking import *
 from get_dint_m_v import *
 from get_delay_timing import *
+from attack_round_model import time_to_ws_breakdown
+from equipment_rules import ranged_attack_ready
 
 def color_text(color, text):
     #
@@ -1020,10 +1022,38 @@ def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric,
         regain_tp = player.stats.get("Dual Wield",0)*(player.gearset["main"]["Name"]=="Gokotai") + player.stats.get("Regain",0)
         tp_per_attack_round += (time_per_attack_round/3)*(regain_tp)
         
-        try:
-            attacks_per_ws = (ws_threshold - starting_tp) / tp_per_attack_round
-            time_per_ws = time_per_attack_round * attacks_per_ws # Real time (seconds) to reach your desired TP value from your starting TP value using the defined gearset and buffs.
-        except ZeroDivisionError:
+        # Time-to-WS uses complete stochastic attack rounds rather than
+        # treating fractional average hits as immediately spendable TP.  The
+        # average TP value above remains the displayed TP/round metric.
+        normal_delay = mdelay / 2 if main_skill_type == "Hand-to-Hand" else mdelay
+        zanshin_proc_rate = zanshin * (
+            (1 - qa) * (1 - ta) * (1 - da) * (1 - oa3_main) * (1 - oa2_main)
+        ) * (
+            (1 - hit_rate12)
+            + hit_rate12 * zanhasso * (player.main_job.lower() == "sam")
+        )
+        exact_tp = time_to_ws_breakdown(
+            starting_tp=starting_tp,
+            target_tp=ws_threshold,
+            round_seconds=time_per_attack_round,
+            regain_per_round=(time_per_attack_round / 3) * regain_tp,
+            dual_wield=dual_wield,
+            qa=qa, ta=ta, da=da,
+            main_oa3=oa3_main, main_oa2=oa2_main,
+            sub_oa8=oa8_sub, sub_oa7=oa7_sub, sub_oa6=oa6_sub,
+            sub_oa5=oa5_sub, sub_oa4=oa4_sub, sub_oa3=oa3_sub, sub_oa2=oa2_sub,
+            main_hit=hit_rate12, sub_hit=hit_rate22,
+            kick_rate=kickattacks if main_skill_type == "Hand-to-Hand" else 0,
+            daken_rate=daken if ammo_skill_type == "Throwing" else 0,
+            daken_hit=hit_rate_ranged,
+            zanshin_rate=zanshin_proc_rate,
+            zanshin_oa2=zanshin_oa2,
+            normal_tp=get_tp(1, normal_delay, stp),
+            zanshin_tp=get_tp(1, normal_delay, stp, player.main_job.lower() == "sam"),
+            daken_tp=get_tp(1, ammo_delay, stp),
+        )
+        time_per_ws = exact_tp["time_to_ws"]
+        if not np.isfinite(time_per_ws):
             time_per_ws = 9999
 
 
@@ -1129,6 +1159,9 @@ def cast_spell(player, enemy, spell_name, spell_type, input_metric):
     # A lot of the magic damage code is repeated and I'd like to reduce this later.
     #
 
+
+    if spell_type == "Ranged Attack" and not ranged_attack_ready(player.gearset):
+        raise ValueError("Ranged Attack requires Gun/Bow/Crossbow with matching Bullet/Arrow/Bolt ammo.")
 
     # Magic burst damage may be increased based on the enemy's resist rank to the bursted element. https://www.bg-wiki.com/ffxi/Magic_Burst
     enemy_resist_rank_burst_bonus = {"150%":1.5, "130%":1.15, "115%":0.85, "100%":0.60, "85%":0.50, "70%":0.40, "60%":0.15, "50%":0.05, "40%":0, "30%":0, "25%":0, "20%":0, "15%":0, "10%":0, "5%":0}
@@ -1672,6 +1705,9 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
     # ws_name: The name of the weapon skill being used.
     # ws_type: includes ["melee","ranged","magical"] and is used to separate how the physical/magical portions of the damage contribute. Hybrid WSs are considered "melee" but activate a "hybrid" flag which enables their magical damage.
     #
+
+    if ws_type == "ranged" and not ranged_attack_ready(player.gearset):
+        raise ValueError("Ranged weapon skills require Gun/Bow/Crossbow with matching Bullet/Arrow/Bolt ammo.")
 
     # ===========================================================================
     # ===========================================================================

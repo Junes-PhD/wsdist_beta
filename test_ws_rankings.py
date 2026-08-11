@@ -9,7 +9,7 @@ from new_gui_main import _lock_ranking_weapon_slots, _ranking_weapon_types
 
 
 class WeaponSkillRankingTests(unittest.TestCase):
-    def test_substat_optimization_is_lexicographic_with_damage_floor(self):
+    def test_substat_optimization_builds_a_pareto_frontier_with_damage_floor(self):
         baseline = SimpleNamespace(
             gearset={"head": {"Name": "Damage"}},
             stats={"Magic Evasion": 20, "Evasion": 30, "Defense": 40},
@@ -47,16 +47,12 @@ class WeaponSkillRankingTests(unittest.TestCase):
             "Magic Evasion", "Evasion", "Defense",
         ])
         self.assertEqual(phases[0]["constraints"], [])
-        self.assertEqual(phases[1]["constraints"], [("Magic Evasion", 90.0)])
-        self.assertEqual(phases[2]["constraints"], [
-            ("Magic Evasion", 90.0), ("Evasion", 80.0),
-        ])
-        self.assertEqual(result[5][-1]["stat"], "Defense")
-        self.assertEqual(result[5][-1]["damage_floor"], 850.0)
-        self.assertEqual(
-            [entry["label"] for entry in result[4]],
-            ["Best damage set", "Sub-stat optimized"],
-        )
+        self.assertTrue(all(phase["constraints"] == [] for phase in phases))
+        self.assertTrue(all(phase["primary_floor"] == 850.0 for phase in phases))
+        self.assertEqual(result[5]["mode"], "tradeoff")
+        self.assertEqual(result[5]["targets"], ["Magic Evasion", "Evasion", "Defense"])
+        self.assertGreaterEqual(result[5]["frontier_count"], 2)
+        self.assertIn("Balanced recommendation", [entry["label"] for entry in result[4]])
 
     def test_ranks_each_tp_tier_independently(self):
         damages = {

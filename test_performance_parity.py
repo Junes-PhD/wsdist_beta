@@ -4,6 +4,7 @@ import io
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 # Formula-parity tests do not need machine-code compilation.
@@ -12,6 +13,7 @@ os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
 import numpy as np
 
 import actions
+from attack_round_model import expected_rounds, time_to_ws_breakdown, tp_distribution
 import create_player as player_module
 import wsdist as wsdist_module
 from new_gui_main import SLOTS as GUI_SLOTS, _optimizer_check_gear
@@ -27,7 +29,7 @@ from enemies import preset_enemies
 from gear import *
 from wsdist import (
     CombinedSetResult, apply_forced_empty_slots, build_set, optimize_set,
-    prune_dominated_candidates,
+    balanced_pareto_record, pareto_frontier, prune_dominated_candidates,
     starting_item_candidates,
 )
 
@@ -379,8 +381,46 @@ class PerformanceParityTests(unittest.TestCase):
 
                 self.assertEqual(player.gearset["head"]["Name"], "Multiattack Cap")
                 self.assertEqual(output[-1], -1)
-                expected_time = output[2] * 1000 / output[1]
+                expected_time = actions.average_attack_round(
+                    player, enemy, 0, 1000, "Time to WS"
+                )[0]
+                self.assertGreater(expected_time, 0)
                 self.assertAlmostEqual(normalized_metric, 1 / expected_time)
+
+    def test_discrete_attack_round_model_keeps_zero_tp_rounds(self):
+        distribution = ((0, 0.5), (100, 0.5))
+        # Three successful 100-TP rounds are required; misses are complete
+        # rounds too, so the expectation is six rather than the old fractional
+        # 250 / 50 approximation that treated the final hit as partial.
+        self.assertAlmostEqual(expected_rounds(distribution, 0, 250), 6.0)
+
+    def test_attack_round_distribution_is_normalized_and_finite(self):
+        result = time_to_ws_breakdown(
+            starting_tp=0, target_tp=1000, round_seconds=2.5,
+            dual_wield=True, qa=0.02, ta=0.10, da=0.25,
+            main_oa3=0, main_oa2=0, sub_oa8=0, sub_oa7=0, sub_oa6=0,
+            sub_oa5=0, sub_oa4=0, sub_oa3=0, sub_oa2=0,
+            main_hit=0.8, sub_hit=0.75, kick_rate=0, daken_rate=0,
+            daken_hit=0, zanshin_rate=0, zanshin_oa2=0,
+            normal_tp=70, zanshin_tp=70, daken_tp=0,
+        )
+        self.assertAlmostEqual(sum(probability for _tp, probability in result["outcomes"]), 1.0)
+        self.assertGreater(result["expected_rounds"], 0)
+        self.assertGreater(result["time_to_ws"], 0)
+
+    def test_pareto_frontier_removes_dominated_sets_and_selects_balance(self):
+        def record(name, metric, evasion):
+            return {
+                "player": SimpleNamespace(gearset={"head": {"Name": name}}),
+                "metric": metric, "substats": {"Evasion": evasion},
+            }
+        primary = record("Primary", 100, 10)
+        balanced = record("Balanced", 95, 50)
+        extreme = record("Extreme", 90, 100)
+        dominated = record("Dominated", 89, 20)
+        frontier = pareto_frontier([primary, balanced, extreme, dominated], ["Evasion"])
+        self.assertEqual([item["player"].gearset["head"]["Name"] for item in frontier], ["Primary", "Balanced", "Extreme"])
+        self.assertEqual(balanced_pareto_record(frontier, ["Evasion"])["player"].gearset["head"]["Name"], "Balanced")
 
     def test_base_stats_cache_is_isolated_and_configuration_sensitive(self):
         player_module._BASE_STATS_CACHE.clear()
@@ -451,7 +491,7 @@ class PerformanceParityTests(unittest.TestCase):
         self.assertTrue(ranked)
         self.assertEqual(player.gearset, ranked[0]["player"].gearset)
 
-    def test_split_worker_falls_back_when_defensive_set_needs_multiple_passes(self):
+    def test_split_worker_finds_defensive_set_needing_multiple_passes(self):
         """A valid three-slot defensive set must not become a split-worker false negative."""
         base, _check_gear, enemy = self.optimizer_inputs()
         check_gear = {slot: [item] for slot, item in base.items()}
@@ -476,7 +516,6 @@ class PerformanceParityTests(unittest.TestCase):
             )
 
         self.assertEqual(calculate_damage_taken(player.gearset), (-40, -30))
-        self.assertTrue(any("full-search fallback" in message for message in messages))
 
     def test_independent_restarts_find_feasible_defensive_set(self):
         """Independent restart workers must retain feasible PDT/MDT candidates."""
@@ -531,6 +570,26 @@ class PerformanceParityTests(unittest.TestCase):
                 )
 
         self.assertTrue(calls)
+
+    def test_optimizer_returns_marked_best_defense_when_floor_is_impossible(self):
+        """Impossible defensive floors return the closest legal set, not an unusable error."""
+        base, _check_gear, enemy = self.optimizer_inputs()
+        check_gear = {slot: [item] for slot, item in base.items()}
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            player, output, _metric = build_set(
+                "nin", "war", 50, {}, {}, enemy, "Blade: Shun", "Waterja", "attack round",
+                1000, check_gear, base.copy(), -100, -100, "DPS", False, 1,
+                dt_requirement=-100, seed=20260810, n_iter=1, return_details=True,
+                preserve_starting_gearset=True,
+            )
+
+        defense = player.optimizer_defense
+        self.assertTrue(defense["fallback"])
+        self.assertIsNotNone(output)
+        self.assertGreater(defense["actual"]["PDT"], defense["requested"]["PDT"])
+        self.assertGreater(defense["actual"]["MDT"], defense["requested"]["MDT"])
+        self.assertGreater(defense["actual"]["DT"], defense["requested"]["DT"])
 
     def test_optimizer_does_not_restore_unselected_weapon(self):
         empty = {"Name": "Empty", "Name2": "Empty", "Type": "None", "Skill Type": "None"}

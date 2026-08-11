@@ -4,6 +4,7 @@ File containing code to build a player character with gear and aggregate stats.
 Author: Kastra (Asura server)
 '''
 from enemies import *
+from equipment_rules import apply_weapon_slot_rules
 
 
 _BASE_STATS_CACHE = {}
@@ -157,6 +158,13 @@ class create_player:
 
         # Add base stats (ignoring gear or buffs).
         self.add_base_stats()
+
+        # Enforce main/sub/ranged/ammo compatibility before any equipment
+        # stat can affect this player.  This is also used by the optimizer,
+        # keeping Quick Look and optimized simulations on the same rules.
+        self.weapon_slot_changes = apply_weapon_slot_rules(
+            self.gearset, self.main_job, self.sub_job, self.master_level,
+        )
 
         # Add stats from gear
         self.add_gear_stats()

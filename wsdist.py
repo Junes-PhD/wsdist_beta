@@ -30,6 +30,7 @@ import time
 import queue as queue_module
 sys.path.append(os.path.dirname(sys.executable))
 from gear import *
+from equipment_rules import apply_weapon_slot_rules, ranged_attack_ready
 
 
 class OptimizerStopped(RuntimeError):
@@ -409,6 +410,75 @@ def prune_dominated_candidates(check_gear: dict[str, list[dict]]) -> tuple[dict[
     return pruned, removed
 
 
+def obvious_blacklist_suggestions(items_by_slot: dict[str, list[dict]]) -> dict[str, set[str]]:
+    """Suggest globally safe blacklist entries from strictly dominated gear.
+
+    A blacklist entry hides every augmentation of a base item.  It is therefore
+    suggested only when *every* known variant of that base item is dominated in
+    each compatible slot by an item with a different base name.  The existing
+    dominance rules already require matching type, skill type, forced-empty
+    footprint, and no worse modeled numeric stats, so this cannot remove a
+    modeled tradeoff item.
+    """
+    contexts: dict[str, set[tuple[str, int]]] = {}
+    dominated: dict[str, set[tuple[str, int]]] = {}
+    dominators: dict[str, set[str]] = {}
+
+    def base_name(item: dict) -> str:
+        return str(item.get("Name") or item.get("Name2") or "").strip().casefold()
+
+    for slot, values in items_by_slot.items():
+        items = [item for item in values if base_name(item) and item.get("Name") != "Empty"]
+        for index, item in enumerate(items):
+            name = base_name(item)
+            context = (str(slot), index)
+            contexts.setdefault(name, set()).add(context)
+            winners = [
+                other for other in items
+                if base_name(other) != name and _dominates_item(other, item)
+            ]
+            if winners:
+                dominated.setdefault(name, set()).add(context)
+                dominators.setdefault(name, set()).update(base_name(other) for other in winners)
+
+    return {
+        name: dominators.get(name, set())
+        for name, positions in contexts.items()
+        if positions and dominated.get(name, set()) == positions
+    }
+
+
+def universal_blacklist_suggestions(
+        items_by_owner: dict[str, dict[str, list[dict]]]) -> dict[str, set[str]]:
+    """Return global blacklist suggestions that remain safe for every owner.
+
+    The global blacklist applies to all characters, so a +2 on one character
+    must never hide a base or +1 item that another character still needs.  A
+    base name is returned only when it is an ``obvious_blacklist_suggestion``
+    within the independently owned inventory of *each* character that has it.
+    """
+    owner_names: dict[str, set[str]] = {}
+    owner_suggestions: dict[str, dict[str, set[str]]] = {}
+    for owner, items_by_slot in items_by_owner.items():
+        names = {
+            str(item.get("Name") or item.get("Name2") or "").strip().casefold()
+            for values in items_by_slot.values() for item in values
+            if item.get("Name") != "Empty"
+        }
+        names.discard("")
+        owner_names[str(owner)] = names
+        owner_suggestions[str(owner)] = obvious_blacklist_suggestions(items_by_slot)
+
+    result = {}
+    for name in set().union(*owner_names.values()) if owner_names else set():
+        owners = [owner for owner, names in owner_names.items() if name in names]
+        if owners and all(name in owner_suggestions[owner] for owner in owners):
+            result[name] = set().union(
+                *(owner_suggestions[owner][name] for owner in owners)
+            )
+    return result
+
+
 def _substat_value(player, stat_name):
     """Return a numeric player stat for secondary-stat optimization."""
     try:
@@ -432,6 +502,99 @@ def _substat_constraints_met(player, constraints):
     )
 
 
+def _gearset_identity(player):
+    """Stable identity for a displayed optimizer result."""
+    modeled = _substat_player(player)
+    return tuple(
+        (slot, str(item.get("Bridge Key") or item.get("Name2") or item.get("Name") or "Empty"))
+        for slot, item in sorted(modeled.gearset.items())
+    )
+
+
+def pareto_dominates(left, right, targets):
+    """Whether ``left`` is no worse on every objective and better on one."""
+    left_values = [float(left["metric"])] + [float(left["substats"].get(target, 0)) for target in targets]
+    right_values = [float(right["metric"])] + [float(right["substats"].get(target, 0)) for target in targets]
+    return all(a >= b for a, b in zip(left_values, right_values)) and any(
+        a > b for a, b in zip(left_values, right_values)
+    )
+
+
+def pareto_frontier(records, targets, limit=20):
+    """Deduplicate and retain non-dominated objective records.
+
+    The frontier normally stays small for a two-swap local search.  If it
+    grows beyond the display limit, retain objective extremes and evenly
+    spaced balanced tradeoffs rather than silently discarding them by score.
+    """
+    unique = {}
+    for record in records:
+        if record is None:
+            continue
+        key = _gearset_identity(record["player"])
+        previous = unique.get(key)
+        if previous is None or float(record["metric"]) > float(previous["metric"]):
+            unique[key] = record
+    values = list(unique.values())
+    frontier = [
+        record for record in values
+        if not any(other is not record and pareto_dominates(other, record, targets) for other in values)
+    ]
+    frontier.sort(key=lambda record: float(record["metric"]), reverse=True)
+    if len(frontier) <= limit:
+        return frontier
+    # Keep every objective extreme, then choose the least similar remaining
+    # records by their normalized objective vector.
+    selected = {0}
+    for target in targets:
+        selected.add(max(range(len(frontier)), key=lambda index: frontier[index]["substats"].get(target, 0)))
+    ranges = []
+    for target in (None, *targets):
+        series = [float(record["metric"] if target is None else record["substats"].get(target, 0)) for record in frontier]
+        ranges.append((min(series), max(series)))
+    while len(selected) < limit:
+        best_index, best_distance = None, -1.0
+        for index, record in enumerate(frontier):
+            if index in selected:
+                continue
+            vector = [float(record["metric"])] + [float(record["substats"].get(target, 0)) for target in targets]
+            nearest = float("inf")
+            for chosen in selected:
+                other = frontier[chosen]
+                other_vector = [float(other["metric"])] + [float(other["substats"].get(target, 0)) for target in targets]
+                distance = sum(
+                    ((value - other_value) / max(1e-9, high - low)) ** 2
+                    for value, other_value, (low, high) in zip(vector, other_vector, ranges)
+                )
+                nearest = min(nearest, distance)
+            if nearest > best_distance:
+                best_index, best_distance = index, nearest
+        if best_index is None:
+            break
+        selected.add(best_index)
+    return [frontier[index] for index in sorted(selected)]
+
+
+def balanced_pareto_record(frontier, targets):
+    """Choose the frontier point with the smallest normalized worst regret."""
+    if not frontier:
+        return None
+    ranges = []
+    for target in (None, *targets):
+        series = [float(record["metric"] if target is None else record["substats"].get(target, 0)) for record in frontier]
+        ranges.append((min(series), max(series)))
+
+    def rank(record):
+        vector = [float(record["metric"])] + [float(record["substats"].get(target, 0)) for target in targets]
+        regrets = [
+            0.0 if high <= low else (high - value) / (high - low)
+            for value, (low, high) in zip(vector, ranges)
+        ]
+        return max(regrets), sum(regrets), -float(record["metric"])
+
+    return min(frontier, key=rank)
+
+
 def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, dt_requirement=0, seed=None, n_iter=10, return_details=False, progress_callback=None, stop_event=None, slot_pair_filter=None, preserve_starting_gearset=False, single_outer_pass=False, combined_ws_player=None, substat_spec=None):
     #
     # Build a valid gear set, test it, and return the best set found.
@@ -448,14 +611,16 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     # avoids recomputing a player and action when multiple slot-pair paths
     # revisit the same gear set, without any cross-process SQLite contention.
     evaluation_cache = OrderedDict()
-    evaluation_cache_limit = 512
+    evaluation_cache_limit = 2048
     evaluation_cache_hits = 0
     evaluation_cache_misses = 0
+    item_token_cache = {}
     rng = np.random.default_rng(seed) if seed is not None else np.random
     best_set = None
     best_output = None
     best_metric = None
     best_primary_metric = None
+    defense_fallback = False
 
     def report_progress(message):
         if progress_callback is not None:
@@ -479,8 +644,18 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
             )
 
     def evaluation_key(gearset):
+        def item_token(item):
+            # Candidate dictionaries are stable for a run.  Freeze each one
+            # once rather than sorting/repr-ing every field for every pair
+            # evaluation; this was a measurable hot path in optimizer traces.
+            cache_key = id(item)
+            token = item_token_cache.get(cache_key)
+            if token is None:
+                token = tuple(sorted((str(field), repr(value)) for field, value in item.items()))
+                item_token_cache[cache_key] = token
+            return token
         return tuple(
-            (slot, tuple(sorted((str(key), repr(value)) for key, value in item.items())))
+            (slot, item_token(item))
             for slot, item in sorted(gearset.items())
         )
 
@@ -710,6 +885,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                 starting_gearset["ear2"] = Empty
 
     apply_forced_empty_slots(starting_gearset)
+    apply_weapon_slot_rules(starting_gearset, main_job, sub_job, master_level)
     # Do not let the random starting point contain two copies of a unique
     # +1000 TP Bonus weapon (Centovente/Centovente2, Hitaki/Hitaki2, etc.).
     # The candidate loop applies the same rule to every later swap.
@@ -727,6 +903,14 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     two_handed = ("Great Sword", "Great Katana", "Great Axe", "Polearm", "Scythe", "Staff")
     archery_ws = ("Empyreal Arrow", "Flaming Arrow", "Namas Arrow", "Jishnu's Radiance", "Apex Arrow", "Refulgent Arrow", "Sidewinder", "Blast Arrow", "Piercing Arrow")
     marksmanship_ws = ("Last Stand", "Hot Shot", "Leaden Salute", "Wildfire", "Coronach", "Trueflight", "Detonator", "Blast Shot", "Slug Shot", "Split Shot")
+    requires_ranged_pair = ((ws_action and ws_type == "ranged")
+                             or (action_type == "spell cast" and spell_name == "Ranged Attack"))
+    # The fallback can finish from the defensive-only phase before a normal
+    # baseline evaluation assigns these legacy print-format values.
+    if action_type == "attack round":
+        decimals, nondecimals = 3, 8
+    else:
+        decimals, nondecimals = 1, 8
 
     pdt = 200 # How much PDT the set has
     mdt = 200
@@ -751,11 +935,12 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
     # First find a legal set that satisfies requested PDT/MDT/DT totals.
     # This avoids expensive DPS/WS evaluation for candidates that cannot
-    # possibly be returned. Split chunks keep their strict one-pass gate; the
-    # coordinator already supplies a full-search fallback when needed.
-    defense_phase = (not single_outer_pass and any(
+    # possibly be returned.  This applies to split workers too: if the floors
+    # are impossible with the selected gear, every path must retain and report
+    # the closest legal set instead of discarding useful work as an error.
+    defense_phase = any(
         threshold < 0 for threshold in (pdt_thresh, mdt_thresh, dt_thresh)
-    ))
+    )
     metric_pass_pending = False
 
     # Split-worker passes enforce final thresholds immediately. Regular runs
@@ -813,7 +998,8 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                     f"defensive baseline PDT:{base_pdt:g}, MDT:{base_mdt:g}, DT:{base_dt:g}"
                 )
             elif (base_pdt <= pdt_thresh_temp and base_mdt <= mdt_thresh_temp
-                    and base_dt <= dt_thresh_temp):
+                    and base_dt <= dt_thresh_temp
+                    and (not requires_ranged_pair or ranged_attack_ready(converged_set))):
                 base_player, normalized_metric, best_output = evaluate_gearset(converged_set)
                 if action_type == "weapon skill":
                     decimals = 1
@@ -924,6 +1110,13 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                     or (slot2 in forced_empty and item2.get("Name") != "Empty")):
                                 continue
 
+                            weapon_empty = apply_weapon_slot_rules(
+                                test_set, main_job, sub_job, master_level,
+                            )
+                            if ((slot1 in weapon_empty and item1.get("Name") != "Empty")
+                                    or (slot2 in weapon_empty and item2.get("Name") != "Empty")):
+                                continue
+
 
                             if (test_set["ring1"]==test_set["ring2"]) and (test_set["ring1"]["Name"]!="Empty") and not duplicate_allowed(test_set["ring1"]):
                                 continue
@@ -935,69 +1128,14 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                 continue
                             #print("test1")
 
-                            # Do not test 1-handed weapons with grips.
-                            if (test_set["main"]["Skill Type"] in one_handed) and (test_set["sub"]["Type"] == "Grip"):
-                                continue
-                            #print("test2")
-
-                            # Do not allow 2-handed weapons with shields or 1-handed weapons.
-                            if (test_set["main"]["Skill Type"] in two_handed) and (test_set["sub"]["Type"]=="Weapon" or test_set["sub"]["Type"]=="Shield"):
-                                continue
-                            #print("test3")
-
-                            # Do not allow a hand-to-hand weapon with an off-hand item.
-                            if (test_set["main"]["Skill Type"] == "Hand-to-Hand") and (test_set["sub"]["Name"] != "Empty"):
-                                continue
-
-                            #print("test4")
-
-                            if ws_action and (ws_name in archery_ws + marksmanship_ws):
-                                # If using a ranged weapon skill, ensure that the weapon and ammo type match the weapon skill.
-
-                                if (ws_name in archery_ws) and (test_set["ranged"]["Skill Type"]!="Archery" or test_set["ammo"]["Type"]!="Arrow"):
+                            # Ranged actions need a usable weapon/projectile
+                            # pair.  Other actions may retain stat ammo without
+                            # firing it, but the shared slot rules have already
+                            # removed impossible pairings.
+                            if ((ws_action and ws_type == "ranged")
+                                    or (action_type == "spell cast" and spell_name == "Ranged Attack")):
+                                if not ranged_attack_ready(test_set):
                                     continue
-                                
-                                if (ws_name in marksmanship_ws) and (test_set["ranged"]["Skill Type"]!="Marksmanship" or test_set["ammo"]["Type"] not in ["Bolt", "Bullet"]):
-                                    continue
-
-                                if (test_set["ranged"]["Type"]=="Crossbow") and (test_set["ammo"]["Type"]!="Bolt"):
-                                    continue
-                                if (test_set["ranged"]["Type"]=="Gun") and (test_set["ammo"]["Type"]!="Bullet"):
-                                    continue
-                            #print("test5")
-
-                            # Ranged TP attacks require a ranged weapon and ammo to be equipped. We check that the ammo matches the weapon later.
-                            if (action_type=="spell cast") and (spell_name=="Ranged Attack"):
-                                if (test_set["ranged"]["Type"] not in ["Gun","Bow","Crossbow"]) or (test_set["ammo"]["Type"] not in ["Bullet","Arrow","Bolt"]):
-                                    continue
-                            #print("test6")
-
-                            # Do not equip an ammo incompatible with your ranged weapon
-                            if (test_set["ranged"]["Type"]=="Gun") and (test_set["ammo"].get("Type","None") not in ["Bullet","None"]):
-                                continue
-                            if (test_set["ranged"]["Type"]=="Bow") and (test_set["ammo"].get("Type","None") not in ["Arrow","None"]):
-                                continue
-                            if (test_set["ranged"]["Type"]=="Crossbow") and (test_set["ammo"].get("Type","None") not in ["Bolt","None"]):
-                                continue
-                            #print("test7")
-
-                            # Do not equip a ranged weapon incompatible with your ammo
-                            if (test_set["ammo"].get("Type","None")=="Bullet") and (test_set["ranged"].get("Type","None")!="Gun"):
-                                continue
-                            if (test_set["ammo"].get("Type","None")=="Arrow") and (test_set["ranged"].get("Type","None")!="Bow"):
-                                continue
-                            if (test_set["ammo"].get("Type","None")=="Bolt") and (test_set["ranged"].get("Type","None")!="Crossbow"):
-                                continue
-                            #print("test8")
-
-                            if (test_set["ranged"].get("Type","None")=="Instrument") and (test_set["ammo"].get("Type","None")!="None"):
-                                continue
-                            #print("test9")
-
-                            # Do not allow dual wielding unless the selected main job has native dual wield.
-                            if (main_job not in ["nin", "dnc", "thf", "blu"] and sub_job not in ["nin", "dnc"]) and (test_set["sub"]["Type"] == "Weapon"):
-                                    continue
-                            #print("test10")
 
                             # Do not equip Balder Earring +1 and the JSE +2 ears at the same time. They both only work if in the right ear.
                             if (test_set["ear1"]["Name"] in jse_ears) and (test_set["ear2"]["Name"]=="Balder Earring +1"):
@@ -1162,10 +1300,22 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
             )
             if pdt > pdt_thresh or mdt > mdt_thresh or dt > dt_thresh:
                 if best_set == converged_set:
-                    raise ValueError(
-                        "Optimizer could not reach the requested PDT/MDT/DT minimums from the "
-                        "current legal candidates. Try more selected defensive gear or additional search runs."
+                    # The selected candidates cannot meet every requested
+                    # defensive floor.  ``best_set`` is nevertheless the
+                    # legal set with the smallest total/max deficit, so use it
+                    # as a marked fallback and give it a normal combat result.
+                    defense_fallback = True
+                    _fallback_player, normalized_metric, best_output = evaluate_gearset(best_set)
+                    best_metric = max(0.0001, normalized_metric)
+                    best_primary_metric = best_metric
+                    pdt_thresh_temp = pdt
+                    mdt_thresh_temp = mdt
+                    dt_thresh_temp = dt
+                    report_progress(
+                        f"Defense fallback: requested PDT:{pdt_requirement:g}, MDT:{mdt_requirement:g}, "
+                        f"DT:{dt_requirement:g}; best available PDT:{pdt:g}, MDT:{mdt:g}, DT:{dt:g}."
                     )
+                    break
                 report_progress(
                     f"Defensive search improving: PDT:{pdt:g}, MDT:{mdt:g}, DT:{dt:g}; "
                     "continuing without damage simulation."
@@ -1254,7 +1404,8 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         report_progress(f"Current best PDT:{pdt:g}, MDT:{mdt:g}, DT:{dt:g}.")
 
 
-    if pdt > pdt_thresh or mdt > mdt_thresh or dt > dt_thresh:
+    if (not defense_fallback
+            and (pdt > pdt_thresh or mdt > mdt_thresh or dt > dt_thresh)):
         raise ValueError("Optimizer could not find a set satisfying the requested PDT/MDT/DT minimums.")
 
     # At this point, we've found the best conditional set.
@@ -1265,6 +1416,21 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
     # Record the stats for the best gear set.
     best_player = create_player(main_job, sub_job, master_level, best_set, buffs, abilities)
+    actual_pdt, actual_mdt = calculate_damage_taken(
+        best_set, buffs, abilities, damage_taken_item_cache
+    )
+    actual_dt = damage_taken_dt_from_totals(
+        damage_taken_totals(best_set, buffs, damage_taken_item_cache),
+        best_set["main"], abilities,
+    )
+    # Player objects are the result transport used by the worker, ranking,
+    # cache, and Profile Builder paths.  Keep the defensive outcome attached
+    # so every consumer can explain an infeasible request without re-running.
+    best_player.optimizer_defense = {
+        "requested": {"PDT": pdt_requirement, "MDT": mdt_requirement, "DT": dt_requirement},
+        "actual": {"PDT": actual_pdt, "MDT": actual_mdt, "DT": actual_dt},
+        "fallback": defense_fallback,
+    }
 
 
     header = {
@@ -1910,21 +2076,20 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
     return winner["player"], winner["output"]
 
 
-def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
-                      ws_name, spell_name, base_action_type, min_tp, check_gear,
-                      starting_gearset, pdt_requirement, mdt_requirement,
-                      input_metric, print_swaps, next_best_percent, substat_specs,
-                      *, dt_requirement=0, restarts=1, workers=0, seed=None,
-                      n_iter=10, return_details=False, return_top_results=False,
-                      parallel_mode="search_runs", progress_callback=None,
-                      progress_queue=None, stop_event=None):
-    """Optimize damage first, then trade a bounded amount for prioritized stats.
+def optimize_tradeoffs(main_job, sub_job, master_level, buffs, abilities, enemy,
+                       ws_name, spell_name, base_action_type, min_tp, check_gear,
+                       starting_gearset, pdt_requirement, mdt_requirement,
+                       input_metric, print_swaps, next_best_percent, substat_specs,
+                       *, dt_requirement=0, restarts=1, workers=0, seed=None,
+                       n_iter=10, return_details=False, return_top_results=False,
+                       parallel_mode="search_runs", progress_callback=None,
+                       progress_queue=None, stop_event=None, search_mode="fast"):
+    """Return a non-dominated damage/secondary-stat frontier.
 
-    The damage floor is fixed from the first optimization.  Each secondary
-    stat is then maximized in order, while preserving that floor and all
-    previously selected stat floors.  This makes row 1 more important than
-    row 2, and row 2 more important than row 3, without turning the result
-    into an arbitrary weighted score.
+    ``fast`` uses the normal optimizer winner and one stat-extreme search per
+    selected stat.  ``deep`` adds evenly-spaced primary-loss bands; this is a
+    deterministic, bounded beam around the same candidate space and is useful
+    for overnight runs without introducing arbitrary stat weights.
     """
     specs = [
         {"target": str(spec.get("target") or "").strip()}
@@ -1934,7 +2099,7 @@ def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
     if not specs:
         raise ValueError("Select at least one secondary stat to optimize.")
     if progress_callback is not None:
-        progress_callback("Sub-stat optimization: finding the damage baseline...")
+        progress_callback("Tradeoff optimization: finding the primary baseline...")
     baseline = optimize_set(
         main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         spell_name, base_action_type, min_tp, check_gear, starting_gearset,
@@ -1945,90 +2110,117 @@ def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
         progress_callback=progress_callback, progress_queue=progress_queue,
         stop_event=stop_event,
     )
-    baseline_player, baseline_output, baseline_metric, baseline_seed, _ = baseline
-    current_player, current_output, damage_metric, winning_seed = (
-        baseline_player, baseline_output, baseline_metric, baseline_seed
-    )
-    damage_floor = float(damage_metric) * (
-        1.0 - max(0.0, min(100.0, float(substat_specs[0].get("loss_percent", 15.0)))) / 100.0
-    )
-    constraints = []
-    summary = []
-    current_gearset = dict(current_player.gearset)
-    for index, spec in enumerate(specs, start=1):
-        if _stop_requested(stop_event):
-            raise OptimizerStopped("Optimizer stopped by user.")
-        target = spec["target"]
-        if progress_callback is not None:
-            progress_callback(
-                f"Sub-stat optimization: prioritizing {target} ({index}/{len(specs)})..."
-            )
-        phase = dict(
-            target=target,
-            primary_floor=damage_floor,
-            constraints=list(constraints),
-        )
-        phase_seed = None if seed is None else int(seed) + index
-        phase_result = build_set(
-            main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
-            spell_name, base_action_type, min_tp, check_gear, current_gearset,
-            pdt_requirement, mdt_requirement, input_metric, False,
-            next_best_percent, dt_requirement=dt_requirement, seed=phase_seed,
-            n_iter=n_iter, return_details=True, progress_callback=progress_callback,
-            stop_event=stop_event, preserve_starting_gearset=True,
-            substat_spec=phase,
-        )
-        current_player, current_output, damage_metric = phase_result
-        value = _substat_value(_substat_player(current_player), target)
-        constraints.append((target, value))
-        summary.append({
-            "stat": target,
-            "value": value,
-            "damage": float(damage_metric),
-            "damage_floor": damage_floor,
-        })
-        current_gearset = dict(current_player.gearset)
-
-    if progress_callback is not None:
-        progress_callback("Sub-stat optimization complete.")
+    baseline_player, baseline_output, baseline_metric, baseline_seed, baseline_results = baseline
+    max_loss = max(0.0, min(100.0, float(substat_specs[0].get("loss_percent", 15.0))))
     targets = [spec["target"] for spec in specs]
 
     def stat_values(player):
         modeled = _substat_player(player)
         return {target: float(_substat_value(modeled, target)) for target in targets}
 
-    # Keep the unconstrained damage winner visible alongside the final
-    # secondary-stat result.  This makes the trade-off auditable in the
-    # existing "Show best sets" dialog instead of silently replacing the
-    # damage set.
-    top_results = [
-        {
-            "rank": 1,
-            "label": "Best damage set",
-            "player": baseline_player,
-            "output": baseline_output,
-            "metric": baseline_metric,
-            "seed": baseline_seed,
-            "index": 1,
-            "substats": stat_values(baseline_player),
-            "substat_targets": targets,
-        },
-        {
-            "rank": 2,
-            "label": "Sub-stat optimized",
-            "player": current_player,
-            "output": current_output,
-            "metric": damage_metric,
-            "seed": winning_seed,
-            "index": 2,
-            "substats": stat_values(current_player),
-            "substat_targets": targets,
-        },
-    ]
+    records = []
+    for result in baseline_results:
+        records.append({
+            "player": result["player"], "output": result["output"],
+            "metric": float(result["metric"]), "seed": result.get("seed", baseline_seed),
+            "substats": stat_values(result["player"]), "kind": "primary",
+        })
+    records.append({
+        "player": baseline_player, "output": baseline_output,
+        "metric": float(baseline_metric), "seed": baseline_seed,
+        "substats": stat_values(baseline_player), "kind": "primary",
+    })
+    loss_bands = [max_loss]
+    if str(search_mode).lower() == "deep" and max_loss > 0:
+        loss_bands = sorted({round(max_loss * step / 4.0, 8) for step in range(1, 5)})
+
+    phase_number = 0
+    for loss in loss_bands:
+        damage_floor = float(baseline_metric) * (1.0 - loss / 100.0)
+        for target in targets:
+            phase_number += 1
+            if _stop_requested(stop_event):
+                raise OptimizerStopped("Optimizer stopped by user.")
+            if progress_callback is not None:
+                progress_callback(
+                    f"Tradeoff optimization: exploring {target} at {loss:.2f}% primary loss "
+                    f"({phase_number}/{len(loss_bands) * len(targets)})..."
+                )
+            phase_seed = None if seed is None else int(seed) + phase_number
+            phase = {
+                "target": target,
+                "primary_floor": damage_floor,
+                "constraints": [],
+            }
+            player, output, metric = build_set(
+                main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
+                spell_name, base_action_type, min_tp, check_gear,
+                dict(baseline_player.gearset), pdt_requirement, mdt_requirement,
+                input_metric, False, next_best_percent, dt_requirement=dt_requirement,
+                seed=phase_seed, n_iter=n_iter, return_details=True,
+                progress_callback=progress_callback, stop_event=stop_event,
+                preserve_starting_gearset=True, substat_spec=phase,
+            )
+            if float(metric) + 1e-12 < damage_floor:
+                continue
+            records.append({
+                "player": player, "output": output, "metric": float(metric),
+                "seed": phase_seed, "substats": stat_values(player),
+                "kind": "extreme", "target": target, "loss_band": loss,
+            })
+
+    frontier = pareto_frontier(records, targets, limit=40)
+    if not frontier:
+        raise ValueError("No eligible tradeoff sets were produced.")
+    recommended = balanced_pareto_record(frontier, targets) or frontier[0]
+    top_results = []
+    for index, record in enumerate(frontier, start=1):
+        if record is recommended:
+            label = "Balanced recommendation"
+        elif record["player"] is baseline_player:
+            label = "Primary winner"
+        else:
+            extremes = [target for target in targets if record["substats"].get(target) == max(
+                item["substats"].get(target, float("-inf")) for item in frontier
+            )]
+            label = f"Best {', '.join(extremes)}" if extremes else f"Tradeoff {index}"
+        top_results.append({
+            "rank": index, "label": label, "player": record["player"],
+            "output": record["output"], "metric": record["metric"],
+            "seed": record["seed"], "index": index, "substats": record["substats"],
+            "substat_targets": targets, "primary_loss": max(
+                0.0, 100.0 * (float(baseline_metric) - record["metric"])
+                / max(abs(float(baseline_metric)), 1e-12)
+            ), "tradeoff": True,
+        })
+    summary = {
+        "mode": "tradeoff", "search_mode": str(search_mode).lower(),
+        "targets": targets, "max_loss_percent": max_loss,
+        "baseline_metric": float(baseline_metric),
+        "frontier_count": len(top_results),
+        "recommended_index": next(index for index, item in enumerate(top_results) if item["label"] == "Balanced recommendation"),
+    }
+    if progress_callback is not None:
+        progress_callback("Tradeoff optimization complete.")
     if return_details:
-        result = current_player, current_output, damage_metric, winning_seed, top_results, summary
+        result = (recommended["player"], recommended["output"], recommended["metric"],
+                  recommended["seed"], top_results, summary)
         return result if return_top_results else result[:4]
-    return current_player, current_output
+    return recommended["player"], recommended["output"]
+
+
+def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
+                      ws_name, spell_name, base_action_type, min_tp, check_gear,
+                      starting_gearset, pdt_requirement, mdt_requirement,
+                      input_metric, print_swaps, next_best_percent, substat_specs,
+                      **kwargs):
+    """Compatibility alias for saved pre-tradeoff optimizer settings."""
+    return optimize_tradeoffs(
+        main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
+        spell_name, base_action_type, min_tp, check_gear, starting_gearset,
+        pdt_requirement, mdt_requirement, input_metric, print_swaps,
+        next_best_percent, substat_specs, **kwargs,
+    )
 
 
 def rank_weapon_skills(main_job, sub_job, master_level, buffs, abilities, enemy,

@@ -11,9 +11,74 @@ from new_gui_main import (
     _quick_cache_request, _run_overnight_cache_task, _with_weapon_overlays,
 )
 from simulation_cache import SimulationCache
+from profile_builder import (
+    ProfileRecipe, build_stat_set, child_seed, optimizer_scenario, weapon_category, weapon_overlays,
+)
+from wsdist import obvious_blacklist_suggestions, universal_blacklist_suggestions
 
 
 class ProfileReportHelperTests(unittest.TestCase):
+    def test_profile_builder_detects_weapon_overlays_and_categories(self):
+        empty = {"Name": "Empty", "Type": "None", "Skill Type": "None"}
+        overlays = [
+            {"name": "Weapon_SwordShield", "descriptor": {"role": "weapon"},
+             "specified_slots": {"main", "sub"}, "gearset": {"main": {"Name": "Sword", "Skill Type": "Sword"}, "sub": {"Name": "Shield", "Type": "Shield"}}},
+            {"name": "Weapon_DualWield", "descriptor": {"role": "weapon"},
+             "specified_slots": {"main", "sub"}, "gearset": {"main": {"Name": "Axe", "Skill Type": "Axe"}, "sub": {"Name": "Axe", "Type": "Weapon"}}},
+            {"name": "Weapon_GreatAxe", "descriptor": {"role": "weapon"},
+             "specified_slots": {"main", "sub"}, "gearset": {"main": {"Name": "Great Axe", "Skill Type": "Great Axe"}, "sub": empty}},
+        ]
+        detected = weapon_overlays(overlays)
+        self.assertEqual([item["name"] for item in detected], ["Weapon_DualWield", "Weapon_GreatAxe", "Weapon_SwordShield"])
+        self.assertEqual([weapon_category(item) for item in detected], ["DualWield", "TwoHanded", "SingleWield"])
+
+    def test_profile_builder_stat_recipe_respects_sir_cap_and_duplicate_rings(self):
+        empty = {"Name": "Empty", "Name2": "Empty", "Type": "None", "Skill Type": "None"}
+        slots = ("head", "neck", "ear1", "ear2", "body", "hands", "ring1", "ring2", "back", "waist", "legs", "feet")
+        candidates = {slot: [empty.copy()] for slot in slots}
+        candidates["head"].append({"Name": "SIR Helm", "Name2": "SIR Helm", "Spell interruption rate down": -50})
+        candidates["body"].append({"Name": "SIR Body", "Name2": "SIR Body", "Spell interruption rate down": -42})
+        ring = {"Name": "Rare Ring", "Name2": "Rare Ring", "Spell interruption rate down": -20, "Accessible Count": 1}
+        candidates["ring1"].append(ring)
+        candidates["ring2"].append(ring)
+        result = build_stat_set("SIR", candidates, ProfileRecipe("SIR", ("Spell interruption rate down",), (("Spell interruption rate down", 92),)))
+        self.assertEqual(result.equipment["head"]["Name"], "SIR Helm")
+        self.assertEqual(result.equipment["body"]["Name"], "SIR Body")
+        self.assertNotEqual(result.equipment["ring1"].get("Name"), result.equipment["ring2"].get("Name"))
+        self.assertEqual(child_seed(123, "WAR", "Tp_Default"), child_seed(123, "WAR", "Tp_Default"))
+
+    def test_profile_builder_optimizer_scenarios_follow_set_variant(self):
+        self.assertEqual(
+            optimizer_scenario("Tp_Default", 1000),
+            {"enemy": "Apex Toad", "pdt": 0, "mdt": 0, "dt": 0, "tp": 1000},
+        )
+        self.assertEqual(
+            optimizer_scenario("Savage_Hybrid_DualWield", 2000),
+            {"enemy": "Apex Knight Lugcrawler", "pdt": 50, "mdt": 25, "dt": 0, "tp": 2000},
+        )
+        self.assertEqual(
+            optimizer_scenario("Ukko_HighAcc", 3000)["enemy"],
+            "Apex Archaic Cogs",
+        )
+
+    def test_obvious_blacklist_requires_every_variant_to_be_dominated(self):
+        weak = {"Name": "Weak Helm", "Name2": "Weak Helm", "Type": "Armor", "Skill Type": "None", "Attack": 5}
+        strong = {"Name": "Strong Helm", "Name2": "Strong Helm", "Type": "Armor", "Skill Type": "None", "Attack": 8}
+        suggestions = obvious_blacklist_suggestions({"head": [weak, strong]})
+        self.assertEqual(suggestions, {"weak helm": {"strong helm"}})
+
+        upgraded_variant = {"Name": "Weak Helm", "Name2": "Weak Helm [Attack+10]", "Type": "Armor", "Skill Type": "None", "Attack": 10}
+        suggestions = obvious_blacklist_suggestions({"head": [weak, upgraded_variant, strong]})
+        self.assertNotIn("weak helm", suggestions)
+
+    def test_universal_blacklist_does_not_borrow_another_characters_upgrade(self):
+        weak = {"Name": "Shared Helm", "Name2": "Shared Helm", "Type": "Armor", "Skill Type": "None", "Attack": 5}
+        strong = {"Name": "Superior Helm +2", "Name2": "Superior Helm +2", "Type": "Armor", "Skill Type": "None", "Attack": 8}
+        suggestions = universal_blacklist_suggestions({
+            "character with +2": {"head": [weak, strong]},
+            "character without +2": {"head": [weak]},
+        })
+        self.assertNotIn("shared helm", suggestions)
     def test_quick_cache_request_ignores_inputs_unused_by_action(self):
         common = {
             "main_job": "mnk", "sub_job": "war", "master_level": 50,

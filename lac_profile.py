@@ -290,6 +290,63 @@ def prepare_managed_update(source: str, sets: dict[str, dict[str, dict]], *,
     return updated
 
 
+def prepare_profile_builder_update(source: str, sets: dict[str, dict[str, dict]], *,
+                                   defense_modes: tuple[str, ...] = ("None", "Dt", "Evasion", "MEVA")) -> str:
+    """Apply a complete Profile Builder catalog and its small LAC adapter.
+
+    Set tables remain source-preserving top-level entries so old profiles and
+    GearSetBuilder can continue reading them.  A durable comment marker makes
+    the managed ownership visible without touching unrelated Lua handlers.
+    """
+    updated = prepare_managed_update(source, sets, add_wsdist_cycle=False)
+    marker = "-- WSDIST-PROFILE-BUILDER v1"
+    if marker not in updated:
+        table_start, _entries, _table_end = parse_set_entries(updated)
+        updated = updated[:table_start + 1] + "\n    " + marker + "\n" + updated[table_start + 1:]
+    cycle_pattern = re.compile(
+        r"gcdisplay\.CreateCycle\(\s*['\"]MeleeSet['\"]\s*,\s*\{.*?\}\s*\)\s*;?",
+        re.DOTALL,
+    )
+    melee_cycle = "gcdisplay.CreateCycle('MeleeSet', { [1] = 'Default', [2] = 'Acc', [3] = 'HighAcc', [4] = 'Hybrid' });"
+    if cycle_pattern.search(updated):
+        updated = cycle_pattern.sub(melee_cycle, updated, count=1)
+    else:
+        initialize = re.search(r"^(?P<indent>\s*)gcinclude\.Initialize\([^\n]+\)\s*;?", updated, re.MULTILINE)
+        if initialize is None:
+            raise RuntimeError("Could not find gcinclude.Initialize() for Profile Builder cycles.")
+        updated = updated[:initialize.end()] + "\n" + initialize.group("indent") + melee_cycle + updated[initialize.end():]
+    defense_cycle = "gcdisplay.CreateCycle('DefenseSet', { " + ", ".join(
+        f"[{index}] = {_lua_quote(mode)}" for index, mode in enumerate(defense_modes, 1)
+    ) + " });"
+    if "CreateCycle('DefenseSet'" not in updated and 'CreateCycle("DefenseSet"' not in updated:
+        position = updated.find(melee_cycle)
+        updated = updated[:position + len(melee_cycle)] + "\n    " + defense_cycle + updated[position + len(melee_cycle):]
+    # Adapter applies the selected defense overlay after TP/idle handling.
+    adapter = (
+        "\n-- WSDIST-PROFILE-BUILDER defense adapter\n"
+        "local function applyWSDistDefenseSet()\n"
+        "    local defenseSet = gcdisplay.GetCycle('DefenseSet') or 'None';\n"
+        "    if (gcdisplay.GetToggle('DTset') == true) then defenseSet = 'Dt'; end\n"
+        "    if (defenseSet ~= 'None' and sets[defenseSet] ~= nil) then gFunc.EquipSet(sets[defenseSet]); end\n"
+        "end\n"
+    )
+    if "WSDIST-PROFILE-BUILDER defense adapter" not in updated:
+        anchor = re.search(r"profile\.HandleDefault\s*=\s*function\(\)", updated)
+        if anchor is None:
+            raise RuntimeError("Could not locate profile.HandleDefault for Profile Builder adapter.")
+        updated = updated[:anchor.start()] + adapter + "\n" + updated[anchor.start():]
+        # Apply just before HandleDefault closes: profiles conventionally call
+        # gcinclude.CheckDefault() near the end, so attach immediately after it.
+        start = updated.find("profile.HandleDefault", anchor.start() + len(adapter))
+        finish = updated.find("end", start)
+        check = updated.find("gcinclude.CheckDefault", start, finish + 2000)
+        if check >= 0:
+            line_end = updated.find("\n", check)
+            updated = updated[:line_end + 1] + "    applyWSDistDefenseSet();\n" + updated[line_end + 1:]
+    parse_set_entries(updated)
+    return updated
+
+
 def write_managed_sets(profile_path: Path, sets: dict[str, dict[str, dict]], *,
                        expected_hash: str, backup_dir: Path | None = None) -> tuple[Path, str]:
     """Write a TP/WS managed pair as one backed-up atomic transaction."""
@@ -306,6 +363,27 @@ def write_managed_sets(profile_path: Path, sets: dict[str, dict[str, dict]], *,
         "w", encoding="utf-8", newline="", dir=profile_path.parent,
         prefix=profile_path.name + ".", suffix=".tmp", delete=False,
     ) as handle:
+        temporary = Path(handle.name)
+        handle.write(updated)
+    os.replace(temporary, profile_path)
+    return backup, bridge_hash(updated)
+
+
+def write_profile_builder_sets(profile_path: Path, sets: dict[str, dict[str, dict]], *,
+                               expected_hash: str, defense_modes: tuple[str, ...] = ("None", "Dt", "Evasion", "MEVA"),
+                               backup_dir: Path | None = None) -> tuple[Path, str]:
+    """Atomically publish a Profile Builder catalog with stale-file protection."""
+    profile_path = profile_path.resolve()
+    source = profile_path.read_text(encoding="utf-8")
+    if expected_hash and bridge_hash(source) != expected_hash:
+        raise RuntimeError("LuAshitacast profile changed since WSDist imported it; refresh before saving.")
+    updated = prepare_profile_builder_update(source, sets, defense_modes=defense_modes)
+    backup_dir = backup_dir or profile_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / f"{profile_path.stem}_{__import__('datetime').datetime.now():%Y.%m.%d_%H.%M.%S_%f}.lua"
+    backup.write_text(source, encoding="utf-8", newline="")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=profile_path.parent,
+                                     prefix=profile_path.name + ".", suffix=".tmp", delete=False) as handle:
         temporary = Path(handle.name)
         handle.write(updated)
     os.replace(temporary, profile_path)

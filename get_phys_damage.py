@@ -17,7 +17,9 @@ def get_phys_damage(wpn_dmg, fstr_wpn, wsc, pdif, ftp, crit, crit_dmg, wsd, ws_b
     # "wsd_bonus" comes from specific damage boosts to weapon skills. Sources include REMA hidden damage boosts, REMA augments, and Ambuscade weapons. This applies to all hits of the weapon skill.
     #
     phys = int(  ((wpn_dmg + fstr_wpn + wsc)*ftp*(1+wsd*(n==0))*(1+ws_bonus)*(1+ws_trait)) + sneak_attack_bonus*(n==0) + trick_attack_bonus*(n==0) + climactic_flourish_bonus*(n==0) + striking_flourish_bonus*(n==0) + ternary_flourish_bonus*(n==0)) * pdif * (1 + crit*min(crit_dmg,1.0)) # "crit" = True/False
-    return(phys)
+    # A physical hit cannot heal the target.  Invalid/empty equipment used to
+    # leak a negative base term into average and overnight cache results.
+    return(max(0, phys))
 
 @njit(cache=True)
 def get_avg_phys_damage(wpn_dmg, fstr_wpn, wsc, pdif, ftp, crit_rate, crit_dmg, wsd, ws_bonus, ws_trait, sneak_attack_bonus=0, trick_attack_bonus=0 ,climactic_flourish_bonus=0, striking_flourish_bonus=0,ternary_flourish_bonus=0):
@@ -26,4 +28,4 @@ def get_avg_phys_damage(wpn_dmg, fstr_wpn, wsc, pdif, ftp, crit_rate, crit_dmg, 
     # https://www.bg-wiki.com/ffxi/Weapon_Skill_Damage
     #
     phys = int(  ((wpn_dmg + fstr_wpn + wsc)*ftp  * (1+wsd)*(1+ws_bonus)*(1+ws_trait)) + sneak_attack_bonus + trick_attack_bonus + climactic_flourish_bonus + striking_flourish_bonus + ternary_flourish_bonus) * pdif * (1 + min(crit_rate,1.0)*min(crit_dmg,1.0))
-    return(phys)
+    return(max(0, phys))
