@@ -4182,11 +4182,28 @@ class MainWindow(QMainWindow):
                     "This set uses a stat/cap recipe because it does not have a complete combat formula."
                 )
                 set_layout.addWidget(direct_label, 0, 3)
+            overlay = self._profile_builder_overlay_for_set(set_name, overlays)
+            if overlay:
+                overlay_items = overlay.get("gearset") or {}
+                specified_slots = set(overlay.get("specified_slots") or ())
+                weapon_box = QGroupBox(
+                    f"Fixed weapon setup · {overlay.get('name', 'overlay')}"
+                )
+                weapon_layout = QHBoxLayout(weapon_box)
+                weapon_layout.setContentsMargins(5, 3, 5, 3)
+                for slot in WEAPON_SLOTS:
+                    item = (
+                        overlay_items.get(slot, gear.Empty)
+                        if slot in specified_slots else gear.Empty
+                    )
+                    weapon_layout.addWidget(self._profile_builder_gear_tile(slot, item), 1)
+                set_layout.addWidget(weapon_box, 1, 0, 1, 4)
+            armor_row_offset = 2 if overlay else 1
             for index, slot in enumerate(ARMOR_SLOTS):
                 row, column = divmod(index, 3)
                 set_layout.addWidget(
                     self._profile_builder_gear_tile(slot, equipment.get(slot, gear.Empty)),
-                    row + 1, column,
+                    row + armor_row_offset, column,
                 )
             self.profile_builder_results_layout.addWidget(set_box)
 
