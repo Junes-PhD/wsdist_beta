@@ -2979,7 +2979,6 @@ class MainWindow(QMainWindow):
         # Active Buffs must be constructed before Profile Builder because the
         # profile recipes use its initialized controls while building.
         active_buffs_tab = self._buffs_tab()
-        job_abilities_tab = self._quick_abilities_tab()
         calculators_tab = self._calculators_tab()
         optimizer_tab = self._optimizer_tab()
         profile_builder_tab = self._profile_builder_tab()
@@ -2989,11 +2988,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(profile_builder_tab, "Profile Builder")
         self.tabs.addTab(self._results_tab(), "Results")
         self.tabs.addTab(aspirational_tab, "Aspirational")
-        self.tabs.addTab(job_abilities_tab, "Job Abilities")
         self.tabs.addTab(active_buffs_tab, "Active Buffs")
         self.tabs.addTab(calculators_tab, "Calculators")
-        self.tabs.addTab(self._profile_report_tab(), "Old LAC")
-        self.tabs.addTab(self._sets_tab(), "TP / WS Sets (legacy)")
         self.tabs.insertTab(1, self._build_dashboard_tab(), "Build Dashboard")
         tab_help = {
             "Gear Workspace": "Edit a single set or the TP → WS cycle, then launch reproducible simulations.",
@@ -3002,11 +2998,8 @@ class MainWindow(QMainWindow):
             "Profile Builder": "Turn optimized results into reviewed LuAshitacast profile sets.",
             "Results": "Browse, pin, rerun, compare, and export completed simulations.",
             "Aspirational": "Review modeled gear you do not currently own; never published automatically.",
-            "Job Abilities": "Enable job abilities and custom ability values used by every combat calculation.",
             "Active Buffs": "Configure active songs, rolls, GEO, food, debuffs, and test scenarios.",
             "Calculators": "Job abilities, magic damage, self-buff casting sets, and enfeebling checks.",
-            "Old LAC": "Legacy report view retained for migration and comparison.",
-            "TP / WS Sets (legacy)": "Compatibility pointer; live TP and WS editors are in Gear Workspace.",
         }
         for index in range(self.tabs.count()):
             label = self.tabs.tabText(index)
@@ -3020,7 +3013,7 @@ class MainWindow(QMainWindow):
     def _select_tab(self, name: str) -> bool:
         """Select a workspace tab by its stable display name."""
         wanted = str(name or "").strip().casefold()
-        wanted = {"ja": "job abilities", "job ability": "job abilities"}.get(wanted, wanted)
+        wanted = {"ja": "active buffs", "job ability": "active buffs", "job abilities": "active buffs"}.get(wanted, wanted)
         for index in range(self.tabs.count()):
             if self.tabs.tabText(index).casefold() == wanted:
                 self.tabs.setCurrentIndex(index)
@@ -4720,25 +4713,6 @@ class MainWindow(QMainWindow):
                 "use Split one search run to use more cores. 0 leaves one core free."
             )
 
-    def _sets_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        title = QLabel("TP / WS Sets moved to Gear Workspace")
-        title.setObjectName("sectionTitle")
-        layout.addWidget(title)
-        note = QLabel(
-            "This compatibility tab no longer owns a second copy of the gear editors. "
-            "Use Gear Workspace → TP → WS Cycle for the live TP and WS sets. "
-            "Saved character gear and old tab names continue to migrate safely."
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        open_workspace = QPushButton("Open Gear Workspace")
-        open_workspace.clicked.connect(lambda: self._select_tab("Gear Workspace"))
-        layout.addWidget(open_workspace)
-        layout.addStretch(1)
-        return tab
-
     def _results_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -5270,6 +5244,10 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(content)
         outer.addWidget(scroll, 1)
+
+        # Job abilities are part of the active combat state, so keep their
+        # controls with the other buffs instead of exposing a separate tab.
+        outer.addWidget(self._quick_abilities_tab(), 1)
         for control in (
             self.whm_enabled, self.shell_v, self.dia_combo, self.haste_combo,
             self.boost_combo, self.storm_combo, self.enhancing_skill, self.food_combo,
