@@ -55,9 +55,8 @@ from simulation_cache import SimulationCache, source_fingerprint
 from result_history import ResultHistory
 from wsdist_bridge import BridgeStore
 from lac_profile import (
-    prepare_managed_update, prepare_profile_builder_update, prepare_set_renames,
-    write_managed_sets, write_profile_builder_sets,
-    write_reload_request, write_renamed_profile,
+    prepare_profile_builder_update, write_profile_builder_sets,
+    write_reload_request,
 )
 from profile_builder import (
     GearSources, ProfileRecipe, bridge_candidates, build_stat_set, child_seed, pin_unmodeled_slots,
@@ -341,8 +340,6 @@ PROFILE_SLOT_MAP = {
     "back": "back",
 }
 WEAPON_SLOTS = ("main", "sub", "ranged", "ammo")
-MAIN_WEAPON_SLOTS = ("main", "sub")
-RANGED_WEAPON_SLOTS = ("ranged", "ammo")
 ITEM_LEVEL_FILTER_SLOTS = ("main", "head", "body", "hands", "legs", "feet")
 SUBSTAT_OPTIONS = (
     "None", "Magic Evasion", "Evasion", "Defense", "Magic Defense",
@@ -657,100 +654,6 @@ def _profile_set_descriptor(set_name: str, metadata: dict | None = None) -> dict
         "modifiers": list(supplied.get("modifiers") or modifiers),
         "ws_name": ws_name or None,
     }
-
-
-def _merge_profile_layers(label: str, layers: list[dict], *, role: str,
-                          ws_name: str | None = None) -> dict:
-    gearset = {slot: gear.Empty for slot in SLOTS}
-    specified, missing, incomplete, ineligible = set(), [], [], []
-    for layer in layers:
-        for slot in layer.get("specified_slots", set()):
-            gearset[slot] = layer["gearset"][slot]
-            specified.add(slot)
-        missing.extend(f"{layer['name']}.{slot}" for slot in layer.get("missing", ()))
-        incomplete.extend(f"{layer['name']}.{slot}" for slot in layer.get("incomplete", ()))
-        ineligible.extend(f"{layer['name']}.{slot}" for slot in layer.get("ineligible", ()))
-    descriptor = dict(layers[-1]["descriptor"])
-    descriptor["role"] = role
-    return {
-        "name": label,
-        "category": "TP" if role == "tp" else None,
-        "ws_name": ws_name,
-        "gearset": gearset,
-        "specified_slots": specified,
-        "missing": sorted(set(missing)),
-        "incomplete": sorted(set(incomplete)),
-        "ineligible": sorted(set(ineligible)),
-        "layers": [layer["name"] for layer in layers],
-        "descriptor": descriptor,
-    }
-
-
-def _compose_profile_payloads(raw_payloads: list[dict], defense: dict | None = None) -> list[dict]:
-    """Compose the common LAC TP/WS layer order into effective configurations."""
-    by_role = {}
-    for payload in raw_payloads:
-        descriptor = payload["descriptor"]
-        by_role.setdefault(descriptor["role"], []).append(payload)
-    tp_sets = by_role.get("tp", [])
-    ws_bases = by_role.get("ws_base", [])
-    ws_sets = [item for item in by_role.get("ws", []) if item["descriptor"].get("ws_name")]
-    tp_default = next((item for item in tp_sets if item["descriptor"]["variant"] == "Default" and not item["descriptor"]["modifiers"]), None)
-    ws_default = next((item for item in ws_bases if item["descriptor"]["variant"] == "Default"), None)
-    effective = []
-    for payload in tp_sets:
-        layers = []
-        if tp_default is not None and payload is not tp_default:
-            layers.append(tp_default)
-        layers.append(payload)
-        if defense is not None:
-            layers.append(defense)
-        effective.append(_merge_profile_layers(payload["name"], layers, role="tp"))
-    for payload in ws_sets:
-        descriptor = payload["descriptor"]
-        layers = []
-        if ws_default is not None:
-            layers.append(ws_default)
-        if descriptor["variant"] != "Default":
-            generic_variant = next((item for item in ws_bases if item["descriptor"]["variant"] == descriptor["variant"]), None)
-            if generic_variant is not None:
-                layers.append(generic_variant)
-        family_default = next((item for item in ws_sets
-                               if item["descriptor"]["family"].casefold() == descriptor["family"].casefold()
-                               and item["descriptor"]["variant"] == "Default"), None)
-        if family_default is not None and family_default is not payload:
-            layers.append(family_default)
-        layers.append(payload)
-        effective.append(_merge_profile_layers(
-            payload["name"], layers, role="ws", ws_name=descriptor["ws_name"]
-        ))
-    return effective
-
-
-def _with_weapon_overlays(payload: dict, main_weapon: dict | None,
-                          ranged_weapon: dict | None) -> dict:
-    """Apply explicitly-selected weapon-set slots over a profile armor set.
-
-    LuAshitacast profiles commonly equip a TP/WS armor set and then a separate
-    main/sub or ranged/ammo set.  Only slots explicitly named by those sets are
-    overlaid, so missing slots remain the armor set's values.
-    """
-    combined = dict(payload["gearset"])
-    for overlay, allowed_slots in ((main_weapon, MAIN_WEAPON_SLOTS),
-                                   (ranged_weapon, RANGED_WEAPON_SLOTS)):
-        if not overlay:
-            continue
-        specified = overlay.get("specified_slots", set())
-        for slot in allowed_slots:
-            if slot in specified:
-                combined[slot] = overlay["gearset"][slot]
-    result = dict(payload)
-    result["gearset"] = combined
-    labels = [entry["name"] for entry in (main_weapon, ranged_weapon) if entry]
-    provenance = list(payload.get("layers") or [payload.get("name", "As listed")])
-    provenance.extend(labels)
-    result["weapon_setup"] = " -> ".join(provenance)
-    return result
 
 
 def _base_equipment() -> dict[str, list[dict]]:
@@ -3469,8 +3372,8 @@ class MainWindow(QMainWindow):
                 self._self_buff_candidate_pool(),
                 recipe,
                 weapons={slot: self.quick_set.items[slot] for slot in WEAPON_SLOTS},
-                buffs=self._report_context()["buffs"],
-                abilities=self._report_context()["abilities"],
+                buffs=self._combat_context()["buffs"],
+                abilities=self._combat_context()["abilities"],
             )
             self._self_buff_result_gear = dict(built.equipment)
             self._clear_self_buff_preview()
@@ -6213,126 +6116,6 @@ class MainWindow(QMainWindow):
         except Exception as error:
             QMessageBox.critical(self, "Profile Builder", str(error))
 
-    def publish_optimizer_pair_to_lac(self):
-        profile = self._profile_for_job()
-        if profile is None or self.bridge_store.bridge_path is None:
-            QMessageBox.information(self, "LAC integration", "Load a character-specific LAC profile first.")
-            return
-        if (
-            self._last_completed_optimizer_action != "Combined TP + WS"
-            or self.best_tp_player is None
-            or self.best_ws_player is None
-        ):
-            QMessageBox.information(
-                self, "LAC integration",
-                "Run Combined TP + WS optimization before publishing a managed pair.",
-            )
-            return
-        ws_payload = self.report_ws_set_combo.currentData()
-        ws_name = self.report_ws_name_combo.currentText().strip() or self.ws_combo.currentText().strip()
-        if not ws_payload or not ws_name:
-            QMessageBox.information(self, "LAC integration", "Select the matching LAC WS family first.")
-            return
-        descriptor = ws_payload.get("descriptor") or {}
-        family = str(descriptor.get("family") or "").strip()
-        if not family or descriptor.get("role") != "ws":
-            QMessageBox.critical(
-                self, "LAC integration",
-                "The selected WS set has no safe dynamic family prefix for a WSDist variant.",
-            )
-            return
-        managed = {
-            "Tp_WSDist": {slot: self.best_tp_player.gearset[slot] for slot in ARMOR_SLOTS},
-            f"{family}_WSDist": {slot: self.best_ws_player.gearset[slot] for slot in ARMOR_SLOTS},
-        }
-        try:
-            job = str(profile.get("job") or "").upper()
-            path = self.bridge_store.profile_path(job)
-            source = path.read_text(encoding="utf-8")
-            updated = prepare_managed_update(source, managed)
-            diff = "".join(difflib.unified_diff(
-                source.splitlines(keepends=True), updated.splitlines(keepends=True),
-                fromfile=f"{path.name} (current)", tofile=f"{path.name} (WSDist)",
-            ))
-            if not self._confirm_profile_diff("Publish optimized LAC pair", diff):
-                return
-            backup, new_hash = write_managed_sets(
-                path, managed, expected_hash=str(profile.get("source_hash") or "")
-            )
-            profile["source_hash"] = new_hash
-            request = {
-                "schema_version": 2,
-                "character_key": (self.bridge_store.data.get("character") or {}).get("key"),
-                "job": job, "profile": path.name, "profile_hash": new_hash,
-                "set": f"Tp_WSDist + {family}_WSDist", "weapon_skill": ws_name,
-            }
-            write_reload_request(self.bridge_store.bridge_path.parent, request)
-            QMessageBox.information(
-                self, "LAC integration",
-                f"Published Tp_WSDist and {family}_WSDist to {path.name}.\n"
-                f"Backup: {backup.name}\nGearSetBuilder will validate and reload the active job.",
-            )
-        except Exception as error:
-            QMessageBox.critical(self, "LAC integration", str(error))
-
-    @staticmethod
-    def _canonical_lac_set_name(payload: dict) -> str | None:
-        descriptor = payload.get("descriptor") or {}
-        role = descriptor.get("role")
-        variant = str(descriptor.get("variant") or "Default")
-        modifiers = [re.sub(r"[^A-Za-z0-9]+", "", str(value))
-                     for value in descriptor.get("modifiers") or ()]
-        if role == "tp":
-            family = "Tp"
-        elif role == "ws_base":
-            family = "Ws"
-        elif role == "ws" and descriptor.get("ws_name"):
-            family = re.sub(r"[^A-Za-z0-9]+", "", str(descriptor["ws_name"]))
-        else:
-            return None
-        return "_".join([family, variant, *filter(None, modifiers)])
-
-    def preview_canonical_lac_migration(self):
-        profile = self._profile_for_job()
-        if profile is None or self.bridge_store.bridge_path is None:
-            QMessageBox.information(self, "LAC naming", "Load a character-specific profile first.")
-            return
-        renames = {}
-        for payload in self._profile_payloads():
-            canonical = self._canonical_lac_set_name(payload)
-            if canonical and canonical != payload["name"]:
-                renames[payload["name"]] = canonical
-        if not renames:
-            QMessageBox.information(self, "LAC naming", "This profile already uses the canonical combat-set convention.")
-            return
-        try:
-            job = str(profile.get("job") or "").upper()
-            path = self.bridge_store.profile_path(job)
-            source = path.read_text(encoding="utf-8")
-            updated = prepare_set_renames(source, renames)
-            diff = "".join(difflib.unified_diff(
-                source.splitlines(keepends=True), updated.splitlines(keepends=True),
-                fromfile=f"{path.name} (current)", tofile=f"{path.name} (canonical names)",
-            ))
-            if not self._confirm_profile_diff("Guided LAC naming migration", diff):
-                return
-            backup, new_hash = write_renamed_profile(
-                path, renames, expected_hash=str(profile.get("source_hash") or "")
-            )
-            profile["source_hash"] = new_hash
-            write_reload_request(self.bridge_store.bridge_path.parent, {
-                "schema_version": 2,
-                "character_key": (self.bridge_store.data.get("character") or {}).get("key"),
-                "job": job, "profile": path.name, "profile_hash": new_hash,
-                "set": "canonical naming migration",
-            })
-            QMessageBox.information(
-                self, "LAC naming",
-                f"Renamed {len(renames)} combat sets in {path.name}.\nBackup: {backup.name}",
-            )
-        except Exception as error:
-            QMessageBox.critical(self, "LAC naming", str(error))
-
     def _profile_for_job(self) -> dict | None:
         selected = self.profile_job_combo.currentText().casefold()
         selected_code = JOBS.get(self.profile_job_combo.currentText(), self.profile_job_combo.currentText()).casefold()
@@ -6410,181 +6193,6 @@ class MainWindow(QMainWindow):
                 "cap_report": copy.deepcopy(profile_set.get("cap_report") or {}),
             })
         return payloads
-
-    def _effective_profile_payloads(self) -> list[dict]:
-        raw = self._profile_payloads()
-        defense = self.report_defense_combo.currentData() if hasattr(self, "report_defense_combo") else None
-        effective = _compose_profile_payloads(raw, defense)
-        main_weapon = self.report_main_weapon_combo.currentData() if hasattr(self, "report_main_weapon_combo") else None
-        ranged_weapon = self.report_ranged_weapon_combo.currentData() if hasattr(self, "report_ranged_weapon_combo") else None
-        return [
-            _with_weapon_overlays(
-                payload, main_weapon, ranged_weapon,
-            )
-            for payload in effective
-        ]
-
-    def _populate_profile_report(self, *_args):
-        if not hasattr(self, "profile_job_combo"):
-            return
-        profiles = self.bridge_store.profile_records() if self.bridge_store.data else []
-        jobs = []
-        for profile in profiles:
-            code = str(profile.get("job", "")).upper()
-            label = next((name for name, value in JOBS.items() if value.upper() == code), code)
-            if label and label not in jobs:
-                jobs.append(label)
-        current = self.profile_job_combo.currentText()
-        self.profile_job_combo.blockSignals(True)
-        self.profile_job_combo.clear()
-        self.profile_job_combo.addItems(sorted(jobs))
-        if current in jobs:
-            self.profile_job_combo.setCurrentText(current)
-        elif self.main_job.currentText() in jobs:
-            self.profile_job_combo.setCurrentText(self.main_job.currentText())
-        self.profile_job_combo.blockSignals(False)
-        # The legacy report widgets are no longer part of the application.
-        # Keep Profile Builder's job selector usable without requiring
-        # controls that only existed on the removed Old LAC tab.
-        if not all(hasattr(self, name) for name in (
-            "report_tp_combo", "report_ws_set_combo", "report_main_weapon_combo",
-            "report_ranged_weapon_combo", "report_defense_combo",
-            "profile_diagnostic_table",
-        )):
-            return
-        payloads = self._profile_payloads()
-        self.report_tp_combo.blockSignals(True)
-        self.report_ws_set_combo.blockSignals(True)
-        self.report_main_weapon_combo.blockSignals(True)
-        self.report_ranged_weapon_combo.blockSignals(True)
-        self.report_defense_combo.blockSignals(True)
-        current_main_weapon = self.report_main_weapon_combo.currentText()
-        current_ranged_weapon = self.report_ranged_weapon_combo.currentText()
-        current_defense = self.report_defense_combo.currentText()
-        self.report_tp_combo.clear()
-        self.report_ws_set_combo.clear()
-        self.report_main_weapon_combo.clear()
-        self.report_ranged_weapon_combo.clear()
-        self.report_defense_combo.clear()
-        self.report_main_weapon_combo.addItem("None (use gear set as listed)", None)
-        self.report_ranged_weapon_combo.addItem("None (use gear set as listed)", None)
-        self.report_defense_combo.addItem("None", None)
-        for payload in payloads:
-            if payload["descriptor"]["role"] == "weapon" and set(payload["specified_slots"]) & set(MAIN_WEAPON_SLOTS):
-                self.report_main_weapon_combo.addItem(payload["name"], payload)
-            if payload["descriptor"]["role"] == "weapon" and set(payload["specified_slots"]) & set(RANGED_WEAPON_SLOTS):
-                self.report_ranged_weapon_combo.addItem(payload["name"], payload)
-            if payload["descriptor"]["role"] == "defense":
-                self.report_defense_combo.addItem(payload["name"], payload)
-        if current_main_weapon:
-            self.report_main_weapon_combo.setCurrentText(current_main_weapon)
-        elif self.report_main_weapon_combo.count() > 1:
-            self.report_main_weapon_combo.setCurrentIndex(1)
-        if current_ranged_weapon:
-            self.report_ranged_weapon_combo.setCurrentText(current_ranged_weapon)
-        elif self.report_ranged_weapon_combo.count() > 1:
-            self.report_ranged_weapon_combo.setCurrentIndex(1)
-        if current_defense:
-            self.report_defense_combo.setCurrentText(current_defense)
-        self.report_tp_combo.blockSignals(False)
-        self.report_ws_set_combo.blockSignals(False)
-        self.report_main_weapon_combo.blockSignals(False)
-        self.report_ranged_weapon_combo.blockSignals(False)
-        self.report_defense_combo.blockSignals(False)
-        effective = self._effective_profile_payloads()
-        for payload in effective:
-            if payload["descriptor"]["role"] == "tp":
-                self.report_tp_combo.addItem(payload["name"], payload)
-            elif payload["descriptor"]["role"] == "ws":
-                self.report_ws_set_combo.addItem(payload["name"], payload)
-        self._populate_profile_diagnostics(payloads)
-        self._refresh_selected_report_sets()
-        reportable_count = len(effective)
-        bridge_errors = list(self.bridge_store.data.get("profile_errors") or ())
-        error_suffix = f" {len(bridge_errors)} exporter profile error(s) also require attention." if bridge_errors else ""
-        if reportable_count:
-            self.profile_report_status.setText(
-                f"Built {reportable_count} effective TP/WS configurations from {len(payloads)} raw LAC sets."
-                + error_suffix
-            )
-        else:
-            self.profile_report_status.setText(
-                "No readable TP or named WS configurations found for this profile." + error_suffix
-            )
-
-    def _populate_profile_diagnostics(self, payloads: list[dict]):
-        if not hasattr(self, "profile_diagnostic_table"):
-            return
-        table = self.profile_diagnostic_table
-        table.setRowCount(0)
-        for payload in payloads:
-            row = table.rowCount()
-            table.insertRow(row)
-            descriptor = payload["descriptor"]
-            problems = []
-            if payload["missing"]:
-                problems.append("unresolved: " + ", ".join(payload["missing"]))
-            if payload["incomplete"]:
-                problems.append("incomplete model: " + ", ".join(payload["incomplete"]))
-            if payload.get("ineligible"):
-                problems.append("job-ineligible: " + ", ".join(payload["ineligible"]))
-            if payload.get("unknown"):
-                problems.append("unknown stats: " + ", ".join(map(str, payload["unknown"])))
-            status = "Blocked" if problems else "Ready"
-            notes = "; ".join(problems) or (
-                "Composed layer" if descriptor["role"] in {"tp", "ws", "ws_base"}
-                else "Diagnostic only"
-            )
-            values = [
-                payload["name"], descriptor["role"], descriptor["variant"],
-                str(len(payload["specified_slots"])), status, notes,
-            ]
-            for column, value in enumerate(values):
-                table.setItem(row, column, QTableWidgetItem(value))
-        selected_job = self.profile_job_combo.currentText().upper()
-        for bridge_error in self.bridge_store.data.get("profile_errors") or ():
-            error_job = str(bridge_error.get("job") or "").upper()
-            if error_job and selected_job and error_job != selected_job:
-                continue
-            row = table.rowCount()
-            table.insertRow(row)
-            values = [
-                "<profile load>", "error", "", "0", "Blocked",
-                str(bridge_error.get("error") or "Profile export failed"),
-            ]
-            for column, value in enumerate(values):
-                table.setItem(row, column, QTableWidgetItem(value))
-
-    def _refresh_selected_report_sets(self, *_args):
-        payload = self.report_ws_set_combo.currentData()
-        self.report_ws_name_combo.blockSignals(True)
-        self.report_ws_name_combo.clear()
-        self.report_ws_name_combo.addItems(ALL_WS_NAMES)
-        if payload and payload.get("ws_name"):
-            self.report_ws_name_combo.setCurrentText(payload["ws_name"])
-        self.report_ws_name_combo.blockSignals(False)
-
-    def _effective_profile_payload(self, payload: dict | None) -> dict | None:
-        if not payload:
-            return None
-        return _with_weapon_overlays(
-            payload, self.report_main_weapon_combo.currentData(),
-            self.report_ranged_weapon_combo.currentData(),
-        )
-
-    def _profile_weapon_changed(self, *_args):
-        self._populate_profile_report()
-        if self.profile_job_combo.currentText():
-            self.profile_report_status.setText(
-                "Weapon overlay changed. Run the report again to evaluate the selected setup."
-            )
-
-    def _profile_defense_changed(self, *_args):
-        self._populate_profile_report()
-        if self.profile_job_combo.currentText():
-            self.profile_report_status.setText(
-                "Defense overlay changed. Effective TP configurations were rebuilt."
-            )
 
     @staticmethod
     def _add_stats(target: dict, values: dict, multiplier: float = 1.0):
@@ -6679,7 +6287,7 @@ class MainWindow(QMainWindow):
                 target[stat] = target.get(stat, 0) + value
         return merged
 
-    def _report_context(self, use_profile_job: bool = False) -> dict:
+    def _combat_context(self) -> dict:
         structured, debuffs = self._structured_buffs()
         custom_buffs = self._json_object(self.buffs_json, "Additional buffs") if hasattr(self, "buffs_json") else {}
         abilities = self._json_object(self.abilities_json, "Abilities") if hasattr(self, "abilities_json") else {}
@@ -6689,15 +6297,9 @@ class MainWindow(QMainWindow):
         abilities.setdefault("Storm spell", self.storm_combo.currentText() if self.whm_enabled.isChecked() else "None")
         abilities.setdefault("Enemy Resist Rank", "100%")
         abilities.setdefault("99999", False)
-        main_job_name = self.profile_job_combo.currentText() if use_profile_job else self.main_job.currentText()
+        main_job_name = self.main_job.currentText()
         main_job = JOBS[main_job_name]
         master_level = self.master_level.value()
-        if use_profile_job:
-            levels = ((self.bridge_store.data.get("character") or {}).get("metadata") or {}).get("master_levels") or {}
-            try:
-                master_level = max(0, min(50, int(levels.get(main_job, master_level))))
-            except (TypeError, ValueError):
-                pass
         return {
             "main_job": main_job,
             "sub_job": JOBS.get(self.sub_job.currentText(), "None"),
@@ -6706,163 +6308,6 @@ class MainWindow(QMainWindow):
             "enemy": {name: spin.value() for name, spin in self.enemy_spins.items()},
             "debuffs": debuffs, "tp_value": self.tp_value.value(),
         }
-
-    def run_profile_report(self):
-        if self.report_thread and self.report_thread.isRunning():
-            return
-        payloads = self._effective_profile_payloads()
-        if not payloads:
-            QMessageBox.information(self, "LAC report", "No reportable sets were found for this profile.")
-            return
-        try:
-            context = self._report_context(use_profile_job=True)
-        except Exception as error:
-            QMessageBox.critical(self, "LAC report", str(error))
-            return
-        self.profile_report_table.setRowCount(0)
-        self.profile_report_status.setText("Running profile report…")
-        self.cancel_profile_report_button.setEnabled(True)
-        self.character_combo.setEnabled(False)
-        return
-
-    def stop_profile_report(self):
-        if self.report_thread and self.report_thread.isRunning():
-            self.report_thread.request_stop()
-            self.cancel_profile_report_button.setEnabled(False)
-            self.profile_report_status.setText("Stopping profile report after the current calculation...")
-
-    @staticmethod
-    def _report_value(value, decimals=1) -> str:
-        if value in (None, ""):
-            return "—"
-        return f"{float(value):,.{decimals}f}"
-
-    def _profile_report_done(self, rows: list[dict]):
-        self.cancel_profile_report_button.setEnabled(False)
-        self.character_combo.setEnabled(bool(self.character_paths))
-        self._profile_report_rows = list(rows)
-        self.profile_report_table.setSortingEnabled(False)
-        self.profile_report_table.setRowCount(0)
-        for row in rows:
-            index = self.profile_report_table.rowCount()
-            self.profile_report_table.insertRow(index)
-            status = row.get("error") or "Ready"
-            values = [
-                row["name"], row["category"], row["ws_name"] or "—",
-                row["weapon_setup"], self._report_value(row["tp_dps"]),
-                self._report_value(row["time_to_ws"]),
-                self._report_value(row["ws_damage"], 0), self._report_value(row["total_dps"]), status,
-            ]
-            for column, value in enumerate(values):
-                numeric = (
-                    row["tp_dps"], row["time_to_ws"], row["ws_damage"], row["total_dps"]
-                )[column - 4] if 4 <= column <= 7 else None
-                cell = NumericTableWidgetItem(value, numeric) if 4 <= column <= 7 else QTableWidgetItem(value)
-                if row.get("error"):
-                    cell.setToolTip(row["error"])
-                    cell.setForeground(QColor("#b42318"))
-                elif column == 8:
-                    cell.setForeground(QColor("#137333"))
-                if column == 0:
-                    cell.setData(Qt.ItemDataRole.UserRole, row)
-                self.profile_report_table.setItem(index, column, cell)
-        self.profile_report_table.setSortingEnabled(True)
-        errors = sum(1 for row in rows if row.get("error"))
-        self.profile_report_status.setText(
-            f"Report complete: {len(rows) - errors}/{len(rows)} sets evaluated" +
-            (f"; {errors} blocked/error rows are listed in Status." if errors else ".")
-        )
-        valid = [row for row in rows if not row.get("error")]
-        best_cycle = max(valid, key=lambda row: float(row.get("total_dps") or 0), default=None)
-        best_ws = max(valid, key=lambda row: float(row.get("ws_damage") or 0), default=None)
-        if best_cycle is None:
-            self.profile_report_summary.setText(
-                "No complete result rows are available. Open Raw-set diagnostics for the blocking reason."
-            )
-        else:
-            summary = (
-                f"Best cycle DPS: {best_cycle['name']} ({float(best_cycle['total_dps']):,.1f})"
-            )
-            if best_ws is not None:
-                summary += (
-                    f"  ·  Best WS damage: {best_ws['name']} "
-                    f"({float(best_ws['ws_damage']):,.0f})"
-                )
-            self.profile_report_summary.setText(summary)
-
-    def _profile_report_row_selected(self):
-        indexes = self.profile_report_table.selectedIndexes()
-        if not indexes:
-            return
-        row_index = indexes[0].row()
-        item = self.profile_report_table.item(row_index, 0)
-        row = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
-        if not isinstance(row, dict):
-            return
-        if row.get("error"):
-            self.profile_report_summary.setText(
-                f"{row['name']} is blocked: {row['error']}"
-            )
-            return
-        self.profile_report_summary.setText(
-            f"Selected: {row['name']}  ·  {row['category']}  ·  "
-            f"TP DPS {float(row.get('tp_dps') or 0):,.1f}  ·  "
-            f"TP time {float(row.get('time_to_ws') or 0):,.2f}s  ·  "
-            f"WS damage {float(row.get('ws_damage') or 0):,.0f}  ·  "
-            f"Cycle DPS {float(row.get('total_dps') or 0):,.1f}"
-        )
-
-    def _profile_report_failed(self, message: str):
-        self.cancel_profile_report_button.setEnabled(False)
-        self.character_combo.setEnabled(bool(self.character_paths))
-        self.profile_report_status.setText(f"Report failed: {message}")
-        QMessageBox.critical(self, "LAC report", message)
-
-    def _profile_report_stopped(self):
-        self.cancel_profile_report_button.setEnabled(False)
-        self.character_combo.setEnabled(bool(self.character_paths))
-        self.profile_report_status.setText("Profile report stopped.")
-
-    def run_selected_profile_report(self):
-        tp_payload = self.report_tp_combo.currentData()
-        ws_payload = self.report_ws_set_combo.currentData()
-        ws_name = self.report_ws_name_combo.currentText().strip()
-        if not tp_payload or not ws_payload or not ws_name:
-            QMessageBox.information(self, "LAC report", "Select a TP/DT/hybrid set, WS set, and weapon skill.")
-            return
-        try:
-            context = self._report_context(use_profile_job=True)
-            problems = [
-                *tp_payload.get("missing", ()), *tp_payload.get("incomplete", ()),
-                *tp_payload.get("ineligible", ()),
-                *ws_payload.get("missing", ()), *ws_payload.get("incomplete", ()),
-                *ws_payload.get("ineligible", ()),
-            ]
-            if problems:
-                raise ValueError("Selected effective sets contain unresolved data: " + ", ".join(problems))
-            ws_type = "ranged" if ws_name in (
-                WS_BY_SKILL.get("Marksmanship", []) + WS_BY_SKILL.get("Archery", [])
-            ) else "melee"
-            enemy = _report_enemy(context["enemy"], context.get("debuffs"))
-            tp_player = create_player.create_player(
-                context["main_job"], context["sub_job"], context["master_level"],
-                gearset=tp_payload["gearset"], buffs=context["buffs"], abilities=context["abilities"],
-            )
-            ws_player = create_player.create_player(
-                context["main_job"], context["sub_job"], context["master_level"],
-                gearset=ws_payload["gearset"], buffs=context["buffs"], abilities=context["abilities"],
-            )
-            total_dps, cycle = actions.average_tp_ws_cycle(
-                tp_player, ws_player, enemy, ws_name,
-                context["tp_value"], ws_type,
-            )
-            self.selected_report_result.setText(
-                f"{tp_payload['name']} → {ws_payload['name']} using {ws_name}: "
-                f"TP time {cycle[2]:,.2f}s, WS damage {cycle[3]:,.0f}, "
-                f"total DPS {total_dps:,.1f}."
-            )
-        except Exception as error:
-            QMessageBox.critical(self, "Selected report", str(error))
 
     def items_for_slot(self, slot: str) -> list[dict]:
         job = JOBS[self.main_job.currentText()]
@@ -7622,7 +7067,7 @@ class MainWindow(QMainWindow):
         return value
 
     def _context(self, gearset: dict | None = None):
-        context = self._report_context()
+        context = self._combat_context()
         buffs = context["buffs"]
         abilities = context["abilities"]
         player = create_player.create_player(
@@ -8116,7 +7561,7 @@ class MainWindow(QMainWindow):
 
     def _build_overnight_tasks(self, scenario_names: list[str] | None = None) -> list[dict]:
         """Build cache tasks for selected enemies, sets, and one-item variants."""
-        context = self._report_context()
+        context = self._combat_context()
         task_context = {
             "main_job": context["main_job"], "sub_job": context["sub_job"],
             "master_level": context["master_level"],
