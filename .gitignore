@@ -5,6 +5,7 @@ defaults.txt
 *.pkg
 *.pyc
 __pycache__/
+.cache/
 *.nbi
 *.nbc
 *.pyz
