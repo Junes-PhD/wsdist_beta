@@ -5,10 +5,11 @@ from pathlib import Path
 import gear
 from create_player import create_enemy
 from enemies import preset_enemies
-from new_gui_main import (
-    REMA_WEAPON_NAMES, _aspirational_catalog, _compose_profile_payloads,
+from qt_gui_main import (
+    AUTO_WEAPON_TYPE, REMA_WEAPON_NAMES, WS_BY_SKILL, _aspirational_catalog, _compose_profile_payloads,
     _is_r15_variant, _profile_category, _profile_set_descriptor, _profile_ws_name,
     _quick_cache_request, _run_overnight_cache_task, _with_weapon_overlays,
+    magic_damage_spell_choices, weapon_skill_choices,
 )
 from simulation_cache import SimulationCache
 from profile_builder import (
@@ -18,6 +19,25 @@ from wsdist import obvious_blacklist_suggestions, universal_blacklist_suggestion
 
 
 class ProfileReportHelperTests(unittest.TestCase):
+    def test_magic_damage_choices_are_scoped_to_formula(self):
+        self.assertIn("Fire VI", magic_damage_spell_choices("Elemental Magic"))
+        self.assertNotIn("Fire VI", magic_damage_spell_choices("Quick Draw"))
+        self.assertIn("Earth Shot", magic_damage_spell_choices("Quick Draw"))
+        self.assertIn("Katon: San", magic_damage_spell_choices("Ninjutsu"))
+        self.assertEqual(magic_damage_spell_choices("Ranged Attack"), ["None", "Ranged Attack"])
+
+    def test_weapon_skill_choices_follow_explicit_type(self):
+        quick_set = {
+            "main": {"Skill Type": "Sword"},
+            "ranged": {"Skill Type": "None"},
+        }
+        self.assertEqual(weapon_skill_choices("Marksmanship", quick_set), [
+            "None", *WS_BY_SKILL["Marksmanship"]
+        ])
+        self.assertIn("Last Stand", weapon_skill_choices("Marksmanship", quick_set))
+        self.assertNotIn("Savage Blade", weapon_skill_choices("Marksmanship", quick_set))
+        self.assertIn("Savage Blade", weapon_skill_choices(AUTO_WEAPON_TYPE, quick_set))
+
     def test_profile_builder_detects_weapon_overlays_and_categories(self):
         empty = {"Name": "Empty", "Type": "None", "Skill Type": "None"}
         overlays = [
@@ -62,14 +82,44 @@ class ProfileReportHelperTests(unittest.TestCase):
         )
 
     def test_obvious_blacklist_requires_every_variant_to_be_dominated(self):
-        weak = {"Name": "Weak Helm", "Name2": "Weak Helm", "Type": "Armor", "Skill Type": "None", "Attack": 5}
-        strong = {"Name": "Strong Helm", "Name2": "Strong Helm", "Type": "Armor", "Skill Type": "None", "Attack": 8}
+        weak = {"Name": "Weak Helm", "Name2": "Weak Helm", "Type": "Armor", "Skill Type": "None", "Attack": 5, "Model Complete": True}
+        strong = {"Name": "Strong Helm", "Name2": "Strong Helm", "Type": "Armor", "Skill Type": "None", "Attack": 8, "Model Complete": True}
         suggestions = obvious_blacklist_suggestions({"head": [weak, strong]})
         self.assertEqual(suggestions, {"weak helm": {"strong helm"}})
 
-        upgraded_variant = {"Name": "Weak Helm", "Name2": "Weak Helm [Attack+10]", "Type": "Armor", "Skill Type": "None", "Attack": 10}
+        upgraded_variant = {"Name": "Weak Helm", "Name2": "Weak Helm [Attack+10]", "Type": "Armor", "Skill Type": "None", "Attack": 10, "Model Complete": True}
         suggestions = obvious_blacklist_suggestions({"head": [weak, upgraded_variant, strong]})
         self.assertNotIn("weak helm", suggestions)
+
+    def test_obvious_blacklist_skips_special_and_incomplete_items(self):
+        weak = {"Name": "Weak Helm", "Name2": "Weak Helm", "Type": "Armor", "Skill Type": "None", "Attack": 5, "Model Complete": True}
+        strong = {"Name": "Strong Helm", "Name2": "Strong Helm", "Type": "Armor", "Skill Type": "None", "Attack": 8, "Model Complete": True}
+        conditional = {**weak, "Name": "Conditional Helm", "Name2": "Conditional Helm", "Conditional Effects": ["Campaign: Attack +20"]}
+        incomplete = {**weak, "Name": "Incomplete Helm", "Name2": "Incomplete Helm", "Model Complete": False}
+        self.assertNotIn("conditional helm", obvious_blacklist_suggestions({"head": [conditional, strong]}))
+        self.assertNotIn("incomplete helm", obvious_blacklist_suggestions({"head": [incomplete, strong]}))
+
+    def test_blacklist_dominance_ignores_bridge_metadata(self):
+        cosmetic = {
+            "Name": "Cosmetic Weapon", "Name2": "Cosmetic Weapon", "Type": "Weapon",
+            "Skill Type": "Scythe", "Model Complete": True, "Resource Flags": 1,
+        }
+        normal = {
+            "Name": "Normal Weapon", "Name2": "Normal Weapon", "Type": "Weapon",
+            "Skill Type": "Scythe", "Model Complete": True, "Resource Flags": 2,
+        }
+        self.assertEqual(obvious_blacklist_suggestions({"main": [cosmetic, normal]}), {})
+
+    def test_blacklist_does_not_auto_hide_zero_stat_gear(self):
+        cosmetic = {
+            "Name": "Costume Scythe", "Name2": "Costume Scythe", "Type": "Weapon",
+            "Skill Type": "Scythe", "Model Complete": True,
+        }
+        stronger = {
+            "Name": "Modeled Scythe", "Name2": "Modeled Scythe", "Type": "Weapon",
+            "Skill Type": "Scythe", "Model Complete": True, "DMG": 100, "Delay": 500,
+        }
+        self.assertNotIn("costume scythe", obvious_blacklist_suggestions({"main": [cosmetic, stronger]}))
 
     def test_universal_blacklist_does_not_borrow_another_characters_upgrade(self):
         weak = {"Name": "Shared Helm", "Name2": "Shared Helm", "Type": "Armor", "Skill Type": "None", "Attack": 5}
@@ -93,6 +143,15 @@ class ProfileReportHelperTests(unittest.TestCase):
             ws_name="Shijin Spiral", spell_name="Blizzard VI",
         )
         self.assertEqual(first, second)
+
+    def test_quick_tp_action_alias_uses_the_attack_request(self):
+        common = {
+            "main_job": "mnk", "sub_job": "war", "master_level": 50,
+            "buffs": {}, "abilities": {}, "enemy": {"Defense": 100},
+        }
+        alias = _quick_cache_request("tp", {"main": gear.Spharai}, **common, tp=1000)
+        canonical = _quick_cache_request("attack", {"main": gear.Spharai}, **common, tp=1000)
+        self.assertEqual(alias, canonical)
 
     def test_profile_ws_name_matches_compact_and_short_names(self):
         self.assertEqual(_profile_ws_name("Laststand_Default"), "Last Stand")

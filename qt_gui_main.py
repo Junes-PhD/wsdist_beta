@@ -7,7 +7,6 @@ The calculation and optimizer modules are reused without formula changes.
 
 from __future__ import annotations
 
-import ast
 import csv
 import copy
 import difflib
@@ -165,24 +164,36 @@ JOB_ABILITY_DEFINITIONS = (
 )
 
 
-def _legacy_literal(attribute: str, fallback):
-    """Read data declarations from the legacy UI without importing Tk."""
-    try:
-        source = (APP_DIR / "gui_main.py").read_text(encoding="utf-8")
-        for node in ast.walk(ast.parse(source)):
-            if isinstance(node, ast.Assign) and any(
-                isinstance(target, ast.Attribute) and target.attr == attribute
-                for target in node.targets
-            ):
-                return ast.literal_eval(node.value)
-    except (OSError, SyntaxError, ValueError):
-        pass
-    return fallback
-
-
-WS_BY_SKILL = _legacy_literal("ws_dict", {"None": ["None"]})
-SPELLS_BY_JOB = _legacy_literal("spells_dict", {})
-REMA_WEAPON_NAMES = frozenset(_legacy_literal("rema_weapons", ()))
+WS_BY_SKILL = {
+    "Katana": ["Blade: Retsu", "Blade: Teki", "Blade: To", "Blade: Chi", "Blade: Ei", "Blade: Jin", "Blade: Ten", "Blade: Ku", "Blade: Yu", "Blade: Metsu", "Blade: Kamu", "Blade: Hi", "Blade: Shun", "Zesho Meppo"],
+    "Great Katana": ["Tachi: Enpi", "Tachi: Goten", "Tachi: Kagero", "Tachi: Jinpu", "Tachi: Koki", "Tachi: Yukikaze", "Tachi: Gekko", "Tachi: Kasha", "Tachi: Ageha", "Tachi: Kaiten", "Tachi: Rana", "Tachi: Fudo", "Tachi: Shoha", "Tachi: Mumei"],
+    "Dagger": ["Viper Bite", "Dancing Edge", "Shark Bite", "Evisceration", "Aeolian Edge", "Mercy Stroke", "Mandalic Stab", "Mordant Rime", "Pyrrhic Kleos", "Rudra's Storm", "Exenterator", "Ruthless Stroke"],
+    "Sword": ["Fast Blade", "Fast Blade II", "Burning Blade", "Red Lotus Blade", "Seraph Blade", "Circle Blade", "Swift Blade", "Savage Blade", "Sanguine Blade", "Knights of Round", "Death Blossom", "Expiacion", "Chant du Cygne", "Requiescat", "Imperator"],
+    "Scythe": ["Slice", "Dark Harvest", "Shadow of Death", "Nightmare Scythe", "Spinning Scythe", "Guillotine", "Cross Reaper", "Spiral Hell", "Infernal Scythe", "Catastrophe", "Quietus", "Insurgency", "Entropy", "Origin"],
+    "Great Sword": ["Hard Slash", "Freezebite", "Shockwave", "Sickle Moon", "Spinning Slash", "Ground Strike", "Herculean Slash", "Resolution", "Scourge", "Dimidiation", "Torcleaver", "Fimbulvetr"],
+    "Club": ["Shining Strike", "Seraph Strike", "Skullbreaker", "True Strike", "Judgment", "Hexa Strike", "Black Halo", "Randgrith", "Exudation", "Mystic Boon", "Realmrazer", "Dagda"],
+    "Polearm": ["Double Thrust", "Thunder Thrust", "Raiden Thrust", "Penta Thrust", "Wheeling Thrust", "Impulse Drive", "Sonic Thrust", "Geirskogul", "Drakesbane", "Camlann's Torment", "Stardiver", "Diarmuid"],
+    "Staff": ["Heavy Swing", "Rock Crusher", "Earth Crusher", "Starburst", "Sunburst", "Shell Crusher", "Full Swing", "Cataclysm", "Retribution", "Gate of Tartarus", "Omniscience", "Vidohunir", "Garland of Bliss", "Shattersoul", "Oshala"],
+    "Great Axe": ["Iron Tempest", "Shield Break", "Armor Break", "Weapon Break", "Raging Rush", "Full Break", "Steel Cyclone", "Fell Cleave", "Metatron Torment", "King's Justice", "Ukko's Fury", "Upheaval", "Disaster"],
+    "Axe": ["Raging Axe", "Spinning Axe", "Rampage", "Calamity", "Mistral Axe", "Decimation", "Bora Axe", "Onslaught", "Primal Rend", "Cloudsplitter", "Ruinator", "Blitz"],
+    "Archery": ["Flaming Arrow", "Piercing Arrow", "Dulling Arrow", "Sidewinder", "Blast Arrow", "Empyreal Arrow", "Refulgent Arrow", "Namas Arrow", "Jishnu's Radiance", "Apex Arrow", "Sarv"],
+    "Marksmanship": ["Hot Shot", "Split Shot", "Sniper Shot", "Slug Shot", "Blast Shot", "Detonator", "Coronach", "Leaden Salute", "Trueflight", "Wildfire", "Last Stand", "Terminus"],
+    "Hand-to-Hand": ["Combo", "One Inch Punch", "Raging Fists", "Spinning Attack", "Howling Fist", "Dragon Kick", "Asuran Fists", "Tornado Kick", "Ascetic's Fury", "Stringing Pummel", "Final Heaven", "Victory Smite", "Shijin Spiral", "Maru Kala", "Dragon Blow"],
+    "None": ["None"],
+}
+REMA_WEAPON_NAMES = frozenset({
+    "Amanomurakumo", "Annihilator", "Apocalypse", "Bravura", "Excalibur", "Gungnir", "Guttler", "Kikoku", "Mandau", "Mjollnir", "Ragnarok", "Spharai", "Yoichinoyumi", "Almace", "Armageddon", "Caladbolg", "Farsha", "Gandiva", "Kannagi", "Masamune", "Redemption", "Rhongomiant", "Twashtar", "Ukonvasara", "Verethragna", "Hvergelmir", "Aymur", "Burtgang", "Carnwenhan", "Conqueror", "Death Penalty", "Gastraphetes", "Glanzfaust", "Kenkonken", "Kogarasumaru", "Laevateinn", "Liberator", "Murgleis", "Nagi", "Ryunohige", "Terpsichore", "Tizona", "Tupsimati", "Nirvana", "Vajra", "Yagrush", "Epeolatry", "Idris", "Aeneas", "Anguta", "Chango", "Dojikiri Yasutsuna", "Fail-not", "Fomalhaut", "Godhands", "Heishi Shorinken", "Khatvanga", "Lionheart", "Sequence", "Tishtrya", "Tri-edge", "Trishula",
+})
+SPELLS_BY_JOB = {
+    "nin": [f"{element}: {tier}" for element in ("Doton", "Suiton", "Huton", "Katon", "Hyoton", "Raiton") for tier in ("Ichi", "Ni", "San")] + ["Ranged Attack"],
+    "blm": [spell for spell in ("Stone", "Stone II", "Stone III", "Stone IV", "Stone V", "Stone VI", "Stoneja", "Water", "Water II", "Water III", "Water IV", "Water V", "Water VI", "Waterja", "Aero", "Aero II", "Aero III", "Aero IV", "Aero V", "Aero VI", "Aeroja", "Fire", "Fire II", "Fire III", "Fire IV", "Fire V", "Fire VI", "Firaja", "Blizzard", "Blizzard II", "Blizzard III", "Blizzard IV", "Blizzard V", "Blizzard VI", "Blizzaja", "Thunder", "Thunder II", "Thunder III", "Thunder IV", "Thunder V", "Thunder VI", "Thundaja", "Impact", "Ranged Attack")],
+    "rdm": ["EnSpell", "Stone", "Stone II", "Stone III", "Stone IV", "Stone V", "Water", "Water II", "Water III", "Water IV", "Water V", "Aero", "Aero II", "Aero III", "Aero IV", "Aero V", "Fire", "Fire II", "Fire III", "Fire IV", "Fire V", "Blizzard", "Blizzard II", "Blizzard III", "Blizzard IV", "Blizzard V", "Thunder", "Thunder II", "Thunder III", "Impact", "Ranged Attack"],
+    "geo": ["Stone", "Stone II", "Stone III", "Stone IV", "Stone V", "Water", "Water II", "Water III", "Water IV", "Water V", "Aero", "Aero II", "Aero III", "Aero IV", "Aero V", "Fire", "Fire II", "Fire III", "Fire IV", "Fire V", "Blizzard", "Blizzard II", "Blizzard III", "Blizzard IV", "Blizzard V", "Thunder", "Thunder II", "Thunder III", "Impact"],
+    "sch": ["Stone", "Stone II", "Stone III", "Stone IV", "Stone V", "Geohelix II", "Water", "Water II", "Water III", "Water IV", "Water V", "Hydrohelix II", "Aero", "Aero II", "Aero III", "Aero IV", "Anemohelix II", "Fire", "Fire II", "Fire III", "Fire IV", "Pyrohelix II", "Blizzard", "Blizzard II", "Blizzard III", "Blizzard IV", "Cryohelix II", "Thunder", "Thunder II", "Thunder III", "Ionohelix II", "Luminohelix II", "Noctohelix II", "Kaustra", "Impact"],
+    "drk": [f"{element}{suffix}" for element in ("Stone", "Water", "Aero", "Fire", "Blizzard") for suffix in ("", " II", " III")] + ["Thunder", "Thunder II", "Thunder III", "Impact"],
+    "cor": ["Ranged Attack", "Earth Shot", "Water Shot", "Wind Shot", "Fire Shot", "Ice Shot", "Thunder Shot"],
+    "rng": ["Ranged Attack"], "sam": ["Ranged Attack"], "thf": ["Ranged Attack"],
+}
 MAGIC_DAMAGE_TYPES = ("Elemental Magic", "Ninjutsu", "Quick Draw", "Ranged Attack", "EnSpell")
 ELEMENTAL_DAMAGE_SPELLS = frozenset({
     "Stone", "Stone II", "Stone III", "Stone IV", "Stone V", "Stone VI", "Stoneja",
@@ -2259,152 +2270,6 @@ def _report_enemy(raw_enemy: dict, debuffs: dict | None = None):
     return enemy
 
 
-def _evaluate_profile_set(payload: dict, context: dict) -> dict:
-    """Evaluate one profile set using the same player/action modules as the UI."""
-    try:
-        problems = []
-        if payload.get("missing"):
-            problems.append("unresolved slots: " + ", ".join(payload["missing"]))
-        if payload.get("incomplete"):
-            problems.append("incomplete item models: " + ", ".join(payload["incomplete"]))
-        if payload.get("ineligible"):
-            problems.append("job-ineligible slots: " + ", ".join(payload["ineligible"]))
-        if problems:
-            raise ValueError("; ".join(problems))
-        player = create_player.create_player(
-            context["main_job"], context["sub_job"], context["master_level"],
-            gearset=payload["gearset"], buffs=context["buffs"], abilities=context["abilities"],
-        )
-        enemy = _report_enemy(context["enemy"], context.get("debuffs"))
-        row = {
-            "name": payload["name"], "category": payload["category"] or "WS",
-            "ws_name": payload["ws_name"] or "", "tp_dps": "", "time_to_ws": "",
-            "ws_damage": "", "total_dps": "", "weapon_setup": payload.get("weapon_setup", "As listed"),
-            "error": "",
-            "_tp_damage": None, "_tp_return": None, "_attack_time": None,
-            "_player": player,
-        }
-        if payload["category"] is not None:
-            attack = actions.average_attack_round(
-                player, enemy, 0, context["tp_value"], "Time to WS"
-            )
-            row["tp_dps"] = attack[1][0] / max(attack[1][2], 1e-9)
-            row["time_to_ws"] = attack[0]
-            row["_tp_damage"] = attack[1][0]
-            row["_tp_return"] = attack[1][1]
-            row["_attack_time"] = attack[1][2]
-        if payload["ws_name"]:
-            ws_type = "ranged" if payload["ws_name"] in (
-                WS_BY_SKILL.get("Marksmanship", []) + WS_BY_SKILL.get("Archery", [])
-            ) else "melee"
-            if payload["category"] is not None:
-                row["total_dps"], cycle = actions.average_tp_ws_cycle(
-                    player, player, enemy, row["ws_name"], context["tp_value"], ws_type
-                )
-                row["ws_damage"] = cycle[3]
-            else:
-                row["ws_damage"] = actions.average_ws(
-                    player, enemy, payload["ws_name"], context["tp_value"],
-                    ws_type, "Damage dealt",
-                )[0]
-        return row
-    except Exception as error:
-        return {
-            "name": payload["name"], "category": payload["category"] or "WS",
-            "ws_name": payload["ws_name"] or "", "tp_dps": "", "time_to_ws": "",
-            "ws_damage": "", "total_dps": "", "weapon_setup": payload.get("weapon_setup", "As listed"),
-            "error": str(error),
-            "_tp_damage": None, "_tp_return": None, "_attack_time": None,
-            "_player": None,
-        }
-
-
-class ProfileReportThread(QThread):
-    progress = pyqtSignal(str)
-    succeeded = pyqtSignal(object)
-    failed = pyqtSignal(str)
-    stopped = pyqtSignal()
-
-    def __init__(self, payloads: list[dict], context: dict, parent=None):
-        super().__init__(parent)
-        self.payloads = payloads
-        self.context = context
-        self._stop_requested = threading.Event()
-
-    def request_stop(self):
-        self._stop_requested.set()
-
-    def run(self):
-        try:
-            rows = []
-            cache = {}
-            for index, payload in enumerate(self.payloads, 1):
-                if self._stop_requested.is_set():
-                    self.stopped.emit()
-                    return
-                self.progress.emit(f"Evaluating {index}/{len(self.payloads)}: {payload['name']}")
-                key = (
-                    payload.get("category"), payload.get("ws_name"),
-                    tuple(str(payload["gearset"][slot].get("Bridge Key") or item_name(payload["gearset"][slot])) for slot in SLOTS),
-                    tuple(payload.get("missing") or ()), tuple(payload.get("incomplete") or ()),
-                    tuple(payload.get("ineligible") or ()),
-                )
-                if key in cache:
-                    row = dict(cache[key])
-                    row["name"] = payload["name"]
-                    row["weapon_setup"] = payload.get("weapon_setup", row["weapon_setup"])
-                else:
-                    row = _evaluate_profile_set(payload, self.context)
-                    cache[key] = row
-                rows.append(row)
-            if self._stop_requested.is_set():
-                self.stopped.emit()
-                return
-            tp_rows = [row for row in rows if row["category"] == "TP" and not row.get("error")]
-            ws_rows = [row for row in rows if row["category"] == "WS" and row.get("ws_name") and not row.get("error")]
-            enemy = _report_enemy(self.context["enemy"], self.context.get("debuffs"))
-            best_by_ws = {}
-            total_pairs = len(tp_rows) * len(ws_rows)
-            pair_index = 0
-            for ws_row in ws_rows:
-                ws_type = "ranged" if ws_row["ws_name"] in (
-                    WS_BY_SKILL.get("Marksmanship", []) + WS_BY_SKILL.get("Archery", [])
-                ) else "melee"
-                for tp_row in tp_rows:
-                    if self._stop_requested.is_set():
-                        self.stopped.emit()
-                        return
-                    pair_index += 1
-                    self.progress.emit(
-                        f"Comparing TP/WS pair {pair_index}/{total_pairs}: "
-                        f"{tp_row['name']} -> {ws_row['name']}"
-                    )
-                    try:
-                        total_dps, cycle = actions.average_tp_ws_cycle(
-                            tp_row["_player"], ws_row["_player"], enemy,
-                            ws_row["ws_name"], self.context["tp_value"], ws_type,
-                        )
-                    except Exception:
-                        continue
-                    candidate = {
-                        "name": f"{tp_row['name']} -> {ws_row['name']}",
-                        "category": "Best Pair", "ws_name": ws_row["ws_name"],
-                        "weapon_setup": ws_row["weapon_setup"],
-                        "tp_dps": tp_row["tp_dps"], "time_to_ws": cycle[2],
-                        "ws_damage": cycle[3], "total_dps": total_dps,
-                        "error": "", "_player": None,
-                    }
-                    current = best_by_ws.get(ws_row["ws_name"])
-                    if current is None or total_dps > current["total_dps"]:
-                        best_by_ws[ws_row["ws_name"]] = candidate
-            rows.extend(sorted(
-                best_by_ws.values(), key=lambda row: row["total_dps"], reverse=True
-            ))
-            self.succeeded.emit(rows)
-        except Exception as error:
-            self.failed.emit(str(error))
-
-
 class OvernightScenarioDialog(QDialog):
     """Choose the enemy scenarios included in an overnight cache batch."""
 
@@ -2525,7 +2390,6 @@ class MainWindow(QMainWindow):
         self.aspirational_selected: set[str] = set()
         self.optimizer_thread: OptimizeThread | None = None
         self.overnight_thread: OvernightSimulationThread | None = None
-        self.report_thread: ProfileReportThread | None = None
         self.simulation_thread: SimulationThread | None = None
         self._last_quick_result: dict | None = None
         self._history_selected_id: int | None = None
@@ -2617,18 +2481,11 @@ class MainWindow(QMainWindow):
         cache_info.triggered.connect(self.show_cache_info)
         clear_cache = QAction("Clear simulation cache", self)
         clear_cache.triggered.connect(self.clear_simulation_cache)
-        legacy = QAction("About legacy interface", self)
-        legacy.triggered.connect(lambda: QMessageBox.information(
-            self, "Legacy interface",
-            "Run python gui_main.py to use the restored Tk interface."
-        ))
         close = QAction("Exit", self)
         close.triggered.connect(self.close)
         file_menu.addActions([select_root, refresh, blacklist, overnight])
         file_menu.addSeparator()
         file_menu.addActions([self.cache_enabled_action, cache_info, clear_cache])
-        file_menu.addSeparator()
-        file_menu.addAction(legacy)
         file_menu.addSeparator()
         file_menu.addAction(close)
 
@@ -5557,7 +5414,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         profile_controls = QHBoxLayout()
         self.profile_job_combo = QComboBox()
-        self.profile_job_combo.currentTextChanged.connect(self._populate_profile_report)
+        self.profile_job_combo.currentTextChanged.connect(self._refresh_profile_jobs)
         refresh = QPushButton("Refresh profile data")
         refresh.clicked.connect(self.refresh_bridge)
         profile_controls.addWidget(QLabel("LuAshitacast job:"))
@@ -5657,111 +5514,6 @@ class MainWindow(QMainWindow):
         self.profile_builder_results.setWidget(self.profile_builder_results_widget)
         generated_layout.addWidget(self.profile_builder_results)
         layout.addWidget(generated, 1)
-        return tab
-
-    def _profile_report_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        controls = QHBoxLayout()
-        refresh = QPushButton("Refresh profile sets")
-        refresh.clicked.connect(self.refresh_bridge)
-        run = QPushButton("Run profile report")
-        run.clicked.connect(self.run_profile_report)
-        self.cancel_profile_report_button = QPushButton("Cancel")
-        self.cancel_profile_report_button.setEnabled(False)
-        self.cancel_profile_report_button.clicked.connect(self.stop_profile_report)
-        controls.addWidget(refresh)
-        controls.addWidget(run)
-        controls.addWidget(self.cancel_profile_report_button)
-        controls.addStretch(1)
-        layout.addLayout(controls)
-        legacy_note = QLabel("Uses the LuAshitacast job selected in Profile Builder.")
-        legacy_note.setWordWrap(True)
-        layout.addWidget(legacy_note)
-
-        self.profile_report_status = QLabel(
-            "Load a character bridge to inspect its LuAshitacast profiles."
-        )
-        self.profile_report_status.setWordWrap(True)
-        layout.addWidget(self.profile_report_status)
-        weapon_sets = QGroupBox("Profile weapon overlays")
-        weapon_form = QFormLayout(weapon_sets)
-        self.report_main_weapon_combo = QComboBox()
-        self.report_ranged_weapon_combo = QComboBox()
-        self.report_defense_combo = QComboBox()
-        self.report_main_weapon_combo.currentIndexChanged.connect(self._profile_weapon_changed)
-        self.report_ranged_weapon_combo.currentIndexChanged.connect(self._profile_weapon_changed)
-        self.report_defense_combo.currentIndexChanged.connect(self._profile_defense_changed)
-        weapon_form.addRow("Main / sub weapon set", self.report_main_weapon_combo)
-        weapon_form.addRow("Ranged / ammo set", self.report_ranged_weapon_combo)
-        weapon_form.addRow("Optional TP defense overlay", self.report_defense_combo)
-        weapon_note = QLabel(
-            "Use these when the profile equips armor and weapons in separate sets. "
-            "Only explicitly listed weapon slots replace the armor set."
-        )
-        weapon_note.setWordWrap(True)
-        weapon_form.addRow(weapon_note)
-        layout.addWidget(weapon_sets)
-
-        self.profile_report_table = QTableWidget(0, 9)
-        self.profile_report_table.setHorizontalHeaderLabels(
-            ["Effective set", "Role", "Weapon skill", "Weapons / layers",
-             "TP DPS", "TP time (s)", "WS damage", "Cycle DPS", "Status"]
-        )
-        self.profile_report_table.setAlternatingRowColors(True)
-        self.profile_report_table.setSortingEnabled(True)
-        self.profile_report_table.horizontalHeader().setStretchLastSection(True)
-        self.profile_report_table.setMinimumHeight(230)
-        self.profile_report_table.itemSelectionChanged.connect(self._profile_report_row_selected)
-        self.profile_report_summary = QLabel(
-            "Run the profile report to compare TP speed, WS damage, and full-cycle DPS."
-        )
-        self.profile_report_summary.setWordWrap(True)
-        self.profile_report_summary.setObjectName("sectionTitle")
-        layout.addWidget(self.profile_report_summary)
-        report_note = QLabel(
-            "TP DPS is damage during the TP phase. Cycle DPS includes TP time, WS damage, "
-            "and the weapon-skill delay. Sort by a column to compare sets; blocked rows "
-            "remain visible with their reason in Status."
-        )
-        report_note.setWordWrap(True)
-        layout.addWidget(report_note)
-        self.profile_diagnostic_table = QTableWidget(0, 6)
-        self.profile_diagnostic_table.setHorizontalHeaderLabels(
-            ["Raw set", "Role", "Variant", "Slots", "Model status", "Notes"]
-        )
-        self.profile_diagnostic_table.setAlternatingRowColors(True)
-        self.profile_diagnostic_table.horizontalHeader().setStretchLastSection(True)
-        report_views = QTabWidget()
-        report_views.addTab(self.profile_report_table, "Combat results")
-        report_views.addTab(self.profile_diagnostic_table, "Raw-set diagnostics")
-        layout.addWidget(report_views, 1)
-
-        selected = QGroupBox("Selected TP + WS total DPS")
-        selected_form = QFormLayout(selected)
-        self.report_tp_combo = QComboBox()
-        self.report_ws_set_combo = QComboBox()
-        self.report_ws_name_combo = QComboBox()
-        self.report_ws_name_combo.setEditable(True)
-        self.report_tp_combo.currentTextChanged.connect(self._refresh_selected_report_sets)
-        self.report_ws_set_combo.currentTextChanged.connect(self._refresh_selected_report_sets)
-        selected_form.addRow("Effective TP set", self.report_tp_combo)
-        selected_form.addRow("WS set", self.report_ws_set_combo)
-        selected_form.addRow("Weapon skill", self.report_ws_name_combo)
-        selected_button = QPushButton("Calculate selected total DPS")
-        selected_button.clicked.connect(self.run_selected_profile_report)
-        selected_form.addRow(selected_button)
-        self.publish_lac_button = QPushButton("Publish latest combined optimizer pair as WSDist mode")
-        self.publish_lac_button.clicked.connect(self.publish_optimizer_pair_to_lac)
-        selected_form.addRow(self.publish_lac_button)
-        rename_button = QPushButton("Preview guided canonical set-name migration")
-        rename_button.clicked.connect(self.preview_canonical_lac_migration)
-        selected_form.addRow(rename_button)
-        self.selected_report_result = QLabel("Choose a TP set and WS set, then calculate.")
-        self.selected_report_result.setWordWrap(True)
-        selected_form.addRow(self.selected_report_result)
-        layout.addWidget(selected)
-        self._populate_profile_report()
         return tab
 
     def _confirm_profile_diff(self, title: str, diff_text: str) -> bool:
@@ -6590,6 +6342,25 @@ class MainWindow(QMainWindow):
                 return profile
         return None
 
+    def _refresh_profile_jobs(self):
+        """Refresh the Profile Builder job selector from bridge profiles."""
+        profiles = self.bridge_store.profile_records() if self.bridge_store.data else []
+        jobs = []
+        for profile in profiles:
+            code = str(profile.get("job", "")).upper()
+            label = next((name for name, value in JOBS.items() if value.upper() == code), code)
+            if label and label not in jobs:
+                jobs.append(label)
+        current = self.profile_job_combo.currentText()
+        self.profile_job_combo.blockSignals(True)
+        self.profile_job_combo.clear()
+        self.profile_job_combo.addItems(sorted(jobs))
+        if current in jobs:
+            self.profile_job_combo.setCurrentText(current)
+        elif self.main_job.currentText() in jobs:
+            self.profile_job_combo.setCurrentText(self.main_job.currentText())
+        self.profile_job_combo.blockSignals(False)
+
     def _profile_payloads(self) -> list[dict]:
         profile = self._profile_for_job()
         if profile is None:
@@ -6952,12 +6723,7 @@ class MainWindow(QMainWindow):
         self.profile_report_status.setText("Running profile report…")
         self.cancel_profile_report_button.setEnabled(True)
         self.character_combo.setEnabled(False)
-        self.report_thread = ProfileReportThread(payloads, context, self)
-        self.report_thread.progress.connect(self.profile_report_status.setText)
-        self.report_thread.succeeded.connect(self._profile_report_done)
-        self.report_thread.failed.connect(self._profile_report_failed)
-        self.report_thread.stopped.connect(self._profile_report_stopped)
-        self.report_thread.start()
+        return
 
     def stop_profile_report(self):
         if self.report_thread and self.report_thread.isRunning():
@@ -7453,7 +7219,7 @@ class MainWindow(QMainWindow):
             self._reset_invalid_equipment()
             for editor in (self.quick_set, self.tp_set, self.ws_set):
                 editor.refresh_icons()
-            self._populate_profile_report()
+            self._refresh_profile_jobs()
             self._apply_bridge_master_level()
             self._active_character_key = character_key
             self._load_character_state(character_key)
@@ -7669,7 +7435,7 @@ class MainWindow(QMainWindow):
 
         report = state.get("report") if isinstance(state.get("report"), dict) else {}
         self._set_combo_value(self.profile_job_combo, report.get("job"), self.profile_job_combo.currentText())
-        self._populate_profile_report()
+        self._refresh_profile_jobs()
         self.profile_source_accessible.setChecked(bool(report.get("builder_accessible", True)))
         self.profile_source_porter.setChecked(bool(report.get("builder_porter", True)))
         self.profile_source_transferable.setChecked(bool(report.get("builder_transferable", False)))
@@ -7706,7 +7472,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         running_threads = [
             thread for thread in (
-                self.optimizer_thread, self.overnight_thread, self.report_thread,
+                self.optimizer_thread, self.overnight_thread,
                 getattr(self, "simulation_thread", None),
                 getattr(self, "plot_thread", None),
             )

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import gear
 import wsdist
-from new_gui_main import _lock_ranking_weapon_slots, _ranking_weapon_types
+from qt_gui_main import _lock_ranking_weapon_slots, _ranking_weapon_types
 
 
 class WeaponSkillRankingTests(unittest.TestCase):

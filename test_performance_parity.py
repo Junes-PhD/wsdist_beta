@@ -16,7 +16,7 @@ import actions
 from attack_round_model import expected_rounds, time_to_ws_breakdown, tp_distribution
 import create_player as player_module
 import wsdist as wsdist_module
-from new_gui_main import SLOTS as GUI_SLOTS, _optimizer_check_gear
+from qt_gui_main import SLOTS as GUI_SLOTS, _optimizer_check_gear
 from create_player import (
     calculate_damage_taken,
     create_enemy,
@@ -64,6 +64,16 @@ class PerformanceParityTests(unittest.TestCase):
         # One Centovente contributes +1000, Moonshade contributes +250, and
         # the existing Fencer bonus contributes +300.
         self.assertEqual(player.stats.get("TP Bonus"), 1550)
+
+    def test_direct_simulation_rejects_two_plus_1000_tp_bonus_weapons(self):
+        gearset = empty_gearset()
+        gearset["main"] = Centovente
+        gearset["sub"] = Centovente2
+        player = create_player("thf", "war", 50, gearset, {}, {})
+
+        self.assertEqual(player.gearset["sub"]["Name"], "Empty")
+        # Centovente + Fencer; no second +1000 bonus is counted.
+        self.assertEqual(player.stats.get("TP Bonus"), 1300)
 
     def test_sagitta_path_a_store_tp_and_double_damage(self):
         gearset = empty_gearset()

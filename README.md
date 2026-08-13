@@ -10,15 +10,15 @@ items, while leaving effect-only or unresolved descriptions marked incomplete.
 
 You may run the code with as a simple Python file:
 
-    python gui_main.py
+    python qt_gui_main.py
 
-or you may simple double-click the gui_main.exe executable. Note that if you try to double-click the executable and it crashes before you can read the error, then you'll need to open a Windows Powershell, navigate to the executable file location, and type "gui_main.exe" to run it from the powershell to read the error causing the crash.
+or you may simple double-click the qt_gui_main.exe executable. Note that if you try to double-click the executable and it crashes before you can read the error, then you'll need to open a Windows Powershell, navigate to the executable file location, and type "qt_gui_main.exe" to run it from the powershell to read the error causing the crash.
 
 If you choose to use the executable version of this application, then I recommend downloading the application from the actions page for this repository (https://github.com/IzaKastra/wsdist_beta/actions), which contains the executable and necessary files for running it in one simple download. "kastra_ffxi_sim-full" contains all necessary files to run the application. "kastra_ffxi_sim-executable-only" contains only the executable and will not run without the other necessary files. These files from the Actions page were created on GitHub servers using the commands found in the "workflow file" and are therefore considered as "probably safe to run."
 
 
 
-Note that the .exe application will not notice any changes made to the .py files (except gear.py and enemies.py). If you wish to make changes to any other file, then you will need to run the gui_main.py version of the code.
+Note that the .exe application will not notice any changes made to the .py files (except gear.py and enemies.py). If you wish to make changes to any other file, then you will need to run the qt_gui_main.py version of the code.
 
 I prefer that all issues are reported as issues on the GitHub page. I rarely check FFXIAH, so I may be delayed when responding to posts there.
 

@@ -57,13 +57,13 @@ jobs:
         # pip install colorama
 
     - name: Create Installer
-      run: pyinstaller --exclude-module gear --exclude-module enemies --clean --onefile --icon=icons32/23937.ico gui_main.py
+      run: pyinstaller --exclude-module gear --exclude-module enemies --clean --onefile --icon=icons32/23937.ico qt_gui_main.py
 
     - name: Upload Installer
       uses: actions/upload-artifact@v4
       with: 
         name: kastra_ffxi_sim-executable-only
-        path: ./dist/gui_main.exe
+        path: ./dist/qt_gui_main.exe
 
   publish-artifacts:
     name: Publish Artifacts
@@ -82,7 +82,7 @@ jobs:
 
     - name: Zip Artifacts
       run: |
-        zip -r ./kastra_ffxi_sim-full.zip ./gui_main.exe
+        zip -r ./kastra_ffxi_sim-full.zip ./qt_gui_main.exe
         zip -r ./kastra_ffxi_sim-full.zip ./gear.py
         zip -r ./kastra_ffxi_sim-full.zip ./enemies.py
         zip -r ./kastra_ffxi_sim-full.zip ./item_list.csv

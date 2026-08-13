@@ -6,7 +6,7 @@ from pathlib import Path
 
 import create_player
 import gear
-from new_gui_main import MainWindow
+from qt_gui_main import MainWindow
 from simulation_cache import SimulationCache
 
 
