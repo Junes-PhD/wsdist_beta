@@ -151,7 +151,10 @@ def bridge_candidates(store, job: str, sources: GearSources) -> dict[str, list[d
         transferable = bool(raw.get("transferable"))
         allowed = ((sources.accessible and accessible) or (sources.porter and porter)
                    or (sources.transferable and transferable))
-        if not allowed or not raw.get("model_complete"):
+        # Base stats are sufficient for a conservative profile recipe even
+        # when GearSetBuilder reports an unmodeled specialized augment. The
+        # bridge record carries a warning; records with no stats remain out.
+        if not allowed or (not raw.get("model_complete") and not raw.get("stats") and not raw.get("base_stats")):
             continue
         item = _gear_record(raw, eligible=False, hoxne_mastery_rank=store.hoxne_mastery_rank)
         if job not in [str(value).casefold() for value in item.get("Jobs", ())]:

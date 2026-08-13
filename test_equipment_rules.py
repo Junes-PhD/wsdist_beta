@@ -54,6 +54,15 @@ class EquipmentRuleTests(unittest.TestCase):
         apply_weapon_slot_rules(nin, "nin", "war", 50)
         self.assertEqual(nin["sub"]["Name"], "Katana 2")
 
+    def test_only_one_plus_1000_tp_bonus_weapon_is_allowed(self):
+        selected = gearset(
+            main={**item("Centovente", "Weapon", "Dagger"), "TP Bonus": 1000},
+            sub={**item("Hitaki", "Weapon", "Katana"), "TP Bonus": 1000},
+        )
+        changed = apply_weapon_slot_rules(selected, "nin", "war", 50)
+        self.assertEqual(selected["sub"]["Name"], "Empty")
+        self.assertIn("TP Bonus", changed["sub"])
+
     def test_ranged_projectile_pairs_are_normalized_and_validated(self):
         selected = gearset(
             ranged=item("Gun", "Gun", "Marksmanship"),

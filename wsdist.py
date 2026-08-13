@@ -320,7 +320,7 @@ _LOWER_IS_BETTER_STATS = {
 }
 _NON_COMBAT_METADATA = {
     "Item ID", "Item Level", "ItemLevel", "Rank", "Accessible Count",
-    "Total Count", "Model Complete",
+    "Total Count", "Model Complete", "Resource Flags", "Eligible",
 }
 
 # Stats that can improve an offensive result or reduce time to the next WS.
@@ -389,6 +389,34 @@ def _dominates_item(candidate: dict, other: dict) -> bool:
     return strict
 
 
+def _safe_for_auto_blacklist(item: dict) -> bool:
+    """Return whether it is safe to hide every variant of this base item.
+
+    The automatic helper writes a *base-name* blacklist, so one suggestion can
+    hide augmented and conditional variants that were not part of the winning
+    comparison.  Require explicit complete modeling and reject anything with
+    effects outside the numeric stat comparison.  Manual blacklist selections
+    and optimizer candidate pruning intentionally do not use this gate.
+    """
+    if not isinstance(item, dict) or item.get("Name") == "Empty":
+        return False
+    if item.get("Model Complete") is not True and item.get("model_complete") is not True:
+        return False
+    if item.get("Model Warning") or item.get("model_warning"):
+        return False
+    if item.get("Conditional Effects") or item.get("conditional_effects"):
+        return False
+    if item.get("Unknown Augments") or item.get("unknown_augments"):
+        return False
+    if item.get("Augments") or item.get("augments"):
+        return False
+    # Zero-stat equipment can still be intentionally used for appearance,
+    # costume effects, or a special behavior not represented numerically.
+    if not _numeric_combat_stats(item):
+        return False
+    return True
+
+
 def prune_dominated_candidates(check_gear: dict[str, list[dict]]) -> tuple[dict[str, list[dict]], int]:
     """Remove obvious Pareto-dominated items within each slot/type group.
 
@@ -428,7 +456,10 @@ def obvious_blacklist_suggestions(items_by_slot: dict[str, list[dict]]) -> dict[
         return str(item.get("Name") or item.get("Name2") or "").strip().casefold()
 
     for slot, values in items_by_slot.items():
-        items = [item for item in values if base_name(item) and item.get("Name") != "Empty"]
+        # A base-name blacklist hides every known and future variant.  Do not
+        # auto-suggest records unless both the item and its possible
+        # replacement are complete, unconditional, unaugmented models.
+        items = [item for item in values if base_name(item) and _safe_for_auto_blacklist(item)]
         for index, item in enumerate(items):
             name = base_name(item)
             context = (str(slot), index)
@@ -737,24 +768,16 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         return item.get("Name", "Empty") == "Empty" or count is None or int(count) >= 2
 
     def duplicate_tp_bonus_weapon(main, sub):
-        """Return whether main/sub are the same +1000 TP Bonus weapon.
+        """Return whether main/sub would supply two +1000 TP Bonus effects.
 
-        The static gear lists use a second dictionary (for example,
-        ``Centovente2``) when an item can be offered in the sub slot.  Those
-        dictionaries have different ``Name2`` values, so comparing the full
-        dictionaries does not catch an impossible duplicate weapon pair.
-        Keeping this restriction limited to weapons that provide +1000 TP
-        Bonus preserves valid duplicate ordinary weapons and normal off-hand
-        TP Bonus behavior.
+        The rule is about the +1000 weapon effect, not a matching item name:
+        Centovente + Hitaki is invalid just like Centovente + Centovente.
+        Smaller TP Bonus sources such as Moonshade remain stackable.
         """
         if (main.get("Name", "Empty") == "Empty"
                 or sub.get("Name", "Empty") == "Empty"):
             return False
         if main.get("Type") != "Weapon" or sub.get("Type") != "Weapon":
-            return False
-        main_name = str(main.get("Name") or "").strip().casefold()
-        sub_name = str(sub.get("Name") or "").strip().casefold()
-        if not main_name or main_name != sub_name:
             return False
         try:
             return (float(main.get("TP Bonus", 0)) >= 1000
@@ -886,12 +909,11 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
     apply_forced_empty_slots(starting_gearset)
     apply_weapon_slot_rules(starting_gearset, main_job, sub_job, master_level)
-    # Do not let the random starting point contain two copies of a unique
-    # +1000 TP Bonus weapon (Centovente/Centovente2, Hitaki/Hitaki2, etc.).
+    # Do not let the random starting point contain two +1000 TP Bonus weapons.
     # The candidate loop applies the same rule to every later swap.
     if duplicate_tp_bonus_weapon(starting_gearset["main"], starting_gearset["sub"]):
         starting_gearset["sub"] = Empty
-        report_progress("Removed duplicate +1000 TP Bonus weapon from sub slot.")
+        report_progress("Removed second +1000 TP Bonus weapon from sub slot.")
 
     best_set =  starting_gearset.copy()
 

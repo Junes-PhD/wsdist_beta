@@ -35,6 +35,14 @@ def _is_empty(item: dict | None) -> bool:
     return not item or str(item.get("Name") or "Empty") == "Empty"
 
 
+def _tp_bonus(item: dict | None) -> float:
+    """Return an item's modeled TP Bonus without letting metadata raise."""
+    try:
+        return float((item or {}).get("TP Bonus", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _can_dual_wield(main_job: str, sub_job: str, master_level: int) -> bool:
     """Return whether the modeled job pair has a native Dual Wield trait.
 
@@ -90,6 +98,13 @@ def apply_weapon_slot_rules(gearset: dict, main_job: str = "", sub_job: str = ""
             clear("sub", "grips require a two-handed main weapon")
         elif sub_type == "Weapon" and not _can_dual_wield(main_job, sub_job, master_level):
             clear("sub", "job pair has no modeled Dual Wield trait")
+
+    # Centovente, Hitaki, and equivalent +1000 TP Bonus weapons are modeled
+    # as a single effective weapon bonus. They can combine with Moonshade,
+    # Fencer, Warcry, and ordinary gear TP Bonus, but two such weapons must
+    # never contribute +2000 from main/sub.
+    if _tp_bonus(gearset["main"]) >= 1000 and _tp_bonus(gearset["sub"]) >= 1000:
+        clear("sub", "only one +1000 TP Bonus weapon can be equipped")
 
     ranged_type = _item_type(gearset["ranged"])
     ammo_type = _item_type(gearset["ammo"])

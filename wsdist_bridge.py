@@ -15,6 +15,8 @@ try:
 except ImportError:
     FFXIAH_MODELS = {}
 
+from curated_item_models import CURATED_ITEM_MODELS, UNVERIFIED_ITEM_MODELS
+
 
 SLOTS = ["main", "sub", "ranged", "ammo", "head", "neck", "ear1", "ear2",
          "body", "hands", "ring1", "ring2", "back", "waist", "legs", "feet"]
@@ -169,6 +171,13 @@ def _gear_record(record: dict, *, eligible: bool = True, hoxne_mastery_rank: int
     name = str(record.get("name") or "Unknown")
     name2 = _model_name(record)
     accessible_count = _accessible_count(record)
+    has_stats = bool(stats)
+    unknown_augments = tuple(str(value) for value in (record.get("unknown_augments") or ()) if str(value).strip())
+    # A scan can know the complete base item and all normal stats while still
+    # lacking one specialized augment effect.  That gear is useful for most
+    # simulations, but must be visibly marked instead of silently pretending
+    # the missing effect was modeled. Items with no stats remain ineligible.
+    usable_model = bool(record.get("model_complete", False) or has_stats)
     result.update({
         "Name": name,
         "Name2": name2,
@@ -180,11 +189,21 @@ def _gear_record(record: dict, *, eligible: bool = True, hoxne_mastery_rank: int
         "Accessible Count": accessible_count,
         "Total Count": int(record.get("total_count") or record.get("count") or 0),
         "Model Complete": bool(record.get("model_complete", False)),
-        "Eligible": bool(eligible and record.get("model_complete", False) and accessible_count > 0),
+        "Eligible": bool(eligible and usable_model and accessible_count > 0),
         "LAC": deepcopy(record.get("lac") or {"Name": name}),
         "Slots": slots,
         "Augments": deepcopy(record.get("augments") or []),
     })
+    if unknown_augments:
+        result["Model Warning"] = "Unmodeled scan effect: " + ", ".join(unknown_augments)
+        result["Unknown Augments"] = list(unknown_augments)
+    if record.get("model_warning"):
+        existing = str(result.get("Model Warning") or "")
+        result["Model Warning"] = "; ".join(filter(None, (existing, str(record["model_warning"]))))
+    if record.get("conditional_effects"):
+        result["Conditional Effects"] = list(record["conditional_effects"])
+    if record.get("data_source"):
+        result["Data Source"] = str(record["data_source"])
     resource_flags = int(record.get("resource_flags") or record.get("Resource Flags") or 0)
     exclusive = bool(record.get("exclusive", record.get("Exclusive", False)))
     transferable = record.get("transferable", record.get("Transferable"))
@@ -225,6 +244,32 @@ def _with_ffxiah_model(record: dict) -> dict:
     enriched["skill"] = enriched.get("skill") or model.get("skill", 0)
     enriched["stats"] = deepcopy(model.get("stats") or {})
     enriched["model_complete"] = bool(model.get("complete"))
+    return enriched
+
+
+def _with_curated_model(record: dict) -> dict:
+    """Fill an incomplete record from a reviewed, source-attributed model."""
+    item_id = int(record.get("item_id") or 0)
+    model = CURATED_ITEM_MODELS.get(item_id)
+    if not model or record.get("model_complete") or record.get("stats"):
+        return record
+    enriched = deepcopy(record)
+    enriched["stats"] = deepcopy(model["stats"])
+    enriched["model_complete"] = True
+    enriched["stat_source"] = "curated"
+    enriched["data_source"] = model["source"]
+    if model.get("effects"):
+        enriched["conditional_effects"] = list(model["effects"])
+    return enriched
+
+
+def _with_unverified_warning(record: dict) -> dict:
+    """Keep newly-added items visible in audits without guessing their stats."""
+    warning = UNVERIFIED_ITEM_MODELS.get(int(record.get("item_id") or 0))
+    if not warning:
+        return record
+    enriched = deepcopy(record)
+    enriched["model_warning"] = warning
     return enriched
 
 
@@ -357,6 +402,7 @@ class BridgeStore:
         self.catalog = {}
         self.by_slot = {slot: [] for slot in SLOTS}
         for record in self.data.get("items", []):
+            record = _with_unverified_warning(_with_curated_model(record))
             record = _with_ffxiah_model(record)
             item = _with_builtin_model(
                 record, _gear_record(record, hoxne_mastery_rank=self.hoxne_mastery_rank)
@@ -398,6 +444,7 @@ class BridgeStore:
                 continue
             if sorted(map(str, record.get("augments") or [])) != sorted(map(str, item.get("augments") or [])):
                 continue
+            record = _with_unverified_warning(_with_curated_model(record))
             record = _with_ffxiah_model(record)
             return _with_builtin_model(
                 record,

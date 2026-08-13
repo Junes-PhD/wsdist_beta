@@ -8,6 +8,7 @@ Author: Kastra (Asura server)
 '''
 import matplotlib.pyplot as plt
 import numpy as np
+import random
 from get_hit_rate import get_hit_rate
 from weaponskill_info import weaponskill_info
 from get_ma_rate import get_ma_rate3
@@ -66,7 +67,23 @@ def verbose_output(phys_dmg, magic_dmg, tp_return, crit, special="other"):
         print(f"                [{phys_dmg2:>7s} Phys.] [{magic_dmg2:>7s} Magic]  [{tp_return2:>6s} TP]  " + (color_text("yellow", "Critical Hit!") if crit else ""))
         
 
-def run_simulation(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type, plot_dps=False, verbose=False):
+def _downsample_series(times, values, maximum=600):
+    """Keep plot data compact while preserving the first and final samples."""
+    if len(times) <= maximum:
+        return [float(value) for value in times], [float(value) for value in values]
+    indexes = np.linspace(0, len(times) - 1, maximum, dtype=int)
+    return (
+        [float(times[index]) for index in indexes],
+        [float(values[index]) for index in indexes],
+    )
+
+
+class SimulationStopped(RuntimeError):
+    """Raised when a cancellable long simulation is stopped by the caller."""
+
+
+def _run_simulation_core(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type,
+                         plot_dps=False, verbose=False, emit_output=True, stop_event=None):
     #
     #
     #
@@ -101,10 +118,16 @@ def run_simulation(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type, 
     avg_ws_dmg = []
 
     avg_ws_tp = [] # List containing the values of player TP when each WS was used (before TP Bonus)
+    ws_intervals = []
+    last_ws_completion = 0.0
 
     while time < total_time:
+        if stop_event is not None and stop_event.is_set():
+            raise SimulationStopped("Simulation stopped by user.")
         tp0 = tp
         while tp < ws_threshold:
+            if stop_event is not None and stop_event.is_set():
+                raise SimulationStopped("Simulation stopped by user.")
             tp0 = tp
             tp_round = average_attack_round(player_tp, enemy, tp, ws_threshold, "Time to WS", simulation=True)
             physical_damage = tp_round[0]
@@ -128,6 +151,7 @@ def run_simulation(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type, 
             tp_damage_list.append(tp_damage)
             tp_time_list.append(time)
 
+        ws_intervals.append(max(0.0, time - last_ws_completion))
         ws_sim = average_ws(player_ws, enemy, ws_name, tp, ws_type, "Damage dealt", simulation=True)
         avg_ws_tp.append(tp)
 
@@ -135,6 +159,7 @@ def run_simulation(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type, 
         ws_damage += ws_sim[0]
         tp = ws_sim[1]
         time += 2.0 # 2.0 seconds of delay after using a WS  (see https://www.bg-wiki.com/ffxi/Forced_Delay)
+        last_ws_completion = time
         regain_ws_return = round((2./3)*(regain_ws),1) # Extra TP gained from Regain during the 2s delay after using a WS.
         tp += regain_ws_return
         print(f"    Regain bonus: +{regain_ws_return:.1f} TP") if (very_verbose_dps or verbose_dps) and regain_ws_return>0 else None
@@ -158,6 +183,15 @@ def run_simulation(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type, 
     phys_dmg_list = np.array(phys_dmg_list)
     magic_dmg_list = np.array(magic_dmg_list)
 
+    numeric_results = (damage, tp_damage, ws_damage, time, time_per_attack_round)
+    arrays = (damage_list, tp_damage_list, ws_damage_list, phys_dmg_list, magic_dmg_list)
+    if any(not np.isfinite(float(value)) for value in numeric_results) or any(
+        not np.all(np.isfinite(values)) for values in arrays
+    ):
+        raise ValueError("Simulation produced a non-finite damage result; it was not saved.")
+    if any(float(value) < 0 for value in (damage, tp_damage, ws_damage)):
+        raise ValueError("Simulation produced a negative damage result; it was not saved.")
+
     if plot_dps:
         plt.plot(time_list, damage_list/time_list,label=f"Total={damage/time:7.1f}")
         plt.plot(tp_time_list, tp_damage_list/tp_time_list,label=f"TP={tp_damage/time:7.1f} ({tp_damage/damage*100:5.1f}%)")
@@ -167,8 +201,32 @@ def run_simulation(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type, 
         plt.legend()
         plt.show()
 
-    print()
-    print(f"""
+    summary = {
+        "total_time": float(time),
+        "total_damage": float(damage),
+        "total_dps": float(damage / time) if time > 0 else 0.0,
+        "tp_damage": float(tp_damage),
+        "tp_dps": float(tp_damage / time) if time > 0 else 0.0,
+        "ws_damage": float(ws_damage),
+        "ws_dps": float(ws_damage / time) if time > 0 else 0.0,
+        "time_per_attack_round": float(time_per_attack_round),
+        "average_attack_round_damage": float(np.average(avg_tp_dmg)) if avg_tp_dmg else 0.0,
+        "average_ws_damage": float(np.average(avg_ws_dmg)) if avg_ws_dmg else 0.0,
+        "average_ws_tp": float(np.average(avg_ws_tp)) if avg_ws_tp else 0.0,
+        "expected_time_to_ws": float(np.average(ws_intervals)) if ws_intervals else 0.0,
+        "ws_count": int(len(avg_ws_dmg)),
+        "dps_series": {
+            "time": _downsample_series(time_list, time_list)[0],
+            "total": _downsample_series(time_list, damage_list / time_list)[1],
+            "tp_time": _downsample_series(tp_time_list, tp_time_list)[0] if len(tp_time_list) else [],
+            "tp": _downsample_series(tp_time_list, tp_damage_list / tp_time_list)[1] if len(tp_time_list) else [],
+            "ws_time": _downsample_series(ws_time_list, ws_time_list)[0] if len(ws_time_list) else [],
+            "ws": _downsample_series(ws_time_list, ws_damage_list / ws_time_list)[1] if len(ws_time_list) else [],
+        },
+    }
+    if emit_output:
+        print()
+        print(f"""
     =========================
     Total time: {(time/3600):5.1f} h
     Time/Attack: {time_per_attack_round:7.3f} s
@@ -182,6 +240,73 @@ def run_simulation(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type, 
     WS Damage: {ws_damage/1e6:5.1f}M damage (WS DPS: {ws_damage/time:7.1f}; {ws_damage/damage*100:5.1f}%)
     =========================
     """)
+    return summary
+
+
+def run_simulation_structured(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type,
+                              *, seed=None, verbose=False, stop_event=None):
+    """Run the two-hour cycle with isolated, reproducible NumPy/Python RNG states."""
+    state = np.random.get_state()
+    python_state = random.getstate()
+    try:
+        if seed is not None:
+            normalized_seed = int(seed) & 0xFFFFFFFF
+            np.random.seed(normalized_seed)
+            random.seed(normalized_seed)
+        return _run_simulation_core(
+            player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type,
+            plot_dps=False, verbose=verbose, emit_output=False, stop_event=stop_event,
+        )
+    finally:
+        np.random.set_state(state)
+        random.setstate(python_state)
+
+
+def run_simulation(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type,
+                   plot_dps=False, verbose=False):
+    """Compatibility wrapper for callers using the original API."""
+    return _run_simulation_core(
+        player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type,
+        plot_dps=plot_dps, verbose=verbose, emit_output=True,
+    )
+
+
+def simulate_ws_distribution(player, enemy, ws_name, input_tp, ws_type, *, seed=None, samples=20000,
+                             stop_event=None):
+    """Return a compact, reproducible WS distribution summary."""
+    state = np.random.get_state()
+    python_state = random.getstate()
+    try:
+        if seed is not None:
+            normalized_seed = int(seed) & 0xFFFFFFFF
+            np.random.seed(normalized_seed)
+            random.seed(normalized_seed)
+        damage = []
+        for _ in range(max(1, int(samples))):
+            if stop_event is not None and stop_event.is_set():
+                raise SimulationStopped("Weapon-skill distribution stopped by user.")
+            output = average_ws(
+                player, enemy, ws_name, input_tp, ws_type, "Damage dealt",
+                simulation=True, single=True, verbose=False,
+            )
+            damage.append(float(output[0]))
+        values = np.asarray(damage, dtype=float)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("Weapon-skill distribution produced a non-finite damage value.")
+        counts, edges = np.histogram(values, bins=min(160, max(20, int(np.sqrt(len(values))))))
+        return {
+            "samples": int(len(values)),
+            "minimum": float(np.min(values)),
+            "maximum": float(np.max(values)),
+            "mean": float(np.mean(values)),
+            "median": float(np.median(values)),
+            "p05": float(np.percentile(values, 5)),
+            "p95": float(np.percentile(values, 95)),
+            "histogram": {"edges": [float(value) for value in edges], "counts": [int(value) for value in counts]},
+        }
+    finally:
+        np.random.set_state(state)
+        random.setstate(python_state)
 
 def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric, simulation=False, verbose=False):
     #

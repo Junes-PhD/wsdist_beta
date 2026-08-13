@@ -10,10 +10,40 @@ from lac_profile import (
     bridge_hash, parse_set_entries, prepare_managed_update, prepare_profile_builder_update, prepare_set_renames,
     serialize_set, write_set,
 )
-from wsdist_bridge import BridgeStore, _gear_record, hoxne_stat_bonus
+from wsdist_bridge import BridgeStore, _gear_record, _with_curated_model, _with_unverified_warning, hoxne_stat_bonus
 
 
 class BridgeTests(unittest.TestCase):
+    def test_curated_models_fill_every_verified_live_gap(self):
+        expected = {
+            11037: {"Stoneskin Bonus": 10},
+            11590: {"Healing Magic Skill": 7},
+            18912: {"DMG": 1, "Delay": 999},
+            18913: {"DMG": 1, "Delay": 999},
+            19041: {"Store TP": 4},
+            20542: {"DMG": 50, "Hand-to-Hand Skill": 108},
+            23917: {"Fast Cast": 14, "Gear Haste": 8},
+            24121: {"DT": -5, "Crit Rate": 5},
+            26041: {"Enhancing Magic Duration": -50},
+            26215: {"Fast Cast": -10, "Cure Potency": 5},
+        }
+        for item_id, stats in expected.items():
+            with self.subTest(item_id=item_id):
+                model = _with_curated_model({"item_id": item_id, "stats": [], "model_complete": False})
+                self.assertTrue(model["model_complete"])
+                self.assertTrue(model["data_source"].startswith("https://"))
+                for name, value in stats.items():
+                    self.assertEqual(model["stats"][name], value)
+
+    def test_unverified_new_item_remains_ineligible_with_clear_warning(self):
+        record = _with_unverified_warning({"item_id": 21543, "stats": [], "model_complete": False})
+        item = _gear_record({
+            **record, "name": "Ryofu Uchiwa", "slots_mask": 3,
+            "jobs_mask": 8388606, "accessible_count": 1,
+        })
+        self.assertFalse(item["Eligible"])
+        self.assertIn("July 2026", item["Model Warning"])
+
     def test_transferability_preserves_exclusive_flags(self):
         record = {
             "item_id": 99, "name": "Transfer Test", "slots_mask": 1 << 4,
