@@ -5632,8 +5632,8 @@ class MainWindow(QMainWindow):
         builder_form.addRow(self.profile_builder_status)
         layout.addWidget(builder)
         builder_note = QLabel(
-            "Build settings and publishing live here. Use Old LAC only for the previous report and set-inspection tools. "
-            "The initial build uses bounded stat recipes; use Run optimizer for this section or Optimize all loadouts "
+            "Build settings and publishing live here. The initial build uses bounded stat recipes; "
+            "use Run optimizer for this section or Optimize all loadouts "
             "to replace TP and WS previews with simulator-backed results. Optimize direct-stat sections reruns the "
             "cap-aware specialty recipes. Default, Acc, HighAcc, and Hybrid sections "
             "automatically use their own enemy and defensive scenario; Hybrid uses PDT 50% and MDT 25%."
@@ -6644,21 +6644,17 @@ class MainWindow(QMainWindow):
         raw = self._profile_payloads()
         defense = self.report_defense_combo.currentData() if hasattr(self, "report_defense_combo") else None
         effective = _compose_profile_payloads(raw, defense)
+        main_weapon = self.report_main_weapon_combo.currentData() if hasattr(self, "report_main_weapon_combo") else None
+        ranged_weapon = self.report_ranged_weapon_combo.currentData() if hasattr(self, "report_ranged_weapon_combo") else None
         return [
             _with_weapon_overlays(
-                payload, self.report_main_weapon_combo.currentData(),
-                self.report_ranged_weapon_combo.currentData(),
+                payload, main_weapon, ranged_weapon,
             )
             for payload in effective
         ]
 
     def _populate_profile_report(self, *_args):
-        required_widgets = (
-            "profile_job_combo", "report_tp_combo", "report_ws_set_combo",
-            "report_main_weapon_combo", "report_ranged_weapon_combo",
-            "report_defense_combo", "profile_diagnostic_table",
-        )
-        if not all(hasattr(self, name) for name in required_widgets):
+        if not hasattr(self, "profile_job_combo"):
             return
         profiles = self.bridge_store.profile_records() if self.bridge_store.data else []
         jobs = []
@@ -6676,6 +6672,15 @@ class MainWindow(QMainWindow):
         elif self.main_job.currentText() in jobs:
             self.profile_job_combo.setCurrentText(self.main_job.currentText())
         self.profile_job_combo.blockSignals(False)
+        # The legacy report widgets are no longer part of the application.
+        # Keep Profile Builder's job selector usable without requiring
+        # controls that only existed on the removed Old LAC tab.
+        if not all(hasattr(self, name) for name in (
+            "report_tp_combo", "report_ws_set_combo", "report_main_weapon_combo",
+            "report_ranged_weapon_combo", "report_defense_combo",
+            "profile_diagnostic_table",
+        )):
+            return
         payloads = self._profile_payloads()
         self.report_tp_combo.blockSignals(True)
         self.report_ws_set_combo.blockSignals(True)
@@ -7550,12 +7555,6 @@ class MainWindow(QMainWindow):
             },
             "report": {
                 "job": self.profile_job_combo.currentText(),
-                "main_weapon": self.report_main_weapon_combo.currentText(),
-                "ranged_weapon": self.report_ranged_weapon_combo.currentText(),
-                "defense": self.report_defense_combo.currentText(),
-                "tp_set": self.report_tp_combo.currentText(),
-                "ws_set": self.report_ws_set_combo.currentText(),
-                "weapon_skill": self.report_ws_name_combo.currentText(),
                 "builder_accessible": self.profile_source_accessible.isChecked(),
                 "builder_porter": self.profile_source_porter.isChecked(),
                 "builder_transferable": self.profile_source_transferable.isChecked(),
@@ -7671,12 +7670,6 @@ class MainWindow(QMainWindow):
         report = state.get("report") if isinstance(state.get("report"), dict) else {}
         self._set_combo_value(self.profile_job_combo, report.get("job"), self.profile_job_combo.currentText())
         self._populate_profile_report()
-        self._set_combo_value(self.report_main_weapon_combo, report.get("main_weapon"), self.report_main_weapon_combo.currentText())
-        self._set_combo_value(self.report_ranged_weapon_combo, report.get("ranged_weapon"), self.report_ranged_weapon_combo.currentText())
-        self._set_combo_value(self.report_defense_combo, report.get("defense"), self.report_defense_combo.currentText())
-        self._set_combo_value(self.report_tp_combo, report.get("tp_set"), self.report_tp_combo.currentText())
-        self._set_combo_value(self.report_ws_set_combo, report.get("ws_set"), self.report_ws_set_combo.currentText())
-        self._set_combo_value(self.report_ws_name_combo, report.get("weapon_skill"), "None")
         self.profile_source_accessible.setChecked(bool(report.get("builder_accessible", True)))
         self.profile_source_porter.setChecked(bool(report.get("builder_porter", True)))
         self.profile_source_transferable.setChecked(bool(report.get("builder_transferable", False)))
