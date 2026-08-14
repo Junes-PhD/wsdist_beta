@@ -30,7 +30,10 @@ import time
 import queue as queue_module
 sys.path.append(os.path.dirname(sys.executable))
 from gear import *
-from equipment_rules import apply_weapon_slot_rules, ranged_attack_ready
+from equipment_rules import apply_weapon_slot_rules, has_conditional_set_effect, ranged_attack_ready
+
+
+OPTIMIZER_RESULT_LIMIT = 50
 
 
 class OptimizerStopped(RuntimeError):
@@ -362,6 +365,11 @@ def _numeric_combat_stats(item: dict) -> dict[str, float]:
 
 def _dominates_item(candidate: dict, other: dict) -> bool:
     """Return true only when candidate cannot be worse for any modeled stat."""
+    # Cross-slot effects cannot be compared safely from isolated item rows.
+    # Preserve both the conditional item and potential alternatives so the
+    # full optimizer can score the completed equipment combination.
+    if has_conditional_set_effect(candidate) or has_conditional_set_effect(other):
+        return False
     if (candidate.get("Type", "None"), candidate.get("Skill Type", "None")) != (
         other.get("Type", "None"), other.get("Skill Type", "None")
     ):
@@ -757,7 +765,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         )
 
     check_stopped()
-    report_progress(f"Search started (seed {seed if seed is not None else 'random'}).")
+    report_progress("Search started.")
     # Keep caller-owned selections stable and remove impossible candidates once,
     # before the hot loop. Formula evaluation is unchanged for every valid set.
     check_gear = {slot: list(items) for slot, items in check_gear.items()}
@@ -1553,7 +1561,7 @@ def _build_set_restart_worker(request, progress_callback=None):
         }
 
 
-def _rank_optimizer_results(results, limit=5):
+def _rank_optimizer_results(results, limit=OPTIMIZER_RESULT_LIMIT):
     usable = [
         result for result in results
         if result.get("player") is not None and result.get("metric") is not None
@@ -1586,7 +1594,7 @@ def _gearset_mapping_key(gearset):
     )
 
 
-def _unique_ranked_results(results, limit=5):
+def _unique_ranked_results(results, limit=OPTIMIZER_RESULT_LIMIT):
     ranked = _rank_optimizer_results(results, limit=max(limit, len(results)))
     unique, seen = [], set()
     for result in ranked:
@@ -1630,17 +1638,16 @@ def _optimize_combined_pair(main_job, sub_job, master_level, buffs, abilities, e
     )
     if progress_callback is not None:
         progress_callback(
-            "Combined optimization: optimizing TP armor against the same WS main/sub pair..."
+            "Combined optimization: optimizing TP armor against the same WS weapon overlay..."
         )
-    # A TP+WS result is one equipment pair.  The TP set may improve every
-    # armor/accessory slot, but its main and sub weapons must remain the same
-    # weapons used by the selected WS set.  WS optimization still considers
-    # all eligible weapon combinations before this constraint is applied.
+    # A TP+WS result is one linked equipment pair.  The TP set may improve
+    # armor/accessory slots, but all four weapon-overlay slots remain those
+    # used by the selected WS set.  WS optimization still considers all
+    # eligible weapon combinations before this constraint is applied.
     ws_player = ws_result[0]
     tp_check_gear = {slot: list(items) for slot, items in check_gear.items()}
-    tp_start["main"] = ws_player.gearset["main"]
-    tp_start["sub"] = ws_player.gearset["sub"]
-    for slot in ("main", "sub"):
+    for slot in ("main", "sub", "ranged", "ammo"):
+        tp_start[slot] = ws_player.gearset[slot]
         tp_check_gear[slot] = [ws_player.gearset[slot]]
     tp_result = optimize_set(
         main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, "None",
@@ -1677,7 +1684,7 @@ def _optimize_combined_pair(main_job, sub_job, master_level, buffs, abilities, e
                 "tp_seed": tp_entry.get("seed"), "ws_seed": ws_entry.get("seed"),
             })
     pair_results.sort(key=lambda result: result["metric"], reverse=True)
-    for rank, result in enumerate(pair_results[:5], start=1):
+    for rank, result in enumerate(pair_results[:OPTIMIZER_RESULT_LIMIT], start=1):
         result["rank"] = rank
     if not pair_results:
         raise ValueError("Combined TP + WS optimization returned no usable set pair.")
@@ -1691,7 +1698,7 @@ def _optimize_combined_pair(main_job, sub_job, master_level, buffs, abilities, e
     if return_details:
         result = winner["player"], winner["output"], winner["metric"], winning_seed
         if return_top_results:
-            return (*result, pair_results[:5])
+            return (*result, pair_results[:OPTIMIZER_RESULT_LIMIT])
         return result
     return winner["player"], winner["output"]
 
@@ -1771,8 +1778,7 @@ def _optimize_single_run_parallel(main_job, sub_job, master_level, buffs, abilit
     )
     notify(
         f"Search run 1/1 started in split-worker mode with {worker_count} worker "
-        f"chunks (estimated loads {', '.join(f'{load:,}' for load in partition_loads)}; "
-        f"seed {run_seed})."
+        f"chunks (estimated loads {', '.join(f'{load:,}' for load in partition_loads)})."
     )
     for round_index in range(max_rounds):
         check_stopped()
@@ -1893,7 +1899,7 @@ def _optimize_single_run_parallel(main_job, sub_job, master_level, buffs, abilit
     return winner["player"], winner["output"]
 
 
-def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, dt_requirement=0, tp_starting_gearset=None, ws_starting_gearset=None, restarts=1, workers=0, seed=None, n_iter=10, return_details=False, return_top_results=False, parallel_mode="search_runs", progress_callback=None, progress_queue=None, stop_event=None, combined_ws_player=None, combined_defense_both=True):
+def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name, action_type, min_tp, check_gear, starting_gearset, pdt_requirement, mdt_requirement, input_metric, print_swaps, next_best_percent, *, dt_requirement=0, tp_starting_gearset=None, ws_starting_gearset=None, restarts=1, workers=0, seed=None, n_iter=10, return_details=False, return_top_results=False, parallel_mode="search_runs", progress_callback=None, progress_queue=None, stop_event=None, combined_ws_player=None, combined_defense_both=True, cached_restarts=None, restart_callback=None, warm_starting_gearset=None):
     """Run independent seeded searches or one split-worker search.
 
     ``workers=0`` selects available CPU cores while leaving one core free.
@@ -1922,10 +1928,9 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
             progress_callback=progress_callback, progress_queue=progress_queue,
             stop_event=stop_event, combined_ws_player=combined_ws_player,
         )
-    # Independent runs are deliberately bounded.  Beyond ten, the extra process
-    # and result-management overhead is rarely useful, and the GUI presents one
-    # persistent status card per run.
-    restarts = max(1, min(10, int(restarts)))
+    # Deep quality uses twelve independent paths while still leaving spare CPU
+    # capacity on the common sixteen-thread desktop configuration.
+    restarts = max(1, min(12, int(restarts)))
     workers = int(workers)
     seed_sequence = np.random.SeedSequence(seed)
     restart_seeds = [int(value) for value in seed_sequence.generate_state(restarts)]
@@ -1949,6 +1954,30 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
         }
         for index, restart_seed in enumerate(restart_seeds, start=1)
     ]
+    if warm_starting_gearset and requests:
+        warm_request = requests[-1]
+        warm_request["args"] = shared_args[:11] + (dict(warm_starting_gearset),) + shared_args[12:]
+        warm_request["kwargs"]["preserve_starting_gearset"] = True
+        warm_request["warm_start"] = True
+
+    results = []
+    cached_by_index = {
+        int(result.get("index", 0)): result
+        for result in (cached_restarts or ())
+        if isinstance(result, dict) and result.get("player") is not None
+    }
+    if cached_by_index:
+        for request in requests:
+            cached = cached_by_index.get(request["index"])
+            if cached is None or int(cached.get("seed", -1)) != request["seed"]:
+                continue
+            if bool(cached.get("warm_start")) != bool(request.get("warm_start")):
+                continue
+            restored = dict(cached)
+            restored.setdefault("log", "")
+            results.append(restored)
+        reused = {result["index"] for result in results}
+        requests = [request for request in requests if request["index"] not in reused]
 
     def drain_progress():
         if progress_queue is not None and progress_callback is not None:
@@ -1969,7 +1998,7 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
 
     def run_serial(request):
         check_stopped()
-        notify(f"Search run {request['index']}/{restarts} started (seed {request['seed']}).")
+        notify(f"Search run {request['index']}/{restarts} started.")
         callback = lambda message: notify(f"Search run {request['index']}: {message}")
         result = _build_set_restart_worker(request, callback)
         if result.get("stopped"):
@@ -1978,17 +2007,21 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
             notify(f"Search run {request['index']} failed: {result['error']}")
         else:
             notify(f"Search run {request['index']}/{restarts} completed.")
+        if restart_callback is not None and "error" not in result and not result.get("stopped"):
+            restart_callback(result, bool(request.get("warm_start")))
         return result
 
-    if restarts == 1:
-        results = [run_serial(requests[0])]
+    if not requests:
+        notify(f"Reused all {restarts} exact completed search runs.")
+    elif len(requests) == 1:
+        results.append(run_serial(requests[0]))
     else:
         max_workers = workers
         if max_workers <= 0:
-            max_workers = min(restarts, max(1, (os.cpu_count() or 2) - 1))
-        max_workers = min(restarts, max_workers)
+            max_workers = min(len(requests), max(1, (os.cpu_count() or 2) - 1))
+        max_workers = min(len(requests), max_workers)
         if max_workers == 1:
-            results = [run_serial(request) for request in requests]
+            results.extend(run_serial(request) for request in requests)
         else:
             notify(
                 f"Independent mode using {max_workers} worker processes for "
@@ -1997,12 +2030,11 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 check_stopped()
                 for request in requests:
-                    notify(f"Search run {request['index']}/{restarts} started (seed {request['seed']}).")
+                    notify(f"Search run {request['index']}/{restarts} started.")
                 futures = {
                     executor.submit(_build_set_restart_worker, request): request
                     for request in requests
                 }
-                results = []
                 pending = set(futures)
                 while pending:
                     stopping = _stop_requested(stop_event)
@@ -2021,6 +2053,8 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
                             notify(f"Search run {request['index']} failed: {result['error']}")
                         else:
                             notify(f"Search run {request['index']}/{restarts} completed.")
+                            if restart_callback is not None:
+                                restart_callback(result, bool(request.get("warm_start")))
 
     results.sort(key=lambda result: result["index"])
 
@@ -2061,7 +2095,7 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
             raise OptimizerStopped("Optimizer stopped by user.")
         if "error" in fallback:
             errors = "; ".join(
-                f"seed {result['seed']}: {result.get('error', 'unknown worker failure')}"
+                f"run {result.get('index', '?')}: {result.get('error', 'unknown worker failure')}"
                 for result in results
             )
             raise ValueError(
@@ -2079,16 +2113,16 @@ def optimize_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_na
     winner_result = max(successful_results, key=lambda result: result["metric"])
     print(winner_result["log"], end="")
     if winner.get("index") == 0:
-        notify(f"Selected full-search fallback (seed {winner['seed']}; metric {winner['metric']:.6f}).")
-        print(f"Selected full-search fallback (seed {winner['seed']}; metric {winner['metric']:.6f}).")
+        notify(f"Selected full-search fallback (metric {winner['metric']:.6f}).")
+        print(f"Selected full-search fallback (metric {winner['metric']:.6f}).")
     elif restarts > 1:
         notify(
             f"Selected search run {winner['index']}/{restarts} "
-            f"(seed {winner['seed']}; metric {winner['metric']:.6f})."
+            f"(metric {winner['metric']:.6f})."
         )
         print(
             f"Selected search run {winner['index']}/{restarts} "
-            f"(seed {winner['seed']}; metric {winner['metric']:.6f})."
+            f"(metric {winner['metric']:.6f})."
         )
     if return_details:
         result = winner["player"], winner["output"], winner["metric"], winner["seed"]

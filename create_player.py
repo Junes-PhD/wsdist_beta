@@ -4,7 +4,7 @@ File containing code to build a player character with gear and aggregate stats.
 Author: Kastra (Asura server)
 '''
 from enemies import *
-from equipment_rules import apply_weapon_slot_rules
+from equipment_rules import apply_ear_slot_rules, apply_weapon_slot_rules, conditional_gear_bonuses
 
 
 _BASE_STATS_CACHE = {}
@@ -165,6 +165,7 @@ class create_player:
         self.weapon_slot_changes = apply_weapon_slot_rules(
             self.gearset, self.main_job, self.sub_job, self.master_level,
         )
+        self.ear_slot_changes = apply_ear_slot_rules(self.gearset)
 
         # Add stats from gear
         self.add_gear_stats()
@@ -781,7 +782,8 @@ class create_player:
         # Add stats from the equipped gear, including set bonuses at the end.
         #
         # A list of stats to not include in <stats>. These do not affect player stats. We will use DMG and Delay in the main code later to calculate damage, though.
-        ignore_stats = ["Name","Name2","Type","DMG","Delay","Jobs","Skill Type","Rank"]
+        ignore_stats = ["Name","Name2","Type","DMG","Delay","Jobs","Skill Type","Rank",
+                        "Augment Path", "Dynamis Divergence", "Conditional Effects"]
         for slot in self.gearset:
             for stat in self.gearset[slot]:
                 if stat=="Triple Shot" and self.main_job=="rng": # Skip Triple Shot bonuses on Oshosi for RNG
@@ -809,6 +811,12 @@ class create_player:
                             self.stats[stat] = self.stats.get(stat,0) + raw_value
                     else:
                         self.stats[f"{slot} {stat}"] = self.stats.get(f"{slot} {stat}",0) + raw_value
+
+        # Cross-slot effects are deliberately absent from each item's raw
+        # numeric row. Add them once only when the complete combination is
+        # equipped, so partial sets cannot receive phantom bonuses.
+        for stat, value in conditional_gear_bonuses(self.gearset).items():
+            self.stats[stat] = self.stats.get(stat, 0) + value
 
         # Count the number of set-bonus gear equipped.
         mummu_count = 0 # Mummu +2 gives DEX/AGI/VIT/CHR

@@ -1,7 +1,11 @@
 import unittest
 
-from equipment_rules import apply_weapon_slot_rules, ranged_attack_ready
-from gear import Empty
+from equipment_rules import (
+    apply_ear_slot_rules, apply_weapon_slot_rules, conditional_gear_bonuses,
+    has_conditional_set_effect, is_right_ear_only,
+    ranged_attack_ready,
+)
+from gear import Empty, Masamune, Masamune0, Gleti_Knife15, RostamA
 
 
 def item(name, item_type="Weapon", skill_type="None"):
@@ -15,6 +19,21 @@ def gearset(**slots):
 
 
 class EquipmentRuleTests(unittest.TestCase):
+    def test_all_sortie_jse_earrings_are_right_ear_only(self):
+        selected = {
+            "ear1": item("Lethargy Earring +2", "Armor"),
+            "ear2": item("Sherida Earring", "Armor"),
+        }
+        self.assertTrue(is_right_ear_only(selected["ear1"]))
+        apply_ear_slot_rules(selected)
+        self.assertEqual(selected["ear2"]["Name"], "Lethargy Earring +2")
+        self.assertEqual(selected["ear1"]["Name"], "Sherida Earring")
+
+    def test_sortie_jse_detection_covers_other_job_earrings(self):
+        for name in ("Boii Earring +2", "Hattori Earring +1", "Arbatel Earring +2"):
+            self.assertTrue(is_right_ear_only({"Name": name}))
+        self.assertFalse(is_right_ear_only({"Name": "Sherida Earring"}))
+
     def test_hand_to_hand_clears_all_sub_items(self):
         selected = gearset(
             main=item("Knuckles", "Weapon", "Hand-to-Hand"),
@@ -54,6 +73,34 @@ class EquipmentRuleTests(unittest.TestCase):
         apply_weapon_slot_rules(nin, "nin", "war", 50)
         self.assertEqual(nin["sub"]["Name"], "Katana 2")
 
+    def test_dynamis_rema_augment_is_main_hand_only(self):
+        selected = gearset(
+            main={**item("Naegling", "Weapon", "Sword")},
+            sub=dict(Masamune),
+        )
+        changed = apply_weapon_slot_rules(selected, "sam", "nin", 50)
+        self.assertEqual(selected["sub"], Masamune0)
+        self.assertIn("Dynamis-Divergence", changed["sub"])
+
+    def test_ranked_odysssey_weapon_is_not_stripped(self):
+        selected = gearset(
+            main=item("Naegling", "Weapon", "Sword"),
+            sub=dict(Gleti_Knife15),
+        )
+        apply_weapon_slot_rules(selected, "nin", "war", 50)
+        self.assertEqual(selected["sub"]["Name2"], "Gleti's Knife R15")
+
+    def test_divergence_su5_path_augments_are_main_hand_only(self):
+        selected = gearset(
+            main=item("Naegling", "Weapon", "Sword"),
+            sub=dict(RostamA),
+        )
+        changed = apply_weapon_slot_rules(selected, "cor", "nin", 50)
+        self.assertEqual(selected["sub"]["DMG"], 132)
+        self.assertNotIn("Double Damage", selected["sub"])
+        self.assertNotIn("Store TP", selected["sub"])
+        self.assertIn("Dynamis-Divergence", changed["sub"])
+
     def test_only_one_plus_1000_tp_bonus_weapon_is_allowed(self):
         selected = gearset(
             main={**item("Centovente", "Weapon", "Dagger"), "TP Bonus": 1000},
@@ -82,6 +129,17 @@ class EquipmentRuleTests(unittest.TestCase):
         )
         apply_weapon_slot_rules(selected, "brd", "whm", 50)
         self.assertEqual(selected["ammo"]["Name"], "Empty")
+
+    def test_steelflash_set_bonus_requires_bladeborn_in_other_ear(self):
+        selected = {
+            "ear1": item("Steelflash Earring", "Armor"),
+            "ear2": item("Other Earring", "Armor"),
+        }
+        self.assertEqual(conditional_gear_bonuses(selected), {})
+        self.assertTrue(has_conditional_set_effect(selected["ear1"]))
+
+        selected["ear2"] = item("Bladeborn Earring", "Armor")
+        self.assertEqual(conditional_gear_bonuses(selected), {"DA": 7.0})
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import json
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # Formula-parity tests do not need machine-code compilation.
 os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
@@ -43,6 +43,22 @@ def empty_gearset():
 
 
 class PerformanceParityTests(unittest.TestCase):
+    def test_optimizer_retains_up_to_fifty_distinct_gear_results(self):
+        results = [
+            {
+                "player": SimpleNamespace(
+                    gearset={"head": {"Name": f"Candidate {index}", "Name2": f"Candidate {index}"}}
+                ),
+                "metric": float(1000 - index),
+                "seed": index,
+            }
+            for index in range(60)
+        ]
+        ranked = wsdist_module._unique_ranked_results(results)
+        self.assertEqual(wsdist_module.OPTIMIZER_RESULT_LIMIT, 50)
+        self.assertEqual(len(ranked), 50)
+        self.assertEqual([row["rank"] for row in ranked], list(range(1, 51)))
+
     def test_ws_tp_bonus_includes_weapon_and_moonshade_before_cap(self):
         gearset = empty_gearset()
         gearset["main"] = Hitaki
@@ -224,6 +240,21 @@ class PerformanceParityTests(unittest.TestCase):
         self.assertEqual(removed, 0)
         self.assertEqual({item["Name"] for item in pruned["body"]}, {"Normal Body", "Onca Suit"})
         self.assertEqual(starting_item_candidates([onca, normal_body]), [normal_body])
+
+    def test_conditional_set_earrings_are_not_pareto_pruned_in_isolation(self):
+        steelflash = {
+            "Name": "Steelflash Earring", "Name2": "Steelflash Earring",
+            "Type": "Armor", "Skill Type": "None", "Accuracy": 8, "Store TP": 1,
+        }
+        replacement = {
+            "Name": "Strong Earring", "Name2": "Strong Earring",
+            "Type": "Armor", "Skill Type": "None", "Accuracy": 20, "Store TP": 5,
+        }
+
+        pruned, removed = prune_dominated_candidates({"ear1": [steelflash, replacement]})
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(len(pruned["ear1"]), 2)
 
     def test_optimizer_scores_onca_with_its_empty_slot_cost(self):
         base, _check_gear, enemy = self.optimizer_inputs()
@@ -487,6 +518,51 @@ class PerformanceParityTests(unittest.TestCase):
             {slot: item.get("Name2", item.get("Name")) for slot, item in parallel[0].gearset.items()},
         )
 
+    def test_exact_cached_restarts_skip_worker_execution(self):
+        base, check_gear, enemy = self.optimizer_inputs()
+        seeds = [int(value) for value in np.random.SeedSequence(20260807).generate_state(2)]
+        cached = [
+            {
+                "index": index, "seed": restart_seed,
+                "player": create_player("nin", "war", 50, base.copy(), {}, {}),
+                "output": [float(index), 0.0], "metric": float(index), "log": "",
+            }
+            for index, restart_seed in enumerate(seeds, start=1)
+        ]
+        callback = Mock()
+        with patch.object(wsdist_module, "_build_set_restart_worker") as worker:
+            result = optimize_set(
+                "nin", "war", 50, {}, {}, enemy, "Blade: Shun", "Waterja", "weapon skill",
+                1000, check_gear, base.copy(), 0, 0, "Damage Dealt", False, 1,
+                restarts=2, workers=2, seed=20260807, n_iter=3, return_details=True,
+                return_top_results=True, cached_restarts=cached, restart_callback=callback,
+            )
+        worker.assert_not_called()
+        callback.assert_not_called()
+        self.assertEqual(result[2], 2.0)
+        self.assertEqual(len(result[4]), 2)
+
+    def test_independent_restart_limit_accepts_deep_twelve(self):
+        base, check_gear, enemy = self.optimizer_inputs()
+        seeds = [int(value) for value in np.random.SeedSequence(17).generate_state(12)]
+        results = [
+            {
+                "index": index, "seed": restart_seed,
+                "player": create_player("nin", "war", 50, base.copy(), {}, {}),
+                "output": [float(index), 0.0], "metric": float(index), "log": "",
+            }
+            for index, restart_seed in enumerate(seeds, start=1)
+        ]
+        with patch.object(wsdist_module, "_build_set_restart_worker", side_effect=results) as worker:
+            optimized = optimize_set(
+                "nin", "war", 50, {}, {}, enemy, "Blade: Shun", "Waterja", "weapon skill",
+                1000, check_gear, base.copy(), 0, 0, "Damage Dealt", False, 1,
+                restarts=12, workers=1, seed=17, n_iter=1,
+                return_details=True, return_top_results=True,
+            )
+        self.assertEqual(worker.call_count, 12)
+        self.assertEqual(optimized[2], 12.0)
+
     def test_split_single_run_returns_ranked_results(self):
         base, check_gear, enemy = self.optimizer_inputs()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -688,14 +764,11 @@ class PerformanceParityTests(unittest.TestCase):
         self.assertTrue(ranked)
         self.assertIn("tp_player", ranked[0])
         self.assertIn("ws_player", ranked[0])
-        self.assertEqual(
-            combined_player.tp_player.gearset["main"],
-            combined_player.ws_player.gearset["main"],
-        )
-        self.assertEqual(
-            combined_player.tp_player.gearset["sub"],
-            combined_player.ws_player.gearset["sub"],
-        )
+        for slot in ("main", "sub", "ranged", "ammo"):
+            self.assertEqual(
+                combined_player.tp_player.gearset[slot],
+                combined_player.ws_player.gearset[slot],
+            )
 
     def test_combined_defense_scope_can_apply_only_to_tp(self):
         base, _check_gear, enemy = self.optimizer_inputs()

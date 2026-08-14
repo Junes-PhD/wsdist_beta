@@ -91,6 +91,18 @@ class SimulationCacheTests(unittest.TestCase):
         self.assertTrue(path.exists())
         self.assertTrue(list(self.directory.glob("*.corrupt-*")))
 
+    def test_legacy_schema_rows_are_discarded_without_touching_history(self):
+        key = self.cache.key_for("optimizer", {"seed": 1})
+        self.cache.put(key, "optimizer", {"metric": 1}, 1)
+        connection = sqlite3.connect(self.cache.path)
+        try:
+            connection.execute("PRAGMA user_version = 3")
+            connection.commit()
+        finally:
+            connection.close()
+        migrated = SimulationCache(self.directory, source_hash="engine-a")
+        self.assertEqual(migrated.summary()["entries"], 0)
+
     def test_optimizer_payload_restores_player_and_top_set(self):
         gearset = {slot: dict(gear.Empty) for slot in (
             "main", "sub", "ranged", "ammo", "head", "neck", "ear1", "ear2",

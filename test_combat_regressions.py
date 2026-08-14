@@ -6,6 +6,7 @@ from unittest.mock import patch
 os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
 
 import actions
+import gear
 from create_player import create_enemy, create_player
 from enemies import preset_enemies
 from gear import Empty, Sagitta, Tauret, all_jobs
@@ -24,6 +25,32 @@ def empty_gearset():
 
 
 class CombatRegressionTests(unittest.TestCase):
+    def test_crocea_and_sakpata_weapon_effects_are_modeled(self):
+        self.assertEqual(gear.Crocea_Mors["Fast Cast"], 20)
+        self.assertEqual(gear.Crocea_Mors["HP"], 130)
+        self.assertEqual(gear.Crocea_Mors["MP"], 70)
+        for variant in (
+            gear.Sakpata_Sword0, gear.Sakpata_Sword15, gear.Sakpata_Sword20,
+            gear.Sakpata_Sword25, gear.Sakpata_Sword30,
+        ):
+            self.assertEqual(variant["Fast Cast"], 10)
+            self.assertEqual(variant["HP"], 100)
+            self.assertEqual(variant["MP"], 40)
+            self.assertEqual(variant["Phalanx Received"], 5)
+        self.assertEqual(gear.Sakpata_Sword25["Attack"], 70)
+
+    def test_wakido_kote_plus_two_enhances_hasso_job_ability_haste(self):
+        self.assertEqual(gear.Wakido_Kote2["Hasso+ JA Haste"], 3)
+        without_kote = empty_gearset()
+        without_kote["main"] = gear.Masamune0
+        with_kote = {slot: dict(item) for slot, item in without_kote.items()}
+        with_kote["hands"] = gear.Wakido_Kote2
+
+        base = create_player("sam", "war", 50, without_kote, {}, {"Hasso": True})
+        enhanced = create_player("sam", "war", 50, with_kote, {}, {"Hasso": True})
+
+        self.assertEqual(enhanced.stats["JA Haste"] - base.stats["JA Haste"], 3 / 102.4)
+
     @staticmethod
     def _test_weapon(name, weapon_type, skill):
         item = dict(Empty)
@@ -64,6 +91,25 @@ class CombatRegressionTests(unittest.TestCase):
         self.assertEqual(gearset["sub"], original_sub)
         self.assertIsNot(player.gearset["sub"], gearset["sub"])
         self.assertEqual(player.gearset["sub"]["Skill Type"], "None")
+
+    def test_steelflash_bladeborn_da_bonus_is_applied_once_only_as_a_pair(self):
+        solo_set = empty_gearset()
+        solo_set["ear1"] = {
+            **solo_set["ear1"], "Name": "Steelflash Earring",
+            "Name2": "Steelflash Earring", "Accuracy": 8, "Store TP": 1,
+        }
+        pair_set = {slot: dict(item) for slot, item in solo_set.items()}
+        pair_set["ear2"] = {
+            **pair_set["ear2"], "Name": "Bladeborn Earring",
+            "Name2": "Bladeborn Earring", "Attack": 8, "Store TP": 1,
+        }
+
+        solo = create_player("sam", "war", 50, solo_set, {}, {})
+        paired = create_player("sam", "war", 50, pair_set, {}, {})
+
+        self.assertEqual(paired.stats["DA"] - solo.stats["DA"], 7)
+        self.assertEqual(paired.stats["Store TP"] - solo.stats["Store TP"], 1)
+        self.assertEqual(paired.stats["Attack"] - solo.stats["Attack"], 8)
 
     def test_dual_wield_timing_uses_average_weapon_delay(self):
         self.assertAlmostEqual(

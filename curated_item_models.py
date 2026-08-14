@@ -10,6 +10,13 @@ from __future__ import annotations
 
 
 CURATED_ITEM_MODELS = {
+    # Bifrost Ring's item text is a conversion, not a flat bonus: equipping
+    # it removes 70 HP and grants the same amount of MP.
+    11640: {
+        "stats": {"HP": -70, "MP": 70},
+        "source": "https://www.bg-wiki.com/ffxi/Ring",
+        "effects": ("Converts 70 HP to MP.",),
+    },
     11037: {
         "stats": {"Earth Resistance": 10, "Stoneskin Bonus": 10},
         "source": "https://www.bg-wiki.com/ffxi/Earthcry_Earring",

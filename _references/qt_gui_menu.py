@@ -22,7 +22,16 @@ from PyQt6.QtWidgets import (
 
 
 APP_DIR = Path(__file__).resolve().parent
-ICON_ARCHIVE = APP_DIR / "icons32.zip"
+ICON_ARCHIVE = next(
+    (
+        path for path in (
+            APP_DIR / "icons32.zip",
+            APP_DIR.parent / "icons32.zip",
+        )
+        if path.is_file()
+    ),
+    APP_DIR.parent / "icons32.zip",
+)
 
 # The IDs are from item_list.csv, so these entries resolve to the bundled
 # icons32 archive without needing a separate asset directory.

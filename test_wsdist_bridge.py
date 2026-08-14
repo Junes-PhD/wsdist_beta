@@ -8,12 +8,65 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from lac_profile import (
     bridge_hash, parse_set_entries, prepare_managed_update, prepare_profile_builder_update, prepare_set_renames,
-    serialize_set, write_set,
+    serialize_set, write_profile_source, write_set,
 )
-from wsdist_bridge import BridgeStore, _gear_record, _with_curated_model, _with_unverified_warning, hoxne_stat_bonus
+from wsdist_bridge import (
+    BridgeStore, _gear_record, _with_builtin_model, _with_curated_model,
+    _with_unverified_warning, hoxne_stat_bonus,
+)
+from gear import Bifrost_Ring
 
 
 class BridgeTests(unittest.TestCase):
+    def test_bifrost_ring_converts_hp_to_mp(self):
+        self.assertEqual(Bifrost_Ring["HP"], -70)
+        self.assertEqual(Bifrost_Ring["MP"], 70)
+
+        model = _with_curated_model({"item_id": 11640, "stats": [], "model_complete": False})
+        self.assertEqual(model["stats"], {"HP": -70, "MP": 70})
+
+    def test_rostam_uses_explicit_divergence_path_identity(self):
+        expected = {
+            "A": {"Double Damage": 50, "Store TP": 25},
+            "B": {"FUA": 50, "Subtle Blow II": 25},
+            "C": {"Phantom Roll": 8, "Roll Duration": 60},
+        }
+        for path, bonuses in expected.items():
+            with self.subTest(path=path):
+                record = {
+                    "key": f"21581|path={path}", "item_id": 21581,
+                    "name": "Rostam", "slots_mask": 3, "jobs_mask": 1 << 17,
+                    "accessible_count": 1, "model_complete": True,
+                    "augment_path": path.lower(), "augment_rank": 25,
+                    "stats": {"DMG": 132, "Accuracy": 50},
+                    "lac": {"Name": "Rostam", "AugPath": path, "AugRank": 25},
+                }
+                item = _with_builtin_model(record, _gear_record(record))
+                self.assertEqual(item["Augment Path"], path)
+                self.assertEqual(item["DMG"], 132 if path == "C" else 137)
+                for stat, value in bonuses.items():
+                    self.assertEqual(item[stat], value)
+                if path != "A":
+                    self.assertNotIn("Double Damage", item)
+                if path != "B":
+                    self.assertNotIn("FUA", item)
+
+    def test_manual_lac_editor_write_is_atomic_backed_up_and_conflict_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "SAM.lua"
+            original = "local sets = {}\nreturn sets\n"
+            updated = "local sets = { Tp = {} }\nreturn sets\n"
+            profile.write_text(original, encoding="utf-8")
+            backup, saved_hash = write_profile_source(
+                profile, updated, expected_hash=bridge_hash(original),
+            )
+            self.assertEqual(profile.read_text(encoding="utf-8"), updated)
+            self.assertEqual(backup.read_text(encoding="utf-8"), original)
+            self.assertEqual(saved_hash, bridge_hash(updated))
+            profile.write_text("-- external edit\n" + updated, encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "changed on disk"):
+                write_profile_source(profile, updated, expected_hash=saved_hash)
+
     def test_curated_models_fill_every_verified_live_gap(self):
         expected = {
             11037: {"Stoneskin Bonus": 10},
@@ -54,6 +107,34 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(item["Exclusive"])
         self.assertFalse(item["Transferable"])
 
+    def test_augmented_items_are_never_marked_transferable(self):
+        common = {
+            "item_id": 21581, "name": "Rostam", "slots_mask": 3,
+            "jobs_mask": 1 << 17, "accessible_count": 1,
+            "model_complete": True, "transferable": True,
+            "stats": {"DMG": 132}, "lac": {"Name": "Rostam"},
+        }
+        for field, value in (
+            ("augment_path", "A"), ("augment_rank", 25),
+            ("augment_trial", 1), ("augments", ["DMG +5"]),
+        ):
+            with self.subTest(field=field):
+                item = _gear_record({**common, field: value})
+                self.assertTrue(item["Augmented"])
+                self.assertFalse(item["Transferable"])
+
+        base = _gear_record(common)
+        self.assertFalse(base["Augmented"])
+        self.assertTrue(base["Transferable"])
+
+    def test_bridge_preserves_resource_item_level_for_candidate_filters(self):
+        item = _gear_record({
+            "item_id": 100, "name": "Item Level Helm", "slots_mask": 1 << 4,
+            "jobs_mask": 1 << 1, "accessible_count": 1, "model_complete": True,
+            "item_level": 118, "stats": {"Defense": 100},
+        })
+        self.assertEqual(item["Item Level"], 118)
+
     def test_halasz_magic_crit_rate_is_not_physical_crit_rate(self):
         item = _gear_record({
             "item_id": 27535, "name": "Halasz Earring", "slots_mask": 1 << 11,
@@ -62,6 +143,28 @@ class BridgeTests(unittest.TestCase):
         })
         self.assertEqual(item["Magic Crit Rate II"], 14)
         self.assertNotIn("Crit Rate", item)
+
+    def test_steelflash_bladeborn_stats_keep_set_da_conditional(self):
+        common = {
+            "slots_mask": (1 << 11) | (1 << 12),
+            "jobs_mask": (1 << 23) - 2,
+            "accessible_count": 1,
+            "model_complete": True,
+        }
+        steelflash = _gear_record({
+            **common, "item_id": 28520, "name": "Steelflash Earring",
+            "stats": {"Accuracy": 8, "Store TP": 1, "DA": 7},
+        })
+        bladeborn = _gear_record({
+            **common, "item_id": 28521, "name": "Bladeborn Earring",
+            "stats": {"Attack": 8},
+        })
+
+        self.assertNotIn("DA", steelflash)
+        self.assertNotIn("DA", bladeborn)
+        self.assertEqual(steelflash["Store TP"], 1)
+        self.assertEqual(bladeborn["Store TP"], 1)
+        self.assertIn("Double Attack +7%", steelflash["Conditional Effects"][0])
 
     def bridge(self):
         return {
@@ -225,6 +328,10 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("WSDIST-PROFILE-BUILDER v1", first)
         self.assertIn("DefenseSet", first)
         self.assertIn("HighAcc", first)
+        self.assertIn("CreateCycle('HybridAccuracy'", first)
+        self.assertIn("[2] = 'Acc', [3] = 'HighAcc'", first)
+        self.assertIn("applyWSDistHybridTpSet();", first)
+        self.assertIn("setName = setName .. '_' .. accuracy", first)
         parse_set_entries(first)
 
     def test_guided_rename_updates_static_and_dynamic_references(self):

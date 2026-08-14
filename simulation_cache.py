@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 DEFAULT_MAX_BYTES = 250 * 1024 * 1024
 DEFAULT_MAX_AGE_SECONDS = 90 * 24 * 60 * 60
 
@@ -100,6 +100,10 @@ class SimulationCache:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA busy_timeout=2000")
             connection.execute("PRAGMA wal_autocheckpoint=256")
+            table_existed = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'simulation_results'"
+            ).fetchone() is not None
+            previous_schema = int(connection.execute("PRAGMA user_version").fetchone()[0])
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS simulation_results (
@@ -129,6 +133,9 @@ class SimulationCache:
                 "CREATE INDEX IF NOT EXISTS simulation_results_lru "
                 "ON simulation_results(source_hash, accessed_at)"
             )
+            if table_existed and previous_schema != CACHE_SCHEMA_VERSION:
+                connection.execute("DELETE FROM simulation_results")
+            connection.execute(f"PRAGMA user_version = {CACHE_SCHEMA_VERSION}")
         except Exception:
             connection.close()
             raise

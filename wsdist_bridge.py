@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
 
@@ -94,6 +95,19 @@ def _canonicalize_item_stats(item_id: int, stats: dict) -> dict:
     for source, target in ITEM_STAT_ALIASES.get(item_id, {}).items():
         if source in stats:
             stats[target] = stats.get(target, 0) + stats.pop(source)
+    # Older bridge descriptions flattened the Steelflash/Bladeborn set bonus
+    # onto Steelflash itself. Keep only each earring's individual stats here;
+    # equipment_rules adds DA +7 once when both earrings are worn.
+    if item_id == 28520:  # Steelflash Earring
+        stats.pop("DA", None)
+        stats.pop("Double Attack", None)
+        stats.setdefault("Accuracy", 8)
+        stats.setdefault("Store TP", 1)
+    elif item_id == 28521:  # Bladeborn Earring
+        stats.pop("DA", None)
+        stats.pop("Double Attack", None)
+        stats.setdefault("Attack", 8)
+        stats.setdefault("Store TP", 1)
     return stats
 
 
@@ -106,6 +120,33 @@ def _record_is_unaugmented(record: dict) -> bool:
             and record.get("augment_rank") in (None, "", 0)
             and record.get("augment_trial") in (None, "", 0)
             and not record.get("augment_rank_stats"))
+
+
+def _record_is_augmented(record: dict) -> bool:
+    """Return whether an inventory/profile record has item-specific augments."""
+    if record.get("augments") or record.get("augment_rank_stats") or record.get("augment_stats"):
+        return True
+    for key in ("augment_path", "augment_trial"):
+        if record.get(key) not in (None, "", 0):
+            return True
+    try:
+        if int(record.get("augment_rank") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        if str(record.get("augment_rank") or "").strip():
+            return True
+    augment_type = str(record.get("augment_type") or "").strip().casefold()
+    if augment_type and augment_type not in {"none", "base", "unaugmented"}:
+        return True
+    lac = record.get("lac") or {}
+    if not isinstance(lac, dict):
+        lac = {}
+    if lac.get("AugPath") not in (None, "") or lac.get("Augment"):
+        return True
+    try:
+        return int(lac.get("AugRank") or 0) > 0 or int(lac.get("AugTrial") or 0) > 0
+    except (TypeError, ValueError):
+        return bool(lac.get("AugRank") or lac.get("AugTrial"))
 
 
 def _slot_names(mask: int) -> list[str]:
@@ -146,6 +187,23 @@ def _model_name(record: dict) -> str:
         suffix.append(f"rank={record['augment_rank']}")
     suffix.extend(str(value) for value in augment)
     return str(record.get("name") or "Unknown") + (" [" + "; ".join(suffix) + "]" if suffix else "")
+
+
+def _normalize_augment_path(value: object) -> str:
+    """Return the stable A/B/C path token exported by GearSetBuilder."""
+    text = str(value or "").strip().upper()
+    match = re.search(r"(?:PATH\s*)?([ABC])$", text)
+    return match.group(1) if match else text
+
+
+def _builtin_augment_path(item: dict) -> str:
+    """Read explicit path metadata, with legacy Name2 labels as fallback."""
+    explicit = _normalize_augment_path(item.get("Augment Path"))
+    if explicit:
+        return explicit
+    label = str(item.get("Name2") or "").upper()
+    match = re.search(r"(?:\bR\d+|\bPATH\s*|\s)([ABC])(?:\s*\(SUB\))?$", label)
+    return match.group(1) if match else ""
 
 
 def _accessible_count(record: dict) -> int:
@@ -194,6 +252,11 @@ def _gear_record(record: dict, *, eligible: bool = True, hoxne_mastery_rank: int
         "Slots": slots,
         "Augments": deepcopy(record.get("augments") or []),
     })
+    augment_path = _normalize_augment_path(record.get("augment_path"))
+    if augment_path:
+        result["Augment Path"] = augment_path
+    if record.get("augment_rank") not in (None, ""):
+        result["Rank"] = int(record["augment_rank"])
     if unknown_augments:
         result["Model Warning"] = "Unmodeled scan effect: " + ", ".join(unknown_augments)
         result["Unknown Augments"] = list(unknown_augments)
@@ -202,10 +265,15 @@ def _gear_record(record: dict, *, eligible: bool = True, hoxne_mastery_rank: int
         result["Model Warning"] = "; ".join(filter(None, (existing, str(record["model_warning"]))))
     if record.get("conditional_effects"):
         result["Conditional Effects"] = list(record["conditional_effects"])
+    if item_id in (28520, 28521):
+        result["Conditional Effects"] = [
+            "Set: Steelflash Earring + Bladeborn Earring grants Double Attack +7%"
+        ]
     if record.get("data_source"):
         result["Data Source"] = str(record["data_source"])
     resource_flags = int(record.get("resource_flags") or record.get("Resource Flags") or 0)
     exclusive = bool(record.get("exclusive", record.get("Exclusive", False)))
+    augmented = _record_is_augmented(record)
     transferable = record.get("transferable", record.get("Transferable"))
     if transferable is None:
         # The SDK's no-delivery/no-trade bits are the conservative Ex test;
@@ -214,8 +282,10 @@ def _gear_record(record: dict, *, eligible: bool = True, hoxne_mastery_rank: int
         transferable = False
     result.update({
         "Resource Flags": resource_flags,
+        "Rare": bool(resource_flags & 0x8000),
         "Exclusive": exclusive or bool(resource_flags & 0x6000),
-        "Transferable": bool(transferable) and not bool(resource_flags & 0x6000),
+        "Augmented": augmented,
+        "Transferable": bool(transferable) and not augmented and not bool(resource_flags & 0x6000),
     })
     # Newer GearSetBuilder exports may include item-level metadata.  Preserve
     # it for optional optimizer filtering without feeding it into any damage
@@ -285,6 +355,14 @@ def _with_builtin_model(record: dict, item: dict) -> dict:
     name = str(record.get("name") or "").lower()
     candidates = [value for value in gear_pyfile.all_gear.values()
                   if str(value.get("Name") or "").lower() == name]
+    path = _normalize_augment_path(record.get("augment_path"))
+    if path:
+        # Divergence paths share one item ID. The path is separate inventory
+        # metadata, so resolve it before rank or free-form description text.
+        candidates = [value for value in candidates if _builtin_augment_path(value) == path]
+        main_hand = [value for value in candidates
+                     if not str(value.get("Name2") or "").lower().endswith("(sub)")]
+        candidates = main_hand or candidates
     rank = record.get("augment_rank")
     if rank is not None:
         ranked = [value for value in candidates if int(value.get("Rank", -1) or -1) == int(rank)]
@@ -302,10 +380,14 @@ def _with_builtin_model(record: dict, item: dict) -> dict:
     base = deepcopy(candidates[0])
     bridge_stats = item.copy()
     # Preserve the stable character identity and actual resource restrictions.
-    base.update({key: value for key, value in bridge_stats.items()
-                 if key not in {"Name", "Name2", "Type", "Skill Type", "Jobs", "Bridge Key",
-                                "Accessible Count", "Total Count", "Model Complete", "Eligible",
-                                "LAC", "Slots", "Augments"}})
+    for key, value in bridge_stats.items():
+        if key not in {"Name", "Name2", "Type", "Skill Type", "Jobs", "Bridge Key",
+                       "Accessible Count", "Total Count", "Model Complete", "Eligible",
+                       "LAC", "Slots", "Augments"} and key not in base:
+            # The reviewed built-in variant owns stats it explicitly models.
+            # Bridge-only stats still fill gaps, but cannot erase a selected
+            # path bonus with the shared unaugmented resource value.
+            base[key] = value
     base["Name"] = item["Name"]
     base["Name2"] = item["Name2"]
     for key in ("Type", "Skill Type", "Jobs", "Accessible Count", "Total Count", "Model Complete", "Eligible"):

@@ -244,6 +244,37 @@ def write_set(profile_path: Path, set_name: str, equipment: dict[str, dict], *, 
     return backup, bridge_hash(updated)
 
 
+def write_profile_source(profile_path: Path, source: str, *, expected_hash: str,
+                         backup_dir: Path | None = None) -> tuple[Path, str]:
+    """Atomically save a manually edited LAC file with backup/conflict protection."""
+    profile_path = profile_path.resolve()
+    if not profile_path.exists():
+        raise FileNotFoundError(profile_path)
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("LuAshitacast profile cannot be empty.")
+    if "\x00" in source:
+        raise ValueError("LuAshitacast profile contains a NUL character.")
+    current = profile_path.read_text(encoding="utf-8")
+    if expected_hash and bridge_hash(current) != expected_hash:
+        raise RuntimeError(
+            "LuAshitacast profile changed on disk after it was opened; reload before saving."
+        )
+    backup_dir = backup_dir or profile_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / (
+        f"{profile_path.stem}_{__import__('datetime').datetime.now():%Y.%m.%d_%H.%M.%S_%f}.lua"
+    )
+    backup.write_text(current, encoding="utf-8", newline="")
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", newline="", dir=profile_path.parent,
+        prefix=profile_path.name + ".", suffix=".tmp", delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        handle.write(source)
+    os.replace(temporary, profile_path)
+    return backup, bridge_hash(source)
+
+
 def prepare_managed_update(source: str, sets: dict[str, dict[str, dict]], *,
                            add_wsdist_cycle: bool = True) -> str:
     """Return a validated profile update for an atomic managed-set write."""
@@ -315,6 +346,22 @@ def prepare_profile_builder_update(source: str, sets: dict[str, dict[str, dict]]
         if initialize is None:
             raise RuntimeError("Could not find gcinclude.Initialize() for Profile Builder cycles.")
         updated = updated[:initialize.end()] + "\n" + initialize.group("indent") + melee_cycle + updated[initialize.end():]
+    hybrid_accuracy_pattern = re.compile(
+        r"gcdisplay\.CreateCycle\(\s*['\"]HybridAccuracy['\"]\s*,\s*\{.*?\}\s*\)\s*;?",
+        re.DOTALL,
+    )
+    hybrid_accuracy_cycle = (
+        "gcdisplay.CreateCycle('HybridAccuracy', { [1] = 'Default', "
+        "[2] = 'Acc', [3] = 'HighAcc' });"
+    )
+    if hybrid_accuracy_pattern.search(updated):
+        updated = hybrid_accuracy_pattern.sub(hybrid_accuracy_cycle, updated, count=1)
+    else:
+        position = updated.find(melee_cycle)
+        updated = (
+            updated[:position + len(melee_cycle)] + "\n    " + hybrid_accuracy_cycle
+            + updated[position + len(melee_cycle):]
+        )
     defense_cycle = "gcdisplay.CreateCycle('DefenseSet', { " + ", ".join(
         f"[{index}] = {_lua_quote(mode)}" for index, mode in enumerate(defense_modes, 1)
     ) + " });"
@@ -343,18 +390,40 @@ def prepare_profile_builder_update(source: str, sets: dict[str, dict[str, dict]]
         if check >= 0:
             line_end = updated.find("\n", check)
             updated = updated[:line_end + 1] + "    applyWSDistDefenseSet();\n" + updated[line_end + 1:]
+    hybrid_adapter = (
+        "\n-- WSDIST-PROFILE-BUILDER hybrid TP adapter\n"
+        "local function applyWSDistHybridTpSet()\n"
+        "    if ((gcdisplay.GetCycle('MeleeSet') or 'Default') ~= 'Hybrid') then return; end\n"
+        "    local accuracy = gcdisplay.GetCycle('HybridAccuracy') or 'Default';\n"
+        "    local setName = 'Tp_Hybrid';\n"
+        "    if (accuracy ~= 'Default') then setName = setName .. '_' .. accuracy; end\n"
+        "    if (sets[setName] ~= nil) then gFunc.EquipSet(sets[setName]); end\n"
+        "end\n"
+    )
+    if "WSDIST-PROFILE-BUILDER hybrid TP adapter" not in updated:
+        anchor = re.search(r"profile\.HandleDefault\s*=\s*function\(\)", updated)
+        if anchor is None:
+            raise RuntimeError("Could not locate profile.HandleDefault for Hybrid TP adapter.")
+        updated = updated[:anchor.start()] + hybrid_adapter + "\n" + updated[anchor.start():]
+        start = updated.find("profile.HandleDefault", anchor.start() + len(hybrid_adapter))
+        finish = updated.find("end", start)
+        check = updated.find("gcinclude.CheckDefault", start, finish + 2000)
+        if check >= 0:
+            line_end = updated.find("\n", check)
+            updated = updated[:line_end + 1] + "    applyWSDistHybridTpSet();\n" + updated[line_end + 1:]
     parse_set_entries(updated)
     return updated
 
 
 def write_managed_sets(profile_path: Path, sets: dict[str, dict[str, dict]], *,
-                       expected_hash: str, backup_dir: Path | None = None) -> tuple[Path, str]:
+                       expected_hash: str, backup_dir: Path | None = None,
+                       add_wsdist_cycle: bool = True) -> tuple[Path, str]:
     """Write a TP/WS managed pair as one backed-up atomic transaction."""
     profile_path = profile_path.resolve()
     source = profile_path.read_text(encoding="utf-8")
     if expected_hash and bridge_hash(source) != expected_hash:
         raise RuntimeError("LuAshitacast profile changed since WSDist imported it; refresh before saving.")
-    updated = prepare_managed_update(source, sets)
+    updated = prepare_managed_update(source, sets, add_wsdist_cycle=add_wsdist_cycle)
     backup_dir = backup_dir or profile_path.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup = backup_dir / f"{profile_path.stem}_{__import__('datetime').datetime.now():%Y.%m.%d_%H.%M.%S_%f}.lua"

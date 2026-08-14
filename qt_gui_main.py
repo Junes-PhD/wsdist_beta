@@ -27,22 +27,27 @@ from pathlib import Path
 
 import numpy as np
 
-from PyQt6.QtCore import QSettings, QSize, Qt, QStandardPaths, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFontMetrics, QIcon, QPixmap
+from PyQt6.QtCore import QEvent, QRect, QSettings, QSize, Qt, QStandardPaths, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import (
+    QAction, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPixmap,
+    QSyntaxHighlighter, QTextCharFormat, QTextFormat,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-    QInputDialog, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QScrollArea, QDoubleSpinBox, QSpinBox, QSplitter,
+    QHeaderView, QInputDialog, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QDoubleSpinBox, QSpinBox, QSplitter,
     QSizePolicy, QStackedWidget, QStatusBar, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+    from matplotlib.figure import Figure
 except ImportError:  # pragma: no cover - plotting remains optional for headless installs.
     FigureCanvas = None
     NavigationToolbar = None
+    Figure = None
 
 import actions
 import buffs as buff_data
@@ -51,16 +56,19 @@ import enemies
 import fancy_plot
 import gear
 import wsdist
-from simulation_cache import SimulationCache, source_fingerprint
+from equipment_rules import is_right_ear_only
+from simulation_cache import SimulationCache, canonical_json, source_fingerprint
 from result_history import ResultHistory
-from wsdist_bridge import BridgeStore
+from wsdist_bridge import BridgeStore, bridge_hash
 from lac_profile import (
-    prepare_profile_builder_update, write_profile_builder_sets,
+    prepare_managed_update, prepare_profile_builder_update, write_managed_sets,
+    write_profile_builder_sets, write_profile_source,
     write_reload_request,
 )
 from profile_builder import (
-    GearSources, ProfileRecipe, bridge_candidates, build_stat_set, child_seed, pin_unmodeled_slots,
-    optimizer_scenario, profile_recipes, weapon_category, weapon_overlays,
+    GearSources, ProfileRecipe, bridge_candidates, build_profile_catalog, build_stat_set,
+    child_seed, group_similar_ws_sets, pin_unmodeled_slots, optimizer_scenario,
+    SET_SLOTS, weapon_category,
 )
 
 
@@ -79,9 +87,45 @@ SLOTS = (
     "body", "hands", "ring1", "ring2", "back", "waist", "legs", "feet",
 )
 OPTIMIZER_RUN_COLORS = (
-    "#1769aa", "#8e44ad", "#00897b", "#d35400", "#c2185b",
-    "#5d4037", "#546e7a", "#6d4c41", "#00796b", "#7b1fa2",
+    "#d6ad68", "#c995a9", "#aaa3bc", "#c5b486", "#9d96ad",
+    "#d0a28c", "#b9af9c", "#ad8f9e", "#c7b27e", "#958ea3",
 )
+SEARCH_QUALITY = {
+    "Fast": {"restarts": 6, "passes": 4, "shared_start": True},
+    "Standard": {"restarts": 10, "passes": 10, "shared_start": True},
+    "Deep": {"restarts": 12, "passes": 10, "shared_start": False},
+}
+SEARCH_QUALITY_NAMES = tuple(SEARCH_QUALITY)
+# The same three enemy tiers used by Profile Builder's Default, Accuracy, and
+# High Accuracy scenarios.  Graphs may compare the active enemy against these
+# references without changing the selected optimizer scenario.
+PROFILE_REFERENCE_ENEMIES = (
+    "Apex Toad",
+    "Apex Knight Lugcrawler",
+    "Apex Archaic Cogs",
+)
+
+
+def _reference_enemy_names(current_name: str, enabled: bool = True) -> tuple[str, ...]:
+    """Return unique graph labels, keeping the active enemy first."""
+    current = str(current_name or "").strip()
+    names = [current] if current else []
+    if enabled:
+        names.extend(name for name in PROFILE_REFERENCE_ENEMIES if name != current)
+    return tuple(dict.fromkeys(names))
+
+
+def _normalized_search_quality(value: str, *, legacy_deep: bool = False) -> str:
+    """Normalize persisted search quality, migrating the former Deep tier."""
+    text = str(value or "").strip().title()
+    if legacy_deep and text == "Deep":
+        return "Standard"
+    return text if text in SEARCH_QUALITY else "Fast"
+
+
+def _search_quality_settings(value: str) -> tuple[int, int, bool]:
+    policy = SEARCH_QUALITY[_normalized_search_quality(value)]
+    return int(policy["passes"]), int(policy["restarts"]), bool(policy["shared_start"])
 ARMOR_SLOTS = (
     "head", "neck", "ear1", "ear2", "body", "hands",
     "ring1", "ring2", "back", "waist", "legs", "feet",
@@ -248,38 +292,6 @@ WEAPON_TYPE_OPTIONS = [
     ),
 ]
 
-SCENARIO_PRESETS = {
-    "TP Default · Apex Toad": {
-        "enemy": "Apex Toad", "tp": 1000, "pdt": 0, "mdt": 0, "dt": 0,
-        "note": "Default TP damage against the standard Apex Toad target.",
-    },
-    "TP Acc · Apex Knight Lugcrawler": {
-        "enemy": "Apex Knight Lugcrawler", "tp": 1000, "pdt": 0, "mdt": 0, "dt": 0,
-        "note": "Accuracy-focused TP scenario.",
-    },
-    "TP HighAcc · Apex Archaic Cogs": {
-        "enemy": "Apex Archaic Cogs", "tp": 1000, "pdt": 0, "mdt": 0, "dt": 0,
-        "note": "High-accuracy TP scenario for evasive targets.",
-    },
-    "TP Hybrid · Lugcrawler": {
-        "enemy": "Apex Knight Lugcrawler", "tp": 1000, "pdt": 50, "mdt": 25, "dt": 0,
-        "note": "Damage-focused hybrid with 50% PDT and 25% MDT requirements.",
-    },
-    "DT Survival · Apex Toad": {
-        "enemy": "Apex Toad", "tp": 1000, "pdt": 50, "mdt": 50, "dt": 50,
-        "note": "Pure reduction target; prefer HP, defense, MEVA, and evasion after caps.",
-    },
-    "Evasion · Apex Toad": {
-        "enemy": "Apex Toad", "tp": 1000, "pdt": 0, "mdt": 0, "dt": 0,
-        "objective": "Evasion", "note": "Evasion-focused defensive scenario with DT and HP tie-breakers.",
-    },
-    "MEVA · Apex Archaic Cogs": {
-        "enemy": "Apex Archaic Cogs", "tp": 1000, "pdt": 0, "mdt": 0, "dt": 0,
-        "objective": "MEVA", "note": "Magic-evasion-focused defensive scenario with DT and HP tie-breakers.",
-    },
-}
-
-
 def weapon_skill_choices(weapon_type: str, gearset: dict | None = None) -> list[str]:
     """Return WS choices from an explicit skill family, not a temporary gearset."""
     selected = str(weapon_type or AUTO_WEAPON_TYPE)
@@ -287,9 +299,13 @@ def weapon_skill_choices(weapon_type: str, gearset: dict | None = None) -> list[
         skills = []
         for slot in ("main", "ranged"):
             skill = (gearset or {}).get(slot, {}).get("Skill Type", "None")
-            skills.extend(WS_BY_SKILL.get(skill, ()))
+            if skill and skill != "None":
+                skills.extend(WS_BY_SKILL.get(skill, ()))
         if not skills:
-            skills = [value for values in WS_BY_SKILL.values() for value in values]
+            skills = [
+                value for skill, values in WS_BY_SKILL.items()
+                if skill != "None" for value in values if value != "None"
+            ]
     else:
         skills = list(WS_BY_SKILL.get(selected, ()))
     return list(dict.fromkeys(("None", *skills)))
@@ -340,13 +356,36 @@ PROFILE_SLOT_MAP = {
     "back": "back",
 }
 WEAPON_SLOTS = ("main", "sub", "ranged", "ammo")
-ITEM_LEVEL_FILTER_SLOTS = ("main", "head", "body", "hands", "legs", "feet")
+# Item level is an armor requirement here. Weapons use progression systems
+# that are not represented reliably by their resource ItemLevel value.
+ITEM_LEVEL_FILTER_SLOTS = ("head", "body", "hands", "legs", "feet")
 SUBSTAT_OPTIONS = (
     "None", "Magic Evasion", "Evasion", "Defense", "Magic Defense",
     "Subtle Blow", "Counter", "Store TP", "Accuracy", "Magic Accuracy",
     "Attack", "Magic Attack", "HP", "MP", "Enmity",
 )
 WARM_CACHE_ACTION = "Warm cache - WS ranking (1k/2k/3k TP)"
+OPTIMIZER_STATE_LABELS = {
+    "idle": "READY",
+    "starting": "STARTING",
+    "running": "SIMULATION RUNNING",
+    "warming": "CACHE RUNNING",
+    "stopping": "STOPPING",
+    "completed": "COMPLETE",
+    "restored": "RESTORED",
+    "stopped": "STOPPED",
+    "failed": "FAILED",
+}
+
+
+def _item_level_candidate_allowed(slot: str, level: int | None, enabled: bool) -> bool:
+    """Return whether the armor-level filter permits one optimizer item."""
+    return (
+        not enabled
+        or slot not in ITEM_LEVEL_FILTER_SLOTS
+        or level is None
+        or level >= 119
+    )
 
 
 def _gearset_payload(gearset: dict) -> dict[str, dict]:
@@ -426,6 +465,135 @@ def _evaluate_quick_result(player, enemy, action: str, *, tp: int = 0,
     else:
         raise ValueError(f"Unknown Quick Look action: {action}")
     return output, text
+
+
+def _quick_result_chart_data(action: str, output, *, tp_target: int = 1000) -> dict | None:
+    """Normalize a deterministic Quick Look result for its inline chart."""
+    action = "attack" if action == "tp" else action
+    try:
+        values = list(output or ())
+        details = list(values[1] or ())
+        if action == "attack" and len(values) >= 2 and len(details) >= 3:
+            time_to_ws = max(0.0, float(values[0]))
+            damage = max(0.0, float(details[0]))
+            tp_per_round = max(0.0, float(details[1]))
+            round_time = max(0.0, float(details[2]))
+            magical_damage = max(0.0, float(values[2])) if len(values) >= 3 else 0.0
+            target = max(1.0, float(tp_target or 1000))
+            return {
+                "kind": "tp_pace",
+                "time_to_ws": time_to_ws,
+                "target_tp": target,
+                "damage_per_round": damage,
+                "tp_per_round": tp_per_round,
+                "round_time": round_time,
+                "physical_damage": max(0.0, damage - magical_damage),
+                "magical_damage": min(damage, magical_damage),
+            }
+        if action in {"ws", "spell"} and len(details) >= 2:
+            return {
+                "kind": "action_result",
+                "action": action,
+                "damage": max(0.0, float(details[0])),
+                "tp_return": max(0.0, float(details[1])),
+            }
+    except (TypeError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _ws_distribution_chart_data(distribution: dict | None) -> dict | None:
+    """Validate and normalize a sampled WS histogram for an inline graph."""
+    try:
+        distribution = distribution or {}
+        histogram = distribution.get("histogram") or {}
+        edges = np.asarray(histogram.get("edges") or [], dtype=float)
+        counts = np.asarray(histogram.get("counts") or [], dtype=float)
+        samples = int(distribution.get("samples") or np.sum(counts))
+        summary_values = np.asarray([
+            distribution.get("mean", 0), distribution.get("median", 0),
+            distribution.get("p05", 0), distribution.get("p95", 0),
+        ], dtype=float)
+        if (
+            len(edges) != len(counts) + 1 or not len(counts) or samples <= 0
+            or not np.isfinite(edges).all() or not np.isfinite(counts).all()
+            or not np.isfinite(summary_values).all()
+            or np.any(np.diff(edges) <= 0) or np.any(counts < 0)
+        ):
+            return None
+        return {
+            "edges": edges,
+            "counts": counts,
+            "samples": samples,
+            "mean": float(summary_values[0]),
+            "median": float(summary_values[1]),
+            "p05": float(summary_values[2]),
+            "p95": float(summary_values[3]),
+        }
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _dps_series_chart_data(summary: dict | None) -> dict | None:
+    """Validate the two-hour convergence series before plotting it in Qt."""
+    try:
+        summary = summary or {}
+        source = summary.get("dps_series") or {}
+        result = {}
+        for name, time_name in (("total", "time"), ("tp", "tp_time"), ("ws", "ws_time")):
+            times = np.asarray(source.get(time_name) or [], dtype=float)
+            values = np.asarray(source.get(name) or [], dtype=float)
+            if len(times) != len(values) or not len(times):
+                continue
+            finite = np.isfinite(times) & np.isfinite(values)
+            if np.any(finite):
+                result[name] = (times[finite], values[finite])
+        return result or None
+    except (TypeError, ValueError):
+        return None
+
+
+def _remaining_time_estimate(samples: list[tuple[float, float]], *,
+                             elapsed: float, progress: float) -> float | None:
+    """Estimate remaining work from a stable blend of recent and total progress."""
+    progress = max(0.0, min(1.0, float(progress)))
+    elapsed = max(0.0, float(elapsed))
+    if progress >= 1.0:
+        return 0.0
+    if progress <= 0.001 or elapsed < 1.0:
+        return None
+    global_rate = progress / elapsed
+    recent_rate = None
+    useful = [
+        (float(moment), float(fraction)) for moment, fraction in samples
+        if moment >= 0 and 0 <= fraction <= progress
+    ]
+    if len(useful) >= 2:
+        newest_time, newest_progress = useful[-1]
+        # Prefer roughly the last minute, but keep at least one older sample.
+        oldest_time, oldest_progress = useful[0]
+        for candidate_time, candidate_progress in reversed(useful[:-1]):
+            oldest_time, oldest_progress = candidate_time, candidate_progress
+            if newest_time - candidate_time >= 45:
+                break
+        delta_time = newest_time - oldest_time
+        delta_progress = newest_progress - oldest_progress
+        if delta_time >= 2 and delta_progress > 0.0001:
+            recent_rate = delta_progress / delta_time
+    rate = global_rate if recent_rate is None else 0.65 * recent_rate + 0.35 * global_rate
+    if rate <= 0:
+        return None
+    estimate = (1.0 - progress) / rate
+    # Prevent one sparse worker update from producing a wildly misleading ETA.
+    return min(estimate, elapsed * 20 + 3600)
+
+
+def _optimizer_current_result_lines(value: str | None) -> str:
+    """Put unlike live-result metrics on separate, scannable lines."""
+    text = str(value or "waiting for a valid set").strip()
+    text = re.sub(r"^current results:\s*", "", text, flags=re.I)
+    parts = [part.strip().rstrip(".") for part in text.split(";") if part.strip()]
+    return "\n".join(f"• {part}" for part in parts) or "• waiting for a valid set"
 
 
 def _reduction_text(value) -> str:
@@ -549,6 +717,14 @@ def _restore_top_results(results: list[dict], context: dict) -> list[dict]:
     return restored
 
 
+def _optimizer_result_players(result: dict):
+    """Return the TP/WS pair whether stored explicitly or in a combined wrapper."""
+    player = result.get("player")
+    tp_player = result.get("tp_player") or getattr(player, "tp_player", None) or player
+    ws_player = result.get("ws_player") or getattr(player, "ws_player", None) or player
+    return tp_player, ws_player
+
+
 def _optimizer_check_gear(candidates: dict[str, set[str]], items_by_slot: dict[str, list[dict]], quick_gear: dict[str, dict]):
     """Build optimizer candidates without reintroducing unselected weapons."""
     check_gear = {}
@@ -617,7 +793,11 @@ def _profile_category(set_name: str) -> str | None:
     return None
 
 
-PROFILE_VARIANTS = {"default": "Default", "acc": "Acc", "hybrid": "Hybrid", "wsdist": "WSDist"}
+PROFILE_VARIANTS = {
+    "default": "Default", "acc": "Acc", "highacc": "HighAcc",
+    "hybrid": "Hybrid", "hybridacc": "HybridAcc",
+    "hybridhighacc": "HybridHighAcc", "wsdist": "WSDist",
+}
 
 
 def _profile_set_descriptor(set_name: str, metadata: dict | None = None) -> dict:
@@ -627,8 +807,16 @@ def _profile_set_descriptor(set_name: str, metadata: dict | None = None) -> dict
     lowered = [piece.casefold() for piece in pieces]
     variant_index = next((i for i, value in enumerate(lowered) if value in PROFILE_VARIANTS), None)
     variant = PROFILE_VARIANTS.get(lowered[variant_index], "Default") if variant_index is not None else "Default"
+    variant_end = variant_index + 1 if variant_index is not None else 1
+    if variant == "Hybrid" and variant_end < len(lowered):
+        if lowered[variant_end] == "acc":
+            variant = "HybridAcc"
+            variant_end += 1
+        elif lowered[variant_end] == "highacc":
+            variant = "HybridHighAcc"
+            variant_end += 1
     family = "_".join(pieces[:variant_index]) if variant_index is not None else (pieces[0] if pieces else set_name)
-    modifiers = pieces[variant_index + 1:] if variant_index is not None else pieces[1:]
+    modifiers = pieces[variant_end:] if variant_index is not None else pieces[1:]
     first = lowered[0] if lowered else ""
     ws_name = str(supplied.get("ws_name") or "") or _profile_ws_name(set_name)
     role = str(supplied.get("role") or "")
@@ -689,7 +877,9 @@ def item_tooltip(item: dict) -> str:
     ignored = {
         "Name", "Name2", "Jobs", "Slots", "Bridge Key", "Eligible",
         "Shared Only", "Shared Characters", "Aspirational Only", "Model Warning",
-        "Unknown Augments",
+        "Unknown Augments", "Item ID", "Accessible Count", "Total Count",
+        "Model Complete", "Item Level", "ItemLevel", "Rank", "Rare", "Exclusive",
+        "Transferable", "Porter Only", "LAC", "Augments", "Resource Flags",
     }
     lines = [str(item.get("Name") or item_name(item))]
     for key, value in item.items():
@@ -698,6 +888,41 @@ def item_tooltip(item: dict) -> str:
     if item.get("Model Warning"):
         lines.append(f"WARNING: {item['Model Warning']}")
     return "\n".join(lines)
+
+
+def item_detail_stats(item: dict, *, limit: int = 7) -> list[str]:
+    """Return player-facing item stats, excluding inventory/catalog metadata."""
+    ignored = {
+        "Name", "Name2", "Jobs", "Slots", "Bridge Key", "Eligible",
+        "Shared Only", "Shared Characters", "Aspirational Only", "Model Warning",
+        "Unknown Augments", "Item ID", "Accessible Count", "Total Count",
+        "Model Complete", "Item Level", "ItemLevel", "Rank", "Type", "Skill Type",
+        "Resource Flags", "Model Source", "Source", "Augment Path", "Rare",
+        "Exclusive", "Transferable", "LAC", "Augments", "Data Source",
+        "Porter Only",
+    }
+    priority = (
+        "DMG", "Damage", "Delay", "Accuracy", "Attack", "Ranged Accuracy",
+        "Ranged Attack", "Magic Accuracy", "Magic Attack", "Magic Damage",
+        "STR", "DEX", "VIT", "AGI", "INT", "MND", "CHR", "HP", "MP",
+        "Defense", "Evasion", "Magic Evasion", "Magic Defense", "Gear Haste", "DT",
+    )
+    available = {
+        key: value for key, value in item.items()
+        if key not in ignored and value not in (None, "", 0, False, [], {})
+        and isinstance(value, (int, float, str))
+    }
+    ordered = [key for key in priority if key in available]
+    ordered.extend(key for key in available if key not in ordered)
+    values = []
+    for key in ordered[:limit]:
+        value = available[key]
+        display_key = {"Gear Haste": "Haste"}.get(key, key)
+        if display_key == "Haste" and isinstance(value, (int, float)):
+            values.append(f"{display_key}: {value:g}%")
+        else:
+            values.append(f"{display_key}: {value:g}" if isinstance(value, float) else f"{display_key}: {value}")
+    return values
 
 
 def _is_r15_variant(item: dict) -> bool:
@@ -840,6 +1065,29 @@ class GearIconProvider:
                 break
         if icon.isNull():
             icon = self._archive_icon(item_id)
+        # Profiles can retain an older-stage REMA resource ID while the owned
+        # inventory/export has the current 119 III ID. If the exact historical
+        # icon is unavailable, fall back to the canonical name's current icon
+        # instead of showing an empty Masamune (or equivalent upgrade).
+        if icon.isNull():
+            fallback_ids = []
+            for key in (item.get("Name"), item.get("Name2")):
+                fallback_id = self._item_ids.get(str(key or "").casefold())
+                if fallback_id and fallback_id != item_id and fallback_id not in fallback_ids:
+                    fallback_ids.append(fallback_id)
+            for fallback_id in fallback_ids:
+                for root in roots:
+                    for extension in ("png", "bmp", "ico"):
+                        path = root / f"{fallback_id}.{extension}"
+                        if path.is_file():
+                            icon = QIcon(str(path))
+                            break
+                    if not icon.isNull():
+                        break
+                if icon.isNull():
+                    icon = self._archive_icon(fallback_id)
+                if not icon.isNull():
+                    break
         self._icons[cache_key] = icon
         return icon
 
@@ -896,8 +1144,11 @@ class GearPicker(QDialog):
 
 
 class CandidatePicker(QDialog):
+    blacklist_requested = pyqtSignal(str)
+
     def __init__(self, slot: str, items: list[dict], selected: set[str],
-                 icons: GearIconProvider, locked_name: str = "", parent=None):
+                 icons: GearIconProvider, locked_name: str = "", parent=None,
+                 *, blacklisted_items: list[dict] | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"Optimizer candidates: {slot.title()}")
         self.setMinimumSize(520, 440)
@@ -906,9 +1157,14 @@ class CandidatePicker(QDialog):
         self._player_items = [
             item for item in self._items
             if not item.get("Shared Only") and not item.get("Aspirational Only")
+            and not item.get("Porter Only")
         ]
+        self._porter_items = [item for item in self._items if item.get("Porter Only")]
         self._aspirational_items = [item for item in self._items if item.get("Aspirational Only")]
         self._transferable_items = [item for item in self._items if item.get("Shared Only")]
+        self._blacklisted_items = sorted(
+            blacklisted_items or [], key=lambda value: item_name(value).lower()
+        )
         self.selected_names = set(selected)
         self.locked_name = str(locked_name or "")
         self.icons = icons
@@ -921,10 +1177,17 @@ class CandidatePicker(QDialog):
         self.list.setIconSize(QSize(32, 32))
         self.list.setSpacing(1)
         self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.setToolTip(
+            "Double-click an item to lock or unlock the slot. Right-click to blacklist it."
+        )
         layout.addWidget(self.search)
         lock_row = QHBoxLayout()
-        lock_row.addWidget(QLabel("Lock this slot"))
+        self.lock_label = QLabel("Lock this slot")
+        self.lock_label.setObjectName("candidateLockLabel")
+        lock_row.addWidget(self.lock_label)
         self.lock_combo = QComboBox()
+        self.lock_combo.setObjectName("candidateLockCombo")
         self.lock_combo.addItem("No lock", "")
         for item in self._items:
             self.lock_combo.addItem(item_name(item), item_name(item))
@@ -933,6 +1196,7 @@ class CandidatePicker(QDialog):
         self.lock_combo.setToolTip(
             "The selected item is forced in this slot when the optimizer runs."
         )
+        self.lock_combo.currentIndexChanged.connect(self._refresh_lock_style)
         lock_row.addWidget(self.lock_combo, 1)
         layout.addLayout(lock_row)
         layout.addWidget(self.list, 1)
@@ -952,7 +1216,19 @@ class CandidatePicker(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.search.textChanged.connect(self._populate)
+        self.list.itemDoubleClicked.connect(self._toggle_row_lock)
+        self.list.customContextMenuRequested.connect(self._show_item_menu)
+        self._refresh_lock_style()
         self._populate()
+
+    def _refresh_lock_style(self):
+        locked = bool(self.lock_combo.currentData())
+        self.lock_combo.setProperty("locked", locked)
+        self.lock_label.setProperty("locked", locked)
+        self.lock_label.setText("LOCKED" if locked else "Lock this slot")
+        for widget in (self.lock_combo, self.lock_label):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
 
     @staticmethod
     def _is_candidate_row(row: QListWidgetItem) -> bool:
@@ -986,10 +1262,22 @@ class CandidatePicker(QDialog):
             row.setSizeHint(QSize(0, 40))
             self.list.addItem(row)
 
-    def _append_section_header(self, title: str):
+    def _append_blacklisted_items(self, items: list[dict]):
+        for item in items:
+            name = item_name(item)
+            row = QListWidgetItem(name)
+            row.setIcon(self.icons.icon(item))
+            row.setData(Qt.ItemDataRole.UserRole, name)
+            row.setToolTip(f"BLACKLISTED — excluded from optimizer.\n{item_tooltip(item)}")
+            row.setFlags(Qt.ItemFlag.NoItemFlags)
+            row.setForeground(QColor("#817d8a"))
+            row.setSizeHint(QSize(0, 40))
+            self.list.addItem(row)
+
+    def _append_section_header(self, title: str, color: str = "#e6c983"):
         header = QListWidgetItem(title)
         header.setFlags(Qt.ItemFlag.NoItemFlags)
-        header.setForeground(QColor("#475467"))
+        header.setForeground(QColor(color))
         font = header.font()
         font.setBold(True)
         header.setFont(font)
@@ -1001,6 +1289,13 @@ class CandidatePicker(QDialog):
         query = self.search.text().strip().lower()
         self.list.clear()
         self._append_items(self._player_items, query)
+        porter = [
+            item for item in self._porter_items
+            if not query or query in item_tooltip(item).lower()
+        ]
+        if porter:
+            self._append_section_header("Porter slip gear")
+            self._append_items(porter, "")
         transferable = [
             item for item in self._transferable_items
             if not query or query in item_tooltip(item).lower()
@@ -1015,6 +1310,15 @@ class CandidatePicker(QDialog):
         if aspirational:
             self._append_section_header("Aspirational gear")
             self._append_items(aspirational, "")
+        blacklisted = [
+            item for item in self._blacklisted_items
+            if not query or query in item_tooltip(item).lower()
+        ]
+        if blacklisted:
+            self._append_section_header(
+                "Blacklisted — excluded from optimizer", "#817d8a"
+            )
+            self._append_blacklisted_items(blacklisted)
 
     def _check_visible(self, checked: bool):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
@@ -1022,6 +1326,50 @@ class CandidatePicker(QDialog):
             row = self.list.item(index)
             if self._is_candidate_row(row):
                 row.setCheckState(state)
+
+    def _toggle_row_lock(self, row: QListWidgetItem):
+        if not self._is_candidate_row(row):
+            return
+        name = str(row.data(Qt.ItemDataRole.UserRole) or "")
+        target = "" if self.lock_combo.currentData() == name else name
+        index = self.lock_combo.findData(target)
+        self.lock_combo.setCurrentIndex(max(0, index))
+
+    def _show_item_menu(self, position):
+        row = self.list.itemAt(position)
+        if row is None or not self._is_candidate_row(row):
+            return
+        name = str(row.data(Qt.ItemDataRole.UserRole) or "")
+        if not name or name == "Empty":
+            return
+        menu = QMenu(self)
+        blacklist = menu.addAction(f"Add {name} to global blacklist")
+        blacklist.triggered.connect(lambda _checked=False: self._blacklist_candidate(name))
+        menu.exec(self.list.viewport().mapToGlobal(position))
+
+    def _blacklist_candidate(self, name: str):
+        item = next((value for value in self._items if item_name(value) == name), None)
+        if item is None:
+            return
+        self._remember_visible()
+        self.selected_names.discard(name)
+        if self.lock_combo.currentData() == name:
+            self.lock_combo.setCurrentIndex(0)
+        lock_index = self.lock_combo.findData(name)
+        if lock_index >= 0:
+            self.lock_combo.removeItem(lock_index)
+        self._items = [value for value in self._items if item_name(value) != name]
+        for collection in (
+            self._player_items, self._porter_items,
+            self._transferable_items, self._aspirational_items,
+        ):
+            collection[:] = [value for value in collection if item_name(value) != name]
+        if not any(item_name(value) == name for value in self._blacklisted_items):
+            self._blacklisted_items.append(item)
+            self._blacklisted_items.sort(key=lambda value: item_name(value).casefold())
+        self.list.clear()
+        self._populate()
+        self.blacklist_requested.emit(name)
 
     def _accept_selection(self):
         self._remember_visible()
@@ -1032,14 +1380,64 @@ class CandidatePicker(QDialog):
 class GearSetEditor(QWidget):
     changed = pyqtSignal()
 
-    def __init__(self, title: str, owner: "MainWindow"):
+    def __init__(self, title: str, owner: "MainWindow", *, game_grid: bool = False):
         super().__init__()
         self.owner = owner
+        self.game_grid = game_grid
         self.items = {slot: gear.Empty for slot in SLOTS}
         self.buttons: dict[str, QPushButton] = {}
+        self.empty_slot_labels: dict[str, QLabel] = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
+        if game_grid:
+            # Match the reference equipment panel directly; the Quick View
+            # column supplies the surrounding frame and spacing.
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+            self.setObjectName("gameEquipmentEditor")
+            self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            equipment_box = QGroupBox("")
+            equipment_box.setObjectName("equipmentPanel")
+            equipment_box.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            equipment_box.setFixedWidth(183)
+            equipment_layout = QVBoxLayout(equipment_box)
+            equipment_layout.setContentsMargins(3, 3, 3, 3)
+            equipment_layout.setSpacing(0)
+            equipment_grid = QGridLayout()
+            equipment_grid.setContentsMargins(0, 0, 0, 0)
+            equipment_grid.setSpacing(1)
+            equipment_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+            for index, slot in enumerate(SLOTS):
+                button = QPushButton()
+                button.setObjectName("equip_slot")
+                button.setProperty("selected", slot == "main")
+                button.setIconSize(QSize(32, 32))
+                button.setFixedSize(42, 42)
+                button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+                slot_label = {
+                    "main": "Main", "sub": "Sub", "ranged": "Rng", "ammo": "Ammo",
+                    "head": "Head", "neck": "Neck", "ear1": "Ear1", "ear2": "Ear2",
+                    "body": "Body", "hands": "Hands", "ring1": "Ring1", "ring2": "Ring2",
+                    "back": "Back", "waist": "Waist", "legs": "Legs", "feet": "Feet",
+                }[slot]
+                button.setText("")
+                empty_label = QLabel(slot_label, button)
+                empty_label.setObjectName("emptySlotLabel")
+                empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                empty_label.setGeometry(button.rect())
+                empty_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                button.setToolTip(f"{slot_label}: Empty")
+                button.setToolTipDuration(20000)
+                button.setAccessibleName(f"{slot_label}: Empty")
+                button.clicked.connect(lambda _checked=False, name=slot: self.choose(name))
+                row, column = divmod(index, 4)
+                equipment_grid.addWidget(button, row, column)
+                self.buttons[slot] = button
+                self.empty_slot_labels[slot] = empty_label
+            equipment_layout.addLayout(equipment_grid)
+            layout.addWidget(equipment_box)
+            return
         heading = QLabel(title)
         heading.setObjectName("sectionTitle")
         heading.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
@@ -1099,6 +1497,11 @@ class GearSetEditor(QWidget):
         layout.addStretch(1)
 
     def choose(self, slot: str):
+        if self.game_grid:
+            for name, button in self.buttons.items():
+                button.setProperty("selected", name == slot)
+                button.style().unpolish(button)
+                button.style().polish(button)
         dialog = GearPicker(
             slot, self.owner.items_for_slot(slot), self.items[slot], self.owner.icons, self
         )
@@ -1114,6 +1517,12 @@ class GearSetEditor(QWidget):
         self.buttons[slot].setText("" if name != "Empty" else "—")
         self.buttons[slot].setToolTip(f"{slot.upper()}:\n{item_tooltip(item)}")
         self.buttons[slot].setAccessibleName(f"{slot.upper()}: {name}")
+        if self.game_grid:
+            self.buttons[slot].setText("")
+            self.empty_slot_labels[slot].setVisible(name == "Empty")
+            self.empty_slot_labels[slot].raise_()
+            self.buttons[slot].style().unpolish(self.buttons[slot])
+            self.buttons[slot].style().polish(self.buttons[slot])
         if emit:
             self.changed.emit()
 
@@ -1125,6 +1534,460 @@ class GearSetEditor(QWidget):
         for slot in SLOTS:
             self.set_item(slot, gearset.get(slot, gear.Empty), emit=False)
         self.changed.emit()
+
+
+class ProfileGearPreview(QWidget):
+    """Compact, read-only 4x4 preview for one generated LAC set."""
+
+    def __init__(self, owner: "MainWindow"):
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.owner = owner
+        self.items = {slot: gear.Empty for slot in SLOTS}
+        self.buttons: dict[str, QPushButton] = {}
+        self.empty_slot_labels: dict[str, QLabel] = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(1)
+        grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        for index, slot in enumerate(SLOTS):
+            button = QPushButton()
+            button.setObjectName("profileGearSlot")
+            button.setProperty("selected", False)
+            button.setFixedSize(42, 42)
+            button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            button.setIconSize(QSize(32, 32))
+            empty_label = QLabel(self._empty_slot_label(slot), button)
+            empty_label.setObjectName("emptySlotLabel")
+            empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_label.setGeometry(button.rect())
+            empty_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            button.clicked.connect(lambda _checked=False, name=slot: self._select(name))
+            row, column = divmod(index, 4)
+            grid.addWidget(button, row, column)
+            self.buttons[slot] = button
+            self.empty_slot_labels[slot] = empty_label
+        layout.addLayout(grid)
+        self.detail = QLabel("Select a slot to inspect its full item details.")
+        self.detail.setObjectName("profileGearDetail")
+        self.detail.setWordWrap(True)
+        self.detail.setFixedHeight(58)
+        layout.addWidget(self.detail)
+
+    @staticmethod
+    def _slot_label(slot: str) -> str:
+        return {
+            "main": "MAIN", "sub": "SUB", "ranged": "RANGE", "ammo": "AMMO",
+            "head": "HEAD", "neck": "NECK", "ear1": "EAR 1", "ear2": "EAR 2",
+            "body": "BODY", "hands": "HANDS", "ring1": "RING 1", "ring2": "RING 2",
+            "back": "BACK", "waist": "WAIST", "legs": "LEGS", "feet": "FEET",
+        }[slot]
+
+    @staticmethod
+    def _empty_slot_label(slot: str) -> str:
+        return {
+            "main": "MAIN", "sub": "SUB", "ranged": "RNG", "ammo": "AMMO",
+            "head": "HEAD", "neck": "NECK", "ear1": "EAR1", "ear2": "EAR2",
+            "body": "BODY", "hands": "HANDS", "ring1": "RING1", "ring2": "RING2",
+            "back": "BACK", "waist": "WAIST", "legs": "LEGS", "feet": "FEET",
+        }[slot]
+
+    def set_gearset(self, armor: dict, overlay: dict | None = None):
+        combined = {slot: gear.Empty for slot in SLOTS}
+        combined.update(armor or {})
+        if overlay:
+            overlay_items = overlay.get("gearset") or {}
+            for slot in overlay.get("specified_slots") or ():
+                if slot in WEAPON_SLOTS and slot in overlay_items:
+                    combined[slot] = overlay_items[slot]
+        self.items = combined
+        for slot, button in self.buttons.items():
+            item = combined.get(slot, gear.Empty)
+            name = item_name(item)
+            button.setText("")
+            button.setIcon(self.owner.icons.icon(item))
+            self.empty_slot_labels[slot].setVisible(name == "Empty")
+            self.empty_slot_labels[slot].raise_()
+            button.setToolTip(item_tooltip(item))
+            button.setAccessibleName(f"{self._slot_label(slot)}: {name}")
+        selected = next(
+            (slot for slot in SLOTS if item_name(combined.get(slot, gear.Empty)) != "Empty"),
+            "head",
+        )
+        self._select(selected)
+
+    def _select(self, slot: str):
+        for name, button in self.buttons.items():
+            button.setProperty("selected", name == slot)
+            button.style().unpolish(button)
+            button.style().polish(button)
+        item = self.items.get(slot, gear.Empty)
+        stats = item_detail_stats(item, limit=8)
+        detail = " · ".join(stats) if stats else "No modeled stats."
+        self.detail.setText(
+            f"<b>{self._slot_label(slot)} · {escape(item_name(item))}</b><br>"
+            f"<span style='color:#d0ccd6'>{escape(detail)}</span>"
+        )
+
+
+class ResponsiveStatSection(QGroupBox):
+    """Reflow every totals section at the same stable UI breakpoints."""
+
+    TWO_COLUMN_WIDTH = 880
+    FOUR_COLUMN_WIDTH = 1440
+    MAX_COLUMNS = 4
+
+    def __init__(self, title: str, rows: list[QWidget]):
+        super().__init__(title)
+        self.setObjectName("quickStatsSection")
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._rows = rows
+        self._columns = 0
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(4, 8, 4, 4)
+        self._grid.setHorizontalSpacing(3)
+        self._grid.setVerticalSpacing(2)
+        self._reflow(self.width())
+
+    @classmethod
+    def columns_for_width(cls, width: int, row_count: int) -> int:
+        """Use only 1, 2, or 4 columns so adjacent sections resize together."""
+        if width >= cls.FOUR_COLUMN_WIDTH:
+            requested = 4
+        elif width >= cls.TWO_COLUMN_WIDTH:
+            requested = 2
+        else:
+            requested = 1
+        return max(1, min(cls.MAX_COLUMNS, max(1, row_count), requested))
+
+    def _reflow(self, width: int):
+        columns = self.columns_for_width(width, len(self._rows))
+        if columns == self._columns:
+            return
+        self._columns = columns
+        # Explicitly clear placements before re-adding rows.  Qt normally
+        # reparents an item when it is added again, but clearing first avoids
+        # stale grid cells during rapid splitter resizes.
+        while self._grid.count():
+            self._grid.takeAt(0)
+        for index, row in enumerate(self._rows):
+            self._grid.addWidget(row, index // columns, index % columns)
+        for column in range(self.MAX_COLUMNS):
+            self._grid.setColumnStretch(column, 1 if column < columns else 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow(event.size().width())
+
+
+class ResponsiveTotalsHeader(QWidget):
+    """Keep the Live Totals explanation and action from squeezing each other."""
+
+    STACK_WIDTH = 820
+
+    def __init__(self, legend: QWidget, action: QWidget, parent=None):
+        super().__init__(parent)
+        self._legend = legend
+        self._action = action
+        self._stacked = None
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(8)
+        self._grid.setVerticalSpacing(4)
+        self._reflow(self.width())
+
+    def _reflow(self, width: int):
+        stacked = width < self.STACK_WIDTH
+        if stacked == self._stacked:
+            return
+        self._stacked = stacked
+        if stacked:
+            self._grid.addWidget(self._legend, 0, 0, 1, 2)
+            self._grid.addWidget(
+                self._action, 1, 1, alignment=Qt.AlignmentFlag.AlignRight
+            )
+        else:
+            self._grid.addWidget(self._legend, 0, 0)
+            self._grid.addWidget(
+                self._action, 0, 1, alignment=Qt.AlignmentFlag.AlignRight
+            )
+        self._grid.setColumnStretch(0, 1)
+        self._grid.setColumnStretch(1, 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow(event.size().width())
+
+
+class ResponsiveControlStrip(QWidget):
+    """Keep two compact control groups on one row, stacking when space is tight."""
+
+    def __init__(self, primary: QWidget, secondary: QWidget, *, stack_width: int = 760,
+                 parent=None):
+        super().__init__(parent)
+        self._primary = primary
+        self._secondary = secondary
+        self._stack_width = stack_width
+        self._stacked = None
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(10)
+        self._grid.setVerticalSpacing(4)
+        self._reflow(self.width())
+
+    def _reflow(self, width: int):
+        stacked = width < self._stack_width
+        if stacked == self._stacked:
+            return
+        self._stacked = stacked
+        if stacked:
+            self._grid.addWidget(self._primary, 0, 0)
+            self._grid.addWidget(self._secondary, 1, 0)
+            self._grid.setColumnStretch(0, 1)
+            self._grid.setColumnStretch(1, 0)
+        else:
+            self._grid.addWidget(self._primary, 0, 0)
+            self._grid.addWidget(self._secondary, 0, 1)
+            self._grid.setColumnStretch(0, 0)
+            self._grid.setColumnStretch(1, 1)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow(event.size().width())
+
+
+class ResponsiveBuffGrid(QWidget):
+    """Keep Active Buff cards readable instead of squeezing their form fields."""
+
+    TWO_COLUMN_WIDTH = 840
+
+    def __init__(self, panels: list[QWidget], parent=None):
+        super().__init__(parent)
+        self._panels = panels
+        self._columns = 0
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(2, 2, 2, 2)
+        self._grid.setHorizontalSpacing(8)
+        self._grid.setVerticalSpacing(8)
+        self._reflow(self.width())
+
+    @classmethod
+    def columns_for_width(cls, width: int) -> int:
+        return 2 if width >= cls.TWO_COLUMN_WIDTH else 1
+
+    def _reflow(self, width: int):
+        columns = self.columns_for_width(width)
+        if columns == self._columns:
+            return
+        self._columns = columns
+        for index, panel in enumerate(self._panels):
+            self._grid.addWidget(panel, index // columns, index % columns)
+        self._grid.setColumnStretch(0, 1)
+        self._grid.setColumnStretch(1, 1 if columns == 2 else 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow(event.size().width())
+
+
+class LuaSyntaxHighlighter(QSyntaxHighlighter):
+    """Small VS Code-inspired Lua highlighter for LuAshitacast profiles."""
+
+    KEYWORDS = (
+        "and", "break", "do", "else", "elseif", "end", "false", "for",
+        "function", "goto", "if", "in", "local", "nil", "not", "or",
+        "repeat", "return", "then", "true", "until", "while",
+    )
+
+    def __init__(self, document):
+        super().__init__(document)
+        self._formats = {
+            "keyword": self._format("#c586c0", bold=True),
+            "builtin": self._format("#4ec9b0"),
+            "function": self._format("#dcdcaa"),
+            "string": self._format("#ce9178"),
+            "number": self._format("#b5cea8"),
+            "comment": self._format("#6a9955", italic=True),
+            "field": self._format("#9cdcfe"),
+        }
+        keyword_pattern = r"\b(?:" + "|".join(self.KEYWORDS) + r")\b"
+        self._rules = (
+            (re.compile(keyword_pattern), "keyword"),
+            (re.compile(r"\b(?:ashita|gData|gFunc|sets|profile|settings)\b"), "builtin"),
+            (re.compile(r"\b(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?)\b"), "number"),
+            (re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\""), "string"),
+            (re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?=\s*\()"), "function"),
+            (re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?=\s*=)"), "field"),
+        )
+
+    @staticmethod
+    def _format(color: str, *, bold: bool = False, italic: bool = False) -> QTextCharFormat:
+        value = QTextCharFormat()
+        value.setForeground(QColor(color))
+        value.setFontWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
+        value.setFontItalic(italic)
+        return value
+
+    def highlightBlock(self, text: str):
+        for pattern, format_name in self._rules:
+            for match in pattern.finditer(text):
+                self.setFormat(match.start(), match.end() - match.start(), self._formats[format_name])
+
+        # Lua line comments and long comments override tokens inside them.
+        comment_kind, comment_start = self._comment_start(text)
+        if self.previousBlockState() == 1:
+            start = 0
+        elif comment_kind == "long":
+            start = comment_start
+        else:
+            start = -1
+        if start >= 0:
+            end = text.find("]]", start + (0 if self.previousBlockState() == 1 else 4))
+            if end < 0:
+                self.setCurrentBlockState(1)
+                self.setFormat(start, len(text) - start, self._formats["comment"])
+                return
+            self.setCurrentBlockState(0)
+            self.setFormat(start, end + 2 - start, self._formats["comment"])
+        else:
+            self.setCurrentBlockState(0)
+        if comment_kind == "line" and self.previousBlockState() != 1:
+            self.setFormat(comment_start, len(text) - comment_start, self._formats["comment"])
+
+    @staticmethod
+    def _comment_start(text: str) -> tuple[str, int]:
+        """Find the first Lua comment delimiter that is outside a string."""
+        quote = ""
+        escaped = False
+        index = 0
+        while index < len(text) - 1:
+            character = text[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = ""
+                index += 1
+                continue
+            if character in {"'", '"'}:
+                quote = character
+                index += 1
+                continue
+            if text[index:index + 2] == "--":
+                return ("long" if text[index:index + 4] == "--[[" else "line", index)
+            index += 1
+        return "", -1
+
+
+class LineNumberArea(QWidget):
+    def __init__(self, editor: "LuaCodeEditor"):
+        super().__init__(editor)
+        self.editor = editor
+
+    def sizeHint(self):
+        return QSize(self.editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self.editor.paint_line_number_area(event)
+
+
+class LuaCodeEditor(QPlainTextEdit):
+    """Lua editor with line numbers and a restrained VS Code-like surface."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("lacCodeEditor")
+        font = QFont("Consolas", 10)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self.setFont(font)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setTabStopDistance(QFontMetrics(font).horizontalAdvance(" ") * 4)
+        self.line_numbers = LineNumberArea(self)
+        self.highlighter = LuaSyntaxHighlighter(self.document())
+        self.blockCountChanged.connect(self._update_line_number_width)
+        self.updateRequest.connect(self._update_line_number_area)
+        self.cursorPositionChanged.connect(self._highlight_current_line)
+        self._update_line_number_width()
+        self._highlight_current_line()
+
+    def line_number_area_width(self) -> int:
+        digits = len(str(max(1, self.blockCount())))
+        return 12 + self.fontMetrics().horizontalAdvance("9") * digits
+
+    def _update_line_number_width(self, *_args):
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def _update_line_number_area(self, rect: QRect, dy: int):
+        if dy:
+            self.line_numbers.scroll(0, dy)
+        else:
+            self.line_numbers.update(0, rect.y(), self.line_numbers.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_line_number_width()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        rect = self.contentsRect()
+        self.line_numbers.setGeometry(
+            QRect(rect.left(), rect.top(), self.line_number_area_width(), rect.height())
+        )
+
+    def _highlight_current_line(self):
+        selection = QTextEdit.ExtraSelection()
+        selection.format.setBackground(QColor("#252526"))
+        selection.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+        selection.cursor = self.textCursor()
+        selection.cursor.clearSelection()
+        self.setExtraSelections([selection])
+
+    def paint_line_number_area(self, event):
+        painter = QPainter(self.line_numbers)
+        painter.fillRect(event.rect(), QColor("#181818"))
+        block = self.firstVisibleBlock()
+        number = block.blockNumber()
+        top = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom = top + int(self.blockBoundingRect(block).height())
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                color = "#c6c6c6" if number == self.textCursor().blockNumber() else "#858585"
+                painter.setPen(QColor(color))
+                painter.drawText(
+                    0, top, self.line_numbers.width() - 5, self.fontMetrics().height(),
+                    Qt.AlignmentFlag.AlignRight, str(number + 1),
+                )
+            block = block.next()
+            top = bottom
+            bottom = top + int(self.blockBoundingRect(block).height())
+            number += 1
+
+
+class ResponsiveCatalogSplitter(QSplitter):
+    """Stack catalog/detail panes when a side-by-side layout would overlap."""
+
+    NARROW_WIDTH = 820
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.setChildrenCollapsible(False)
+
+    def resizeEvent(self, event):
+        desired = (
+            Qt.Orientation.Vertical
+            if event.size().width() < self.NARROW_WIDTH
+            else Qt.Orientation.Horizontal
+        )
+        changed = desired != self.orientation()
+        if changed:
+            self.setOrientation(desired)
+        super().resizeEvent(event)
+        if changed:
+            extent = event.size().height() if desired == Qt.Orientation.Vertical else event.size().width()
+            self.setSizes([max(190, int(extent * 0.43)), max(240, int(extent * 0.57))])
 
 
 class OptimizeThread(QThread):
@@ -1268,7 +2131,7 @@ class PlotThread(QThread):
     stopped = pyqtSignal(str)
 
     def __init__(self, player, enemy, ws_name: str, tp_value: int, ws_type: str,
-                 samples=20000, seed=None, parent=None):
+                 samples=20000, seed=None, reference_enemies=None, parent=None):
         super().__init__(parent)
         self.player = player
         self.enemy = enemy
@@ -1277,6 +2140,7 @@ class PlotThread(QThread):
         self.ws_type = ws_type
         self.samples = samples
         self.seed = seed
+        self.reference_enemies = list(reference_enemies or ())
         self._stop_requested = threading.Event()
 
     def request_stop(self):
@@ -1286,10 +2150,22 @@ class PlotThread(QThread):
         try:
             if self._stop_requested.is_set():
                 return
-            self.completed.emit(actions.simulate_ws_distribution(
+            distribution = actions.simulate_ws_distribution(
                 self.player, self.enemy, self.ws_name, self.tp_value, self.ws_type,
                 seed=self.seed, samples=self.samples, stop_event=self._stop_requested,
-            ))
+            )
+            if self.reference_enemies:
+                reference_distributions = {}
+                for offset, (name, enemy) in enumerate(self.reference_enemies, start=1):
+                    if self._stop_requested.is_set():
+                        raise actions.SimulationStopped("Weapon-skill distribution stopped by user.")
+                    reference_distributions[str(name)] = actions.simulate_ws_distribution(
+                        self.player, enemy, self.ws_name, self.tp_value, self.ws_type,
+                        seed=(int(self.seed or 0) + offset) & 0xFFFFFFFF,
+                        samples=self.samples, stop_event=self._stop_requested,
+                    )
+                distribution["reference_distributions"] = reference_distributions
+            self.completed.emit(distribution)
         except actions.SimulationStopped as error:
             self.stopped.emit(str(error))
         except Exception as error:
@@ -1303,7 +2179,8 @@ class SimulationThread(QThread):
     failed = pyqtSignal(str)
     stopped = pyqtSignal(str)
 
-    def __init__(self, player_tp, player_ws, enemy, threshold, ws_name, ws_type, seed, parent=None):
+    def __init__(self, player_tp, player_ws, enemy, threshold, ws_name, ws_type, seed,
+                 reference_enemies=None, parent=None):
         super().__init__(parent)
         self.player_tp = player_tp
         self.player_ws = player_ws
@@ -1312,6 +2189,7 @@ class SimulationThread(QThread):
         self.ws_name = ws_name
         self.ws_type = ws_type
         self.seed = seed
+        self.reference_enemies = list(reference_enemies or ())
         self._stop_requested = threading.Event()
 
     def request_stop(self):
@@ -1321,10 +2199,23 @@ class SimulationThread(QThread):
         try:
             if self._stop_requested.is_set():
                 return
-            self.completed.emit(actions.run_simulation_structured(
+            summary = actions.run_simulation_structured(
                 self.player_tp, self.player_ws, self.enemy, self.threshold,
                 self.ws_name, self.ws_type, seed=self.seed, stop_event=self._stop_requested,
-            ))
+            )
+            if self.reference_enemies:
+                reference_summaries = {}
+                for offset, (name, enemy) in enumerate(self.reference_enemies, start=1):
+                    if self._stop_requested.is_set():
+                        raise actions.SimulationStopped("Two-hour simulation stopped by user.")
+                    reference_summaries[str(name)] = actions.run_simulation_structured(
+                        self.player_tp, self.player_ws, enemy, self.threshold,
+                        self.ws_name, self.ws_type,
+                        seed=(int(self.seed or 0) + offset) & 0xFFFFFFFF,
+                        stop_event=self._stop_requested,
+                    )
+                summary["reference_summaries"] = reference_summaries
+            self.completed.emit(summary)
         except actions.SimulationStopped as error:
             self.stopped.emit(str(error))
         except Exception as error:
@@ -1360,7 +2251,10 @@ class ResultComparisonDialog(QDialog):
             if scenario_lines:
                 warning = QLabel("Scenario differences:\n" + "\n".join(scenario_lines))
                 warning.setWordWrap(True)
-                warning.setStyleSheet("color: #9a3412; background: #fff7ed; padding: 6px;")
+                warning.setStyleSheet(
+                    "color: #ffe2a8; background: #352819; "
+                    "border: 1px solid #8a6430; padding: 6px;"
+                )
                 layout.addWidget(warning)
             baseline_controls = QHBoxLayout()
             baseline_controls.addWidget(QLabel("Baseline for deltas"))
@@ -1373,13 +2267,16 @@ class ResultComparisonDialog(QDialog):
             baseline_controls.addWidget(self.baseline_combo, 1)
             layout.addLayout(baseline_controls)
         if len(self.records) > 1:
-            summary = QTableWidget(len(self.records), 9)
+            summary = QTableWidget(len(self.records), 8)
             summary.setHorizontalHeaderLabels([
                 "Result", "Kind", "Total DPS", "TP DPS", "WS DPS",
-                "Time to WS", "Round time", "TP / WS", "Seed",
+                "Time to WS", "Round time", "TP / WS",
             ])
             summary.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
             summary.setAlternatingRowColors(True)
+            summary.verticalHeader().setVisible(False)
+            summary.verticalHeader().setDefaultSectionSize(28)
+            summary.setWordWrap(False)
             for row, record in enumerate(self.records):
                 payload = record.get("payload") or {}
                 metrics = payload.get("metrics") or {}
@@ -1389,7 +2286,6 @@ class ResultComparisonDialog(QDialog):
                     metrics.get("tp_dps", ""), metrics.get("ws_dps", ""),
                     metrics.get("expected_time_to_ws", metrics.get("time_to_ws", "")),
                     metrics.get("time_per_attack_round", ""), metrics.get("average_ws_tp", ""),
-                    payload.get("seed", ""),
                 )
                 for column, value in enumerate(values):
                     summary.setItem(row, column, QTableWidgetItem(self._format_value(value)))
@@ -1408,12 +2304,11 @@ class ResultComparisonDialog(QDialog):
             context = "  ·  ".join(filter(None, (
                 str(scenario.get("enemy") or ""),
                 str(scenario.get("ws") or ""),
-                f"Seed {payload.get('seed')}" if payload.get("seed") not in (None, "") else "",
             )))
             if context:
                 label = QLabel(context)
                 label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                label.setStyleSheet("color: #4b5563; padding: 2px;")
+                label.setStyleSheet("color: #d0ccd6; padding: 2px;")
                 layout.addWidget(label)
         if FigureCanvas is not None:
             self.figure = self._build_figure()
@@ -1498,6 +2393,9 @@ class ResultComparisonDialog(QDialog):
             ["Slot", "Baseline"] + [str(record.get("title", "Result"))[:24] for record in self.records[1:]]
         )
         table.setMaximumHeight(210)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(28)
+        table.setWordWrap(False)
         for row, slot in enumerate(SLOTS):
             table.setItem(row, 0, QTableWidgetItem(slot.upper()))
             base_item = baseline.get(slot) or {}
@@ -1506,7 +2404,7 @@ class ResultComparisonDialog(QDialog):
                 item = self._comparison_gearset(record).get(slot) or {}
                 cell = QTableWidgetItem(item_name(item))
                 if item_name(item) != item_name(base_item):
-                    cell.setForeground(QColor("#9a3412"))
+                    cell.setForeground(QColor("#ffc4c1"))
                 table.setItem(row, column, cell)
         table.resizeColumnsToContents()
         table.setToolTip("Slot-by-slot gear differences. The first selected result is the baseline.")
@@ -1534,6 +2432,9 @@ class ResultComparisonDialog(QDialog):
             ["Stat delta", "Baseline"] + [str(record.get("title", "Result"))[:24] for record in self.records[1:]]
         )
         table.setMaximumHeight(260)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(28)
+        table.setWordWrap(False)
         for row, key in enumerate(keys):
             table.setItem(row, 0, QTableWidgetItem(key))
             table.setItem(row, 1, QTableWidgetItem(f"{baseline[key]:+.1f}"))
@@ -1610,6 +2511,20 @@ class ResultComparisonDialog(QDialog):
         if time_values and total_values:
             total_dps = self._number(metrics.get("total_dps"))
             axis.plot(time_values, total_values, label=f"Total={total_dps:7.1f}")
+            reference_colors = ("#72c7e8", "#d99bea", "#9de2a8")
+            for index, (name, reference) in enumerate(
+                (payload.get("reference_summaries") or {}).items()
+            ):
+                reference_series = reference.get("dps_series") or {}
+                reference_times = reference_series.get("time") or []
+                reference_values = reference_series.get("total") or []
+                if reference_times and reference_values:
+                    reference_metrics = reference.get("total_dps", 0)
+                    axis.plot(
+                        reference_times, reference_values,
+                        color=reference_colors[index % len(reference_colors)],
+                        label=f"{name}={self._number(reference_metrics):7.1f}",
+                    )
             total_damage = self._number(metrics.get("total_damage"))
             for time_key, value_key, metric_key, prefix in (
                 ("tp_time", "tp", "tp_dps", "TP"),
@@ -1658,6 +2573,17 @@ class ResultComparisonDialog(QDialog):
                 axis.stairs(density, edges, color="black", alpha=1.0)
                 average = self._number(distribution.get("mean"))
                 axis.axvline(average, color="black", linestyle="--", label=f"Average = {int(average)} damage.")
+                reference_colors = ("#1769aa", "#c2185b", "#00897b")
+                for index, (name, reference) in enumerate(
+                    (distribution.get("reference_distributions") or {}).items()
+                ):
+                    reference_mean = self._number(reference.get("mean"))
+                    axis.axvline(
+                        reference_mean,
+                        color=reference_colors[index % len(reference_colors)],
+                        linestyle=":",
+                        label=f"{name} mean = {int(reference_mean)}",
+                    )
                 axis.legend(loc="best")
         else:
             axis.text(0.5, 0.5, "This saved result has no WS histogram.", ha="center", va="center", transform=axis.transAxes)
@@ -1712,7 +2638,6 @@ class ResultComparisonDialog(QDialog):
             return "\n".join((
                 f"Enemy = {scenario.get('enemy', '')}",
                 f"Samples = {distribution.get('samples', '')}",
-                f"Seed = {seed if seed is not None else ''}",
                 "", "Legacy result:", "full player stats", "were not saved.",
             ))
         keys = (
@@ -1768,7 +2693,10 @@ class TopSetsDialog(QDialog):
         self.setWindowTitle("Best optimizer sets")
         self.resize(1050, 760)
         self.icons = icons
-        self.results = list(results[:40])
+        self._gear_cells: list[tuple[QFrame, str, dict]] = []
+        # Retain enough distinct candidates to compare meaningful alternatives
+        # without allowing an unbounded result window.
+        self.results = list(results[:wsdist.OPTIMIZER_RESULT_LIMIT])
         layout = QVBoxLayout(self)
         note = QLabel(
             "Combined TP + WS results show the TP and WS sets side by side. "
@@ -1776,24 +2704,6 @@ class TopSetsDialog(QDialog):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("Load set"))
-        self.load_combo = QComboBox()
-        for result in self.results:
-            label = result.get("label") or f"Set {result.get('rank', '?')}"
-            self.load_combo.addItem(str(label))
-        controls.addWidget(self.load_combo)
-        load_quick = QPushButton("Load into Quick Look")
-        load_tpws = QPushButton("Load into TP / WS Sets")
-        load_quick.setEnabled(parent is not None)
-        load_tpws.setEnabled(parent is not None)
-        if parent is not None:
-            load_quick.clicked.connect(lambda: self._load_selected("quick"))
-            load_tpws.clicked.connect(lambda: self._load_selected("tpws"))
-        controls.addWidget(load_quick)
-        controls.addWidget(load_tpws)
-        controls.addStretch(1)
-        layout.addLayout(controls)
         substat_results = [result for result in self.results if result.get("substats")]
         if substat_results:
             baseline = next(
@@ -1859,22 +2769,68 @@ class TopSetsDialog(QDialog):
         content = QWidget()
         content_layout = QVBoxLayout(content)
         top_metric = max((float(result.get("metric") or 0) for result in self.results), default=0)
-        for result in self.results:
+        for result_index, result in enumerate(self.results):
             metric = float(result.get("metric") or 0)
             worse = 0.0 if top_metric <= 0 else max(0.0, (top_metric - metric) / abs(top_metric) * 100)
             label = result.get("label") or f"Set {result.get('rank', '?')}"
             group = QGroupBox(f"{label}  ·  {worse:.2f}% below top")
-            pair_tp = result.get("tp_player")
-            pair_ws = result.get("ws_player")
-            if pair_tp is not None and pair_ws is not None:
-                row = QHBoxLayout(group)
+            group_layout = QVBoxLayout(group)
+            action_row = QHBoxLayout()
+            action_row.addWidget(QLabel("Load candidate:"))
+            load_tp = QPushButton("Load into TP")
+            load_ws = QPushButton("Load into WS")
+            load_quick = QPushButton("Load into Quick View")
+            load_tp.setEnabled(self.parent() is not None)
+            load_ws.setEnabled(self.parent() is not None)
+            load_quick.setEnabled(self.parent() is not None)
+            if self.parent() is not None:
+                load_tp.clicked.connect(lambda _checked=False, index=result_index: self._load_result(index, "tp"))
+                load_ws.clicked.connect(lambda _checked=False, index=result_index: self._load_result(index, "ws"))
+                load_quick.clicked.connect(
+                    lambda _checked=False, index=result_index: self._load_result(index, "quick")
+                )
+            action_row.addWidget(load_tp)
+            action_row.addWidget(load_ws)
+            action_row.addWidget(load_quick)
+            pair_tp, pair_ws = _optimizer_result_players(result)
+            combined_pair = (
+                pair_tp is not None and pair_ws is not None and pair_tp is not pair_ws
+            )
+            if combined_pair:
+                load_pair = QPushButton("Load linked TP + WS")
+                load_pair.setObjectName("primaryAction")
+                load_pair.setToolTip(
+                    "Load both halves of this combined result into the TP → WS workspace."
+                )
+                load_pair.setEnabled(self.parent() is not None)
+                if self.parent() is not None:
+                    load_pair.clicked.connect(
+                        lambda _checked=False, index=result_index:
+                        self._load_result(index, "tpws")
+                    )
+                action_row.addWidget(load_pair)
+            action_row.addStretch(1)
+            group_layout.addLayout(action_row)
+            if combined_pair:
+                linked = QLabel(
+                    "Linked weapon overlay · " + " · ".join(
+                        f"{slot.upper()}: {item_name(pair_ws.gearset.get(slot, gear.Empty))}"
+                        for slot in WEAPON_SLOTS
+                    )
+                )
+                linked.setObjectName("linkedWeaponOverlay")
+                linked.setWordWrap(True)
+                group_layout.addWidget(linked)
+                row = QHBoxLayout()
                 row.addWidget(self._gear_panel("TP set", pair_tp.gearset))
                 row.addWidget(self._gear_panel("WS set", pair_ws.gearset))
+                group_layout.addLayout(row)
             else:
-                grid = QGridLayout(group)
+                grid = QGridLayout()
                 player = result.get("player")
                 gearset = getattr(player, "gearset", {}) if player is not None else {}
                 self._add_gear_cells(grid, gearset, columns=4, cell_width=198)
+                group_layout.addLayout(grid)
             content_layout.addWidget(group)
         content_layout.addStretch(1)
         scroll.setWidget(content)
@@ -1883,10 +2839,10 @@ class TopSetsDialog(QDialog):
         close_button.clicked.connect(self.accept)
         layout.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
 
-    def _load_selected(self, destination: str):
-        """Load the selected result and return the user to the destination tab."""
+    def _load_result(self, index: int, destination: str):
+        """Load one visible retained candidate into the requested set."""
         if self.parent() is not None:
-            self.parent().load_optimizer_result(self.load_combo.currentIndex(), destination)
+            self.parent().load_optimizer_result(index, destination)
         self.accept()
 
     def _gear_panel(self, title: str, gearset: dict) -> QGroupBox:
@@ -1899,8 +2855,23 @@ class TopSetsDialog(QDialog):
         for index, slot in enumerate(SLOTS):
             item = gearset.get(slot, gear.Empty)
             cell = QFrame()
+            cell.setObjectName("topSetGearCell")
             cell.setFixedSize(cell_width, 68)
             cell.setFrameShape(QFrame.Shape.StyledPanel)
+            # Keep the card compact, but expose the complete modeled item row
+            # (including augments) on hover so the retained-set view is useful for
+            # comparing candidates without opening another picker.
+            cell.setToolTip(
+                "Double-click to lock or unlock this optimizer slot.\n"
+                "Right-click to add or remove the item from the global blacklist.\n\n"
+                + item_tooltip(item)
+            )
+            cell.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            cell.customContextMenuRequested.connect(
+                lambda position, target=cell, target_slot=slot, target_item=item:
+                self._show_gear_cell_menu(target, position, target_slot, target_item)
+            )
+            cell.installEventFilter(self)
             cell_layout = QHBoxLayout(cell)
             cell_layout.setContentsMargins(5, 4, 5, 4)
             icon_label = QLabel()
@@ -1909,23 +2880,82 @@ class TopSetsDialog(QDialog):
             icon = self.icons.icon(item)
             if not icon.isNull():
                 icon_label.setPixmap(icon.pixmap(QSize(32, 32)))
+            icon_label.setToolTip(item_tooltip(item))
+            icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             cell_layout.addWidget(icon_label)
             text_layout = QVBoxLayout()
             slot_label = QLabel(slot.upper())
-            slot_label.setStyleSheet("font-size: 10px; color: #667085;")
+            slot_label.setObjectName("topSetSlotLabel")
             name = str(item.get("Name") or "Empty")
             name_label = QLabel()
+            name_label.setObjectName("topSetItemName")
             name_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             name_label.setToolTip(name)
             name_label.setText(QFontMetrics(name_label.font()).elidedText(
                 name, Qt.TextElideMode.ElideRight, max(90, cell_width - 58)
             ))
+            slot_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            name_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             text_layout.addWidget(slot_label)
             text_layout.addWidget(name_label)
             text_layout.addStretch(1)
             cell_layout.addLayout(text_layout, 1)
             row, column = divmod(index, columns)
             grid.addWidget(cell, row, column)
+            self._gear_cells.append((cell, slot, item))
+        self._refresh_gear_cell_styles()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.MouseButtonDblClick:
+            match = next(
+                ((slot, item) for cell, slot, item in self._gear_cells if cell is watched),
+                None,
+            )
+            if match is not None:
+                self._toggle_gear_lock(*match)
+                return True
+        return super().eventFilter(watched, event)
+
+    def _show_gear_cell_menu(self, cell: QFrame, position, slot: str, item: dict):
+        name = item_name(item)
+        if name == "Empty" or self.parent() is None:
+            return
+        blocked = _blacklist_matches(item, self.parent().gear_blacklist)
+        menu = QMenu(self)
+        blacklist = menu.addAction(
+            f"Remove {name} from global blacklist" if blocked
+            else f"Add {name} to global blacklist"
+        )
+        blacklist.triggered.connect(
+            lambda _checked=False: self._set_gear_blacklisted(name, not blocked)
+        )
+        menu.exec(cell.mapToGlobal(position))
+
+    def _set_gear_blacklisted(self, name: str, blocked: bool):
+        parent = self.parent()
+        if parent is None:
+            return
+        parent.set_optimizer_item_blacklisted(name, blocked)
+        self._refresh_gear_cell_styles()
+
+    def _toggle_gear_lock(self, slot: str, item: dict):
+        parent = self.parent()
+        if parent is None or item_name(item) == "Empty":
+            return
+        parent.toggle_optimizer_item_lock(slot, item_name(item))
+        self._refresh_gear_cell_styles()
+
+    def _refresh_gear_cell_styles(self):
+        parent = self.parent()
+        if parent is None:
+            return
+        for cell, slot, item in self._gear_cells:
+            name = item_name(item)
+            blocked = _blacklist_matches(item, parent.gear_blacklist)
+            cell.setProperty("blacklisted", blocked)
+            cell.setProperty("locked", not blocked and parent.locked_gear.get(slot) == name)
+            cell.style().unpolish(cell)
+            cell.style().polish(cell)
 
 
 class GearBlacklistDialog(QDialog):
@@ -2051,7 +3081,6 @@ class WeaponSkillRankingDialog(QDialog):
                 )
                 item.setData(Qt.ItemDataRole.UserRole, float(entry["damage"]))
                 item.setToolTip(
-                    f"Seed: {entry.get('seed')}\n"
                     "Select this cell to load its optimized set into the WS editor."
                 )
                 self.table.setItem(row, column, item)
@@ -2242,7 +3271,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("WSDist — Qt")
         self.resize(1220, 820)
-        self.setMinimumSize(QSize(900, 650))
+        self.setMinimumSize(QSize(980, 650))
         self.icons = GearIconProvider()
         window_icon = self.icons.icon({"Item ID": 23937})
         if not window_icon.isNull():
@@ -2294,9 +3323,13 @@ class MainWindow(QMainWindow):
         self.optimizer_thread: OptimizeThread | None = None
         self.overnight_thread: OvernightSimulationThread | None = None
         self.simulation_thread: SimulationThread | None = None
+        self.quick_distribution_thread: PlotThread | None = None
+        self._quick_distribution_threads: list[PlotThread] = []
         self._last_quick_result: dict | None = None
         self._history_selected_id: int | None = None
-        self._dashboard_build_active = False
+        self._workspace_generated_set_name = ""
+        self._dashboard_ws_ranking_active = False
+        self._dashboard_ws_ranking_result: dict | None = None
         self.best_player = None
         self.best_tp_player = None
         self.best_ws_player = None
@@ -2307,10 +3340,13 @@ class MainWindow(QMainWindow):
         self._ranking_skill_in_progress: str | None = None
         self._optimizer_run_state: dict[int, dict] = {}
         self._optimizer_started_at: float | None = None
+        self._optimizer_eta_started_at: float | None = None
+        self._optimizer_progress_samples: list[tuple[float, float]] = []
         self._optimizer_status_timer = QTimer(self)
         self._optimizer_status_timer.setInterval(1000)
         self._optimizer_status_timer.timeout.connect(self._refresh_optimizer_status)
         self._optimizer_run_cards: dict[int, dict] = {}
+        self._optimizer_log_messages: list[str] = []
         self.top_sets_dialog: TopSetsDialog | None = None
         self.gear_blacklist: set[str] = self._load_gear_blacklist()
         self.shared_catalog: dict[str, dict] = {}
@@ -2323,45 +3359,252 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         self._build_menu()
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setObjectName("mainSplitter")
+        splitter.setOpaqueResize(False)
         splitter.addWidget(self._build_inputs())
         splitter.addWidget(self._build_workspace())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([335, 900])
-        self.setCentralWidget(splitter)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setSizes([270, 950])
+        root = QWidget()
+        root.setObjectName("root")
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(4)
+        header = QHBoxLayout()
+        header.setSpacing(3)
+        title = QLabel("FFXI Sim")
+        title.setObjectName("title")
+        title.setFixedWidth(270)
+        simulation_strip = QFrame()
+        simulation_strip.setObjectName("simulationHeaderPanel")
+        simulation_strip.setProperty("state", "idle")
+        self.simulation_header_panel = simulation_strip
+        simulation_layout = QHBoxLayout(simulation_strip)
+        simulation_layout.setContentsMargins(10, 5, 10, 5)
+        simulation_layout.setSpacing(8)
+        simulation_label = QLabel("SIMULATION")
+        simulation_label.setObjectName("simulationHeaderLabel")
+        self.optimizer_control_layout.removeWidget(self.optimizer_run_progress)
+        self.optimizer_primary_controls.removeWidget(self.stop_optimizer_button)
+        self.optimizer_primary_controls.removeWidget(self.show_optimizer_status_button)
+        self.show_optimizer_status_button.setMinimumHeight(34)
+        self.show_optimizer_status_button.setMaximumHeight(38)
+        self.stop_optimizer_button.setMinimumHeight(34)
+        self.stop_optimizer_button.setMaximumHeight(38)
+        self.optimizer_run_progress.setMinimumHeight(24)
+        self.optimizer_run_progress.setMaximumHeight(24)
+        self.optimizer_run_progress.setMaximumWidth(520)
+        self.show_results_button = QPushButton("Show Gear")
+        self.show_results_button.setObjectName("optimizerResultsAction")
+        self.show_results_button.setMinimumHeight(34)
+        self.show_results_button.setMaximumHeight(38)
+        self.show_results_button.setEnabled(bool(self.optimizer_top_results))
+        self.show_results_button.setToolTip(
+            "Open the retained optimizer gear sets (up to 50 distinct results)."
+        )
+        self.show_results_button.clicked.connect(self.show_top_sets)
+        simulation_layout.addWidget(simulation_label)
+        simulation_layout.addWidget(self.show_optimizer_status_button)
+        simulation_layout.addWidget(self.stop_optimizer_button)
+        simulation_layout.addWidget(self.optimizer_run_progress, 1)
+        self.optimizer_header_eta = QLabel("Est. Time Remaining: --")
+        self.optimizer_header_eta.setObjectName("optimizerHeaderEta")
+        self.optimizer_header_eta.setMinimumWidth(150)
+        self.optimizer_header_eta.setToolTip(
+            "Estimated seconds remaining for the active simulation."
+        )
+        simulation_layout.addWidget(self.optimizer_header_eta)
+        simulation_layout.addStretch(1)
+        simulation_layout.addWidget(self.show_results_button)
+        header.addWidget(title)
+        header.addWidget(simulation_strip, 1)
+        root_layout.addLayout(header)
+        root_layout.addWidget(splitter, 1)
+        self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready — no background polling")
-        self.setStyleSheet("""
-            QMainWindow { background: #f3f5f7; }
-            QGroupBox { font-weight: 600; margin-top: 8px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
-            QLabel#sectionTitle { font-size: 16px; font-weight: 700; padding: 3px; }
-            QPushButton { min-height: 24px; padding: 4px 8px; }
-            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 24px; padding: 1px 4px; }
-            QTabBar::tab { padding: 5px 9px; margin: 0 1px; }
-            QFrame#candidateCard {
-                background: #f8fafc;
-                border: 1px solid #d0d5dd;
-                border-radius: 7px;
-            }
-            QLabel#candidateSlot {
-                color: #344054;
-                font-weight: 700;
-                letter-spacing: 0.5px;
-            }
-            QLabel#candidatePlayer {
-                color: #667085;
-            }
-            QPushButton#candidateButton {
-                background: #eef2f6;
-                border: 1px solid #c7ced8;
-                border-radius: 4px;
-                padding: 4px 8px;
-            }
-            QPushButton#candidateButton:hover { background: #e2e8f0; }
-            QPushButton#candidateButton:pressed { background: #d7dee8; }
+        stylesheet = """
+            QMainWindow, QDialog { background: #171624; color: #f5f1ff; font-family: 'Segoe UI', Arial; font-size: 13px; }
+            QWidget { color: #f5f1ff; background-color: #171624; }
+            QLabel, QCheckBox { background: transparent; }
+            QWidget#root { background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 1, stop: 0 #5d5d62, stop: .48 #34343a, stop: 1 #5b5b60); }
+            QLabel#title { min-height: 34px; background: #19172e; border: 2px solid #5a566f; border-left: 4px solid #d6ad68; color: #fffaff; font-size: 21px; font-weight: 700; padding: 4px 8px; }
+            QFrame#simulationHeaderPanel { min-height: 34px; background: #19172e; border: 2px solid #5a566f; }
+            QFrame#simulationHeaderPanel[state="starting"], QFrame#simulationHeaderPanel[state="running"], QFrame#simulationHeaderPanel[state="warming"] { background: #24213a; border-color: #9c8ca4; border-left: 5px solid #d6ad68; }
+            QFrame#simulationHeaderPanel[state="stopping"] { background: #352819; border-color: #e6c983; }
+            QFrame#simulationHeaderPanel[state="completed"], QFrame#simulationHeaderPanel[state="restored"] { background: #252d29; border-color: #9caf94; }
+            QFrame#simulationHeaderPanel[state="failed"] { background: #34252b; border-color: #c58d91; }
+            QLabel#simulationHeaderLabel { color: #e6c983; border: 0; font-size: 11px; font-weight: 900; letter-spacing: 1px; padding: 0 4px; }
+            QSplitter#mainSplitter { background: #24213a; }
+            QSplitter::handle { background: #57536f; width: 2px; }
+            QMenuBar { background: #19172e; color: #f5f1ff; border-bottom: 1px solid #57536f; }
+            QMenuBar::item { padding: 5px 10px; background: transparent; }
+            QMenuBar::item:selected, QMenu::item:selected { background: #493a68; color: #fffaff; }
+            QMenu { background: #24213a; color: #f5f1ff; border: 1px solid #716893; }
+            QMenu::item { padding: 6px 26px 6px 12px; }
+            QGroupBox { font-weight: 600; margin-top: 10px; padding: 5px; border: 1px solid #57536f; border-radius: 4px; background: qlineargradient(y1: 0, y2: 1, stop: 0 #242344, stop: .55 #17162d, stop: 1 #211e40); }
+            QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 5px; color: #eeeaf2; background: #242044; }
+            QLabel#sectionTitle { color: #fffaff; font-size: 16px; font-weight: 700; padding: 5px 8px; border: 1px solid #5a566f; border-left: 4px solid #d6ad68; border-radius: 3px; background: #19172e; }
+            QLabel#dashboardValue { color: #e6c983; font-weight: 700; padding: 3px 6px; background: #17142e; border: 1px solid #3d3955; }
+            QLabel#dashboardStatus, QLabel#readinessDetails { color: #d0ccd6; padding: 7px 9px; background: #17142e; border: 1px solid #57536f; }
+            QLabel#workflowStep { color: #918ca0; padding: 7px; background: #1b1930; border: 1px solid #454158; font-weight: 700; }
+            QLabel#workflowStep[state="complete"] { color: #8cf3b2; border-color: #397055; }
+            QLabel#workflowStep[state="current"] { color: #fff45c; border-color: #d6ad68; }
+            QLabel#workflowStep[state="optional"] { color: #35aee9; border-color: #39718d; }
+            QLabel#workflowStep[state="blocked"] { color: #ffc4c1; border-color: #8d4f58; }
+            QPushButton { padding: 4px 8px; color: #f8f2ff; background: #282348; border: 1px solid #716893; border-radius: 3px; }
+            QPushButton:hover { background: #493a68; border-color: #d9b36e; }
+            QPushButton:pressed { background: #5a4173; }
+            QPushButton:disabled { color: #8e899d; background: #211f31; border-color: #413d52; }
+            QPushButton#primaryAction { color: #fffaff; background: #5a4173; border: 2px solid #d6ad68; font-weight: 700; }
+            QFrame#optimizerControlPanel { background: #211f36; border: 1px solid #716893; border-left: 5px solid #d6ad68; }
+            QFrame#optimizerControlPanel[state="starting"] { background: #30291d; border-color: #e6c983; }
+            QFrame#optimizerControlPanel[state="running"], QFrame#optimizerControlPanel[state="warming"] { background: #24213a; border: 2px solid #8f829b; border-left: 6px solid #d6ad68; }
+            QFrame#optimizerControlPanel[state="stopping"], QFrame#optimizerControlPanel[state="stopped"] { background: #352819; border-color: #e6c983; }
+            QFrame#optimizerControlPanel[state="failed"] { background: #34252b; border-color: #c58d91; }
+            QFrame#optimizerControlPanel[state="completed"], QFrame#optimizerControlPanel[state="restored"] { background: #252d29; border-color: #9caf94; }
+            QLabel#optimizerRunState { min-width: 150px; padding: 4px 8px; color: #eeeaf2; border: 1px solid #716893; font-weight: 800; letter-spacing: 0.6px; }
+            QLabel#optimizerRunState[state="starting"] { color: #fff45c; border-color: #e6c983; }
+            QLabel#optimizerRunState[state="running"], QLabel#optimizerRunState[state="warming"] { color: #e6c983; border-color: #8f829b; }
+            QLabel#optimizerRunState[state="completed"], QLabel#optimizerRunState[state="restored"] { color: #b7c5ab; border-color: #71806b; }
+            QLabel#optimizerRunState[state="stopping"], QLabel#optimizerRunState[state="stopped"] { color: #ffe2a8; border-color: #8a6430; }
+            QLabel#optimizerRunState[state="failed"] { color: #ffc4c1; border-color: #8d4f58; }
+            QLabel#optimizerRunSummary { color: #f5f1ff; font-weight: 600; }
+            QLabel#optimizerHeaderEta { min-width: 150px; padding: 4px 7px; color: #e6c983; background: #302b47; border: 1px solid #8f829b; font-weight: 700; }
+            QLabel#optimizerHeaderEta[state="completed"], QLabel#optimizerHeaderEta[state="restored"] { color: #b7c5ab; border-color: #71806b; }
+            QLabel#optimizerHeaderEta[state="failed"] { color: #ffc4c1; border-color: #8d4f58; }
+            QLabel#optimizerHeaderEta[state="stopping"], QLabel#optimizerHeaderEta[state="stopped"] { color: #ffe2a8; border-color: #8a6430; }
+            QPushButton#optimizerStartAction { color: #171624; background: #e6c983; border: 2px solid #fff0a8; font-weight: 800; }
+            QPushButton#optimizerStartAction:hover { background: #fff0a8; border-color: #fffaff; }
+            QPushButton#optimizerStartAction:disabled { color: #8e899d; background: #302d3a; border-color: #57536f; }
+            QPushButton#optimizerStopAction { color: #fffaff; background: #7a303a; border: 2px solid #d77a83; font-weight: 800; }
+            QPushButton#optimizerStopAction:hover { background: #9a3b48; border-color: #ffc4c1; }
+            QPushButton#optimizerStopAction:disabled { color: #766f80; background: #251f2c; border-color: #493d4a; }
+            QPushButton#optimizerShowAction { color: #fffaff; background: #4b405a; border: 2px solid #a18fa3; font-weight: 800; }
+            QPushButton#optimizerShowAction:hover { background: #5b4c67; border-color: #d6ad68; }
+            QPushButton#optimizerResultsAction { color: #fffaff; background: #302b47; border: 2px solid #8f829b; font-weight: 800; }
+            QPushButton#optimizerResultsAction:hover { background: #493f58; border-color: #d6ad68; }
+            QProgressBar#optimizerRunProgress { min-height: 20px; max-height: 24px; color: #fffaff; text-align: center; font-size: 10px; font-weight: 800; background: #5b5981; border: 2px solid #d6ad68; border-left-width: 6px; border-right-width: 6px; border-radius: 5px; }
+            QProgressBar#optimizerRunProgress::chunk { background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #d999ad, stop: .5 #c77f99, stop: 1 #a95f7b); border-right: 1px solid #ead0d8; }
+            QLabel#simulationProgressValue, QLabel#simulationEtaValue, QLabel#simulationPhaseValue { background: #1b1930; border: 1px solid #454158; padding: 7px 9px; }
+            QLabel#simulationResultValue { color: #fffaff; background: #302535; border: 1px solid #806b82; border-left: 4px solid #c995a9; padding: 7px 9px; font-weight: 700; }
+            QLabel#simulationActivity { color: #e6c983; font-weight: 800; }
+            QDialog#simulationStatusDialog { background: #4a4a51; color: #fffaff; }
+            QDialog#simulationStatusDialog QGroupBox { background: qlineargradient(y1: 0, y2: 1, stop: 0 #55555e, stop: .5 #42424a, stop: 1 #38383f); border: 1px solid #85818f; }
+            QDialog#simulationStatusDialog QGroupBox::title { color: #fffaff; background: #4a4a52; }
+            QDialog#simulationStatusDialog QTextEdit, QDialog#simulationStatusDialog QLineEdit { color: #fffaff; background: #24242b; border: 1px solid #85818f; selection-background-color: #6b5963; }
+            QDialog#simulationStatusDialog QPushButton { color: #fffaff; background: #414149; border: 1px solid #96919e; }
+            QDialog#simulationStatusDialog QPushButton:hover { background: #55525a; border-color: #d6ad68; }
+            QDialog#simulationStatusDialog QLabel#simulationProgressValue, QDialog#simulationStatusDialog QLabel#simulationEtaValue, QDialog#simulationStatusDialog QLabel#simulationPhaseValue { background: #303037; border: 1px solid #77737f; }
+            QDialog#simulationStatusDialog QLabel#simulationResultValue { background: #41393a; border: 1px solid #8d7d75; border-left: 4px solid #d6ad68; }
+            QDialog#simulationStatusDialog QFrame#optimizerCurrentResult { background: #343238; border: 1px solid #817b86; border-left: 4px solid #d6ad68; }
+            QLabel#optimizerCurrentResultValues { color: #fffaff; border: 0; font-family: Consolas, monospace; font-weight: 700; }
+            QDialog#simulationStatusDialog QWidget#simulationCacheBar, QDialog#simulationStatusDialog QWidget#simulationFooter { background: transparent; }
+            QDialog#simulationStatusDialog QCheckBox::indicator { background: #303037; border-color: #d6ad68; }
+            QDialog#simulationStatusDialog QScrollBar:vertical { background: #303037; }
+            QDialog#simulationStatusDialog QScrollBar::handle:vertical { background: #77737f; }
+            QLabel#linkedWeaponOverlay { color: #e6c983; background: #211f36; border: 1px solid #716893; border-left: 4px solid #d6ad68; padding: 5px 8px; font-weight: 700; }
+            QFrame#topSetGearCell { background: #1d1a36; border: 1px solid #57536f; border-radius: 3px; }
+            QFrame#topSetGearCell:hover { background: #2a2442; border-color: #d6ad68; }
+            QFrame#topSetGearCell[locked="true"] { background: #3b311d; border: 2px solid #e6c983; }
+            QFrame#topSetGearCell[blacklisted="true"] { background: #211f29; border: 1px solid #4b4854; color: #817d8a; }
+            QLabel#topSetSlotLabel { color: #8f89a5; font-size: 10px; }
+            QFrame#topSetGearCell[locked="true"] QLabel#topSetSlotLabel { color: #e6c983; font-weight: 800; }
+            QFrame#topSetGearCell[blacklisted="true"] QLabel { color: #817d8a; }
+            QPushButton#profileGearSlot { text-align: center; padding: 0; font-size: 9px; background: qlineargradient(y1: 0, y2: 1, stop: 0 #5d5b70, stop: 1 #454357); border: 1px solid #77728f; border-radius: 0; }
+            QPushButton#profileGearSlot:hover { border: 1px solid #d6ad68; }
+            QPushButton#profileGearSlot[selected="true"] { background: #555268; border: 2px solid #dfa064; color: #fffaff; }
+            QLabel#emptySlotLabel { color: #f7f4ff; background: transparent; border: 0; padding: 0; font-size: 9px; }
+            QLabel#profileGearDetail { color: #f5f1ff; padding: 5px 8px; background: #17142e; border: 1px solid #57536f; }
+            QLabel#profileRecipe { color: #f5f1ff; padding: 7px 9px; background: #17142e; border: 1px solid #57536f; }
+            QLabel#profileWarning { color: #ffe2a8; padding: 5px 8px; background: #352819; border: 1px solid #8a6430; }
+            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit { min-height: 24px; padding: 1px 4px; color: #f5f1ff; background: #17142e; border: 1px solid #5d5878; border-radius: 3px; selection-color: #fffaff; selection-background-color: #654266; }
+            QComboBox::drop-down { border: 0; width: 20px; }
+            QComboBox QAbstractItemView { background: #17142e; color: #d0ccd6; border: 1px solid #716893; selection-color: #ff6fb3; selection-background-color: #34334d; }
+            QListWidget, QTableWidget { background: #17142e; color: #d0ccd6; border: 1px solid #5d5878; alternate-background-color: #1d1a36; gridline-color: #302d4a; }
+            QListWidget::item { padding: 2px 5px; }
+            QListWidget::item:selected { color: #ff6fb3; background: #282348; border: 0; }
+            QTableWidget::item { padding: 2px 5px; border: 0; }
+            QTableWidget::item:selected { color: #fffaff; background: #4a3038; border: 0; }
+            QHeaderView { background: #17142e; color: #eeeaf2; }
+            QHeaderView::section { min-height: 24px; padding: 2px 6px; color: #eeeaf2; background: #24213a; border: 0; border-right: 1px solid #57536f; border-bottom: 1px solid #716893; font-weight: 700; }
+            QTableCornerButton::section { background: #24213a; border: 0; border-right: 1px solid #57536f; border-bottom: 1px solid #716893; }
+            QListWidget::indicator { width: 18px; height: 18px; border: 2px solid #8f89a5; background: #17142e; }
+            QListWidget::indicator:checked { image: url(__CHECKMARK_GOLD__); border: 0; background: #e6c983; }
+            QTabWidget::pane { border: 1px solid #57536f; background: #1b1930; }
+            QTabBar::tab { padding: 6px 10px; margin: 0 1px; color: #d0ccd6; background: #24213a; border: 1px solid #57536f; border-bottom: 0; border-top-left-radius: 3px; border-top-right-radius: 3px; }
+            QTabBar::tab:selected { color: #fffaff; background: #493a68; border-color: #d6ad68; }
+            QTabBar::tab:hover:!selected { background: #302b4d; }
+            QScrollArea { background: transparent; border: 0; }
+            QScrollBar:vertical { background: #17142e; width: 10px; margin: 0; }
+            QScrollBar::handle:vertical { background: #57536f; min-height: 24px; border-radius: 4px; }
+            QScrollBar:horizontal { background: #17142e; height: 10px; margin: 0; }
+            QScrollBar::handle:horizontal { background: #57536f; min-width: 24px; border-radius: 4px; }
+            QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; background: transparent; border: 0; }
+            QProgressBar { min-height: 16px; color: #fffaff; text-align: center; background: #17142e; border: 1px solid #57536f; }
+            QProgressBar::chunk { background: #5b4778; border-right: 1px solid #d6ad68; }
+            QStatusBar { background: #151329; color: #c7c2d2; border-top: 1px solid #57536f; }
+            QToolTip { background: #17142e; color: #fffaff; border: 1px solid #a39ab9; padding: 6px; }
+            QCheckBox { spacing: 7px; }
+            QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #d6ad68; background: #211b30; }
+            QCheckBox::indicator:hover { border-color: #fff0a8; background: #332b1f; }
+            QCheckBox::indicator:checked { image: url(__CHECKMARK_GOLD__); border: 0; background: #e6c983; }
+            QGroupBox#equipmentPanel { background: qlineargradient(y1: 0, y2: 1, stop: 0 #242344, stop: .5 #13132b, stop: 1 #211e40); border: 2px solid #57536f; margin-top: 0; padding: 0; }
+            QPushButton#equip_slot { background: qlineargradient(y1: 0, y2: 1, stop: 0 #5d5b70, stop: .52 #504e62, stop: 1 #454357); border: 1px solid #77728f; border-radius: 0; color: #f7f4ff; padding: 0; font-size: 9px; text-align: center; }
+            QPushButton#equip_slot:hover { border: 1px solid #d6ad68; }
+            QPushButton#equip_slot:pressed { background: #3f3c52; border: 1px solid #e6c983; }
+            QPushButton#equip_slot[selected="true"] { background: #555268; border: 2px solid #dfa064; }
+            QFrame#quickResultPanel { background: #17142e; border: 2px solid #57536f; border-left: 4px solid #d6ad68; }
+            QLabel#quickResult { color: #fffaff; background: transparent; border: 0; padding: 3px 5px; font-weight: 700; }
+            QWidget#quickResultGraph { background: #17142e; border: 0; }
+            QLabel#quickResultGraphFallback { color: #a9a4b5; background: transparent; border: 0; padding: 8px; }
+            QLabel#cycleIntro { color: #d0ccd6; padding: 2px 4px 4px; }
+            QGroupBox#cycleSetPanel, QGroupBox#cycleActionPanel, QGroupBox#cycleStatusPanel { background: #1b1930; border: 1px solid #57536f; }
+            QGroupBox#cycleSetPanel { border-top: 2px solid #d6ad68; }
+            QGroupBox#cycleSetPanel::title, QGroupBox#cycleActionPanel::title, QGroupBox#cycleStatusPanel::title { color: #fffaff; font-weight: 700; }
+            QLabel#cycleSetSummary { color: #c7c2d2; background: #17142e; border: 1px solid #302d4a; padding: 5px 7px; }
+            QLabel#cycleStatus { color: #ffe2a8; background: #352819; border: 1px solid #8a6430; padding: 7px 9px; font-weight: 600; }
+            QPushButton#cycleRunAction { color: #171624; background: #e6c983; border: 2px solid #fff0a8; font-weight: 800; }
+            QPushButton#cycleRunAction:hover { background: #fff0a8; border-color: #fffaff; }
+            QPushButton#cycleStopAction { color: #fffaff; background: #7a303a; border: 2px solid #d77a83; font-weight: 800; }
+            QPushButton#cycleStopAction:hover { background: #9a3b48; border-color: #ffc4c1; }
+            QPushButton#cycleSecondaryAction { background: #282348; border: 1px solid #716893; }
+            QPushButton#cycleSecondaryAction:hover { background: #493a68; border-color: #d6ad68; }
+            QGroupBox#quickStatsSection { margin-top: 8px; padding: 2px; }
+            QFrame#quickStatRow { background: #17142e; border: 1px solid #302d4a; }
+            QLabel#quickStatName { color: #d0ccd6; font-weight: 600; }
+            QLabel#quickStatValue { color: #f5f1ff; font-family: Consolas, monospace; font-weight: 700; }
+            QLabel#quickStatAccent { font-family: Consolas, monospace; font-weight: 700; }
+            QCheckBox#referenceEnemyToggle { font-size: 10pt; font-weight: 600; spacing: 5px; }
+            QLabel#buffIntro { color: #d0ccd6; padding: 1px 2px 3px; }
+            QLabel#buffPresetNote { color: #c7c2d2; background: #1b1930; border-left: 3px solid #d6ad68; padding: 4px 7px; }
+            QFrame#lacEditorToolbar { background: #252526; border: 1px solid #3f3f46; }
+            QLabel#lacEditorPath { color: #9cdcfe; background: transparent; border: 0; padding: 2px 5px; }
+            QLabel#lacEditorStatus { color: #c7c2d2; background: #252526; border-left: 3px solid #007acc; padding: 5px 8px; }
+            QPlainTextEdit#lacCodeEditor { color: #d4d4d4; background: #1e1e1e; border: 1px solid #3f3f46; selection-background-color: #264f78; selection-color: #ffffff; padding: 0; }
+            QPushButton#lacEditorSave { color: #ffffff; background: #0e639c; border: 1px solid #1177bb; font-weight: 700; }
+            QPushButton#lacEditorSave:hover { background: #1177bb; border-color: #3794ff; }
+            QPushButton#lacEditorSave:disabled { color: #777777; background: #2d2d30; border-color: #3f3f46; }
+            QFrame#candidateCard { background: #242344; border: 1px solid #716893; border-radius: 7px; }
+            QFrame#candidateCard[locked="true"] { background: #3b311d; border: 2px solid #e6c983; }
+            QLabel#candidateSlot { color: #eeeaf2; font-weight: 700; letter-spacing: 0.5px; }
+            QLabel#candidateSlot[locked="true"] { color: #fff0a8; }
+            QLabel#candidatePlayer { color: #d0ccd6; }
+            QPushButton#candidateButton { background: #282348; border: 1px solid #716893; border-radius: 4px; padding: 4px 8px; }
+            QPushButton#candidateButton:hover { background: #493a68; }
+            QPushButton#candidateButton:pressed { background: #5a4173; }
+            QPushButton#candidateButton[locked="true"] { color: #171624; background: #e6c983; border: 2px solid #fff0a8; font-weight: 800; }
+            QComboBox#candidateLockCombo[locked="true"] { color: #171624; background: #e6c983; border: 2px solid #fff0a8; font-weight: 800; }
+            QLabel#candidateLockLabel[locked="true"] { color: #e6c983; font-weight: 800; }
             QPlainTextEdit { font-family: Consolas, monospace; }
-        """)
+            QPlainTextEdit#resultDetailsText { font-size: 12px; padding: 4px 6px; }
+        """
+        self.setStyleSheet(stylesheet.replace(
+            "__CHECKMARK_GOLD__", (APP_DIR / "assets" / "checkmark-gold.svg").as_posix()
+        ))
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("File")
@@ -2371,8 +3614,6 @@ class MainWindow(QMainWindow):
         refresh.triggered.connect(self.refresh_bridge)
         blacklist = QAction("Gear blacklist...", self)
         blacklist.triggered.connect(self.open_gear_blacklist)
-        overnight = QAction("Run overnight simulations...", self)
-        overnight.triggered.connect(self.run_overnight_simulations)
         self.cache_enabled_action = QAction("Enable simulation cache", self)
         self.cache_enabled_action.setCheckable(True)
         self.cache_enabled_action.setChecked(self.cache_enabled)
@@ -2380,20 +3621,22 @@ class MainWindow(QMainWindow):
             "Reuse completed deterministic Quick Look and seeded optimizer results."
         )
         self.cache_enabled_action.toggled.connect(self._set_cache_enabled)
-        cache_info = QAction("Simulation cache...", self)
-        cache_info.triggered.connect(self.show_cache_info)
-        clear_cache = QAction("Clear simulation cache", self)
-        clear_cache.triggered.connect(self.clear_simulation_cache)
+        performance = QAction("Performance and storage...", self)
+        performance.triggered.connect(self.show_performance_settings)
         close = QAction("Exit", self)
         close.triggered.connect(self.close)
-        file_menu.addActions([select_root, refresh, blacklist, overnight])
+        file_menu.addActions([select_root, refresh, blacklist])
         file_menu.addSeparator()
-        file_menu.addActions([self.cache_enabled_action, cache_info, clear_cache])
+        file_menu.addAction(performance)
         file_menu.addSeparator()
         file_menu.addAction(close)
 
     def _set_cache_enabled(self, enabled: bool):
         self.cache_enabled = bool(enabled)
+        if hasattr(self, "cache_enabled_action"):
+            self.cache_enabled_action.blockSignals(True)
+            self.cache_enabled_action.setChecked(self.cache_enabled)
+            self.cache_enabled_action.blockSignals(False)
         self.settings.setValue("simulation_cache/enabled", self.cache_enabled)
         self.statusBar().showMessage(
             "Simulation cache enabled" if self.cache_enabled else "Simulation cache disabled", 4000
@@ -2431,6 +3674,60 @@ class MainWindow(QMainWindow):
             f"Entries by type: {kinds}.\n"
             "Completed Quick Look evaluations and seeded optimizer searches are reused when every input and calculation source matches."
         )
+
+    def show_performance_settings(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Performance and storage")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+        reuse = QCheckBox("Reuse completed calculations")
+        reuse.setChecked(self.cache_enabled)
+        reuse.setToolTip("Reuse only calculations whose effective inputs and formula version match.")
+        reuse.toggled.connect(self._set_cache_enabled)
+        layout.addWidget(reuse)
+        summary = self.simulation_cache.summary()
+        storage = QLabel(
+            f"Saved calculations: {summary['entries']:,} · "
+            f"{self._format_bytes(summary['bytes'])} payload · "
+            f"{self._format_bytes(summary['disk_bytes'])} on disk\n"
+            "Saved work expires after 90 days and is limited to 250 MiB."
+        )
+        storage.setWordWrap(True)
+        layout.addWidget(storage)
+        actions_box = QGroupBox("Advanced cache tools")
+        actions_layout = QGridLayout(actions_box)
+        warm_rankings = QPushButton("Precompute WS rankings")
+        warm_rankings.setToolTip("Precompute current weapon-type rankings at 1,000, 2,000, and 3,000 TP.")
+        overnight = QPushButton("Precompute common evaluations")
+        overnight.setToolTip("Build reusable Quick Look evaluations for the current candidates.")
+        stop = QPushButton("Stop precompute")
+        stop.setEnabled(bool(self.overnight_thread and self.overnight_thread.isRunning()))
+        clear = QPushButton("Clear saved calculations")
+        warm_rankings.clicked.connect(lambda: (dialog.accept(), QTimer.singleShot(0, self.run_warm_cache_from_advanced)))
+        overnight.clicked.connect(lambda: (dialog.accept(), QTimer.singleShot(0, self.run_overnight_simulations)))
+        stop.clicked.connect(self.stop_overnight_simulations)
+        clear.clicked.connect(self.clear_simulation_cache)
+        actions_layout.addWidget(warm_rankings, 0, 0)
+        actions_layout.addWidget(overnight, 0, 1)
+        actions_layout.addWidget(stop, 1, 0)
+        actions_layout.addWidget(clear, 1, 1)
+        layout.addWidget(actions_box)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def run_warm_cache_from_advanced(self):
+        previous = self.optimize_action.currentText()
+        self.optimize_action.addItem(WARM_CACHE_ACTION)
+        self.optimize_action.setCurrentText(WARM_CACHE_ACTION)
+        try:
+            self.run_optimizer()
+        finally:
+            self.optimize_action.setCurrentText(previous)
+            index = self.optimize_action.findText(WARM_CACHE_ACTION)
+            if index >= 0:
+                self.optimize_action.removeItem(index)
 
     def clear_simulation_cache(self):
         if self.simulation_cache.clear():
@@ -2566,12 +3863,49 @@ class MainWindow(QMainWindow):
             _normalized_item_name(value) for value in values if _normalized_item_name(value)
         }
         self.settings.setValue("global_gear_blacklist", json.dumps(sorted(self.gear_blacklist)))
+        self._refresh_shared_gear()
         self._reset_invalid_equipment()
+        self._refresh_locked_gear_options()
         for slot in SLOTS:
             self._update_candidate_button(slot)
         self.statusBar().showMessage(
             f"Global gear blacklist updated ({len(self.gear_blacklist)} item names).", 5000
         )
+
+    def set_optimizer_item_blacklisted(self, name: str, blocked: bool = True):
+        """Apply a result/candidate context-menu blacklist change immediately."""
+        normalized = _normalized_item_name(name)
+        if not normalized:
+            return
+        values = set(self.gear_blacklist)
+        if blocked:
+            values.add(normalized)
+        else:
+            values.discard(normalized)
+        self.set_gear_blacklist(values)
+        action = "Added to" if blocked else "Removed from"
+        self.statusBar().showMessage(f"{name}: {action} global gear blacklist.", 5000)
+
+    def toggle_optimizer_item_lock(self, slot: str, name: str) -> bool:
+        """Toggle a slot lock from an optimizer result or candidate row."""
+        if slot not in self.locked_gear or not name or name == "Empty":
+            return False
+        if self.locked_gear.get(slot) == name:
+            self.locked_gear[slot] = ""
+            self._update_candidate_button(slot)
+            self.statusBar().showMessage(f"{slot.upper()} unlocked.", 4000)
+            return False
+        available = {item_name(item) for item in self.optimizer_items_for_slot(slot)}
+        if name not in available:
+            self.statusBar().showMessage(
+                f"Cannot lock {name}: it is not an available {slot.upper()} candidate.", 5000
+            )
+            return False
+        self.candidates[slot].add(name)
+        self.locked_gear[slot] = name
+        self._update_candidate_button(slot)
+        self.statusBar().showMessage(f"{slot.upper()} locked to {name}.", 4000)
+        return True
 
     def open_gear_blacklist(self):
         dialog = GearBlacklistDialog(self)
@@ -2579,9 +3913,10 @@ class MainWindow(QMainWindow):
 
     def _build_inputs(self) -> QWidget:
         content = QWidget()
+        content.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
         bridge = QGroupBox("Character bridge")
         bridge_layout = QVBoxLayout(bridge)
         choose = QPushButton("Select Ashita folder...")
@@ -2606,6 +3941,7 @@ class MainWindow(QMainWindow):
 
         player = QGroupBox("Player")
         form = QFormLayout(player)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.main_job = QComboBox()
         self.main_job.addItems(sorted(JOBS))
         self.main_job.setCurrentText("Scholar")
@@ -2638,7 +3974,11 @@ class MainWindow(QMainWindow):
             "it does not require the temporary Quick Look weapon to be equipped. Auto uses the equipped Quick Look weapon."
         )
         self.ws_combo = QComboBox()
-        self.ws_combo.setEditable(True)
+        self.ws_combo.setEditable(False)
+        self.ws_combo.setMaxVisibleItems(18)
+        self.ws_combo.setToolTip(
+            "Choose a weapon skill from the selected weapon-type family."
+        )
         self.spell_combo = QComboBox()
         self.spell_combo.setEditable(True)
         form.addRow("Main job", self.main_job)
@@ -2660,6 +4000,7 @@ class MainWindow(QMainWindow):
 
         enemy_box = QGroupBox("Enemy")
         enemy_form = QFormLayout(enemy_box)
+        enemy_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.enemy_combo = QComboBox()
         self.enemy_combo.addItems(list(enemies.preset_enemies))
         self.enemy_combo.setCurrentText("BG Wiki sets")
@@ -2678,10 +4019,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(enemy_box)
         layout.addStretch(1)
         scroll = QScrollArea()
+        scroll.setObjectName("contextScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(content)
-        scroll.setMinimumWidth(315)
+        scroll.setMinimumWidth(250)
+        scroll.setMaximumWidth(280)
         return scroll
 
     def _refresh_favorite_character_button(self, *_args):
@@ -2726,9 +4070,11 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
         self.tabs = QTabWidget()
-        self.quick_set = GearSetEditor("Quick Look equipment", self)
-        self.tp_set = GearSetEditor("TP equipment", self)
-        self.ws_set = GearSetEditor("Weapon-skill equipment", self)
+        self.quick_set = GearSetEditor("Quick View equipment", self, game_grid=True)
+        # TP and WS use the same compact reference-style 4x4 equipment grid
+        # as Quick Look so the cycle view is scannable and directly comparable.
+        self.tp_set = GearSetEditor("TP equipment", self, game_grid=True)
+        self.ws_set = GearSetEditor("Weapon-skill equipment", self, game_grid=True)
         self.quick_set.changed.connect(self._gear_changed)
         self.tp_set.changed.connect(self._gear_changed)
         self.ws_set.changed.connect(self._gear_changed)
@@ -2742,10 +4088,13 @@ class MainWindow(QMainWindow):
         calculators_tab = self._calculators_tab()
         optimizer_tab = self._optimizer_tab()
         profile_builder_tab = self._profile_builder_tab()
+        lac_editor_tab = self._lac_editor_tab()
+        self.profile_job_combo.currentTextChanged.connect(self._profile_job_for_editor_changed)
         aspirational_tab = self._aspirational_tab()
         self.tabs.addTab(self._gear_workspace_tab(), "Gear Workspace")
-        self.tabs.addTab(optimizer_tab, "Optimizer")
         self.tabs.addTab(profile_builder_tab, "Profile Builder")
+        self.tabs.addTab(lac_editor_tab, "LAC Editor")
+        self.tabs.addTab(optimizer_tab, "Optimizer")
         self.tabs.addTab(self._results_tab(), "Results")
         self.tabs.addTab(aspirational_tab, "Aspirational")
         self.tabs.addTab(active_buffs_tab, "Active Buffs")
@@ -2756,6 +4105,7 @@ class MainWindow(QMainWindow):
             "Build Dashboard": "Run the complete build workflow, apply scenario presets, check gear readiness, and manage favorites.",
             "Optimizer": "Search selected candidates for damage, defense, WS ranking, or tradeoffs.",
             "Profile Builder": "Turn optimized results into reviewed LuAshitacast profile sets.",
+            "LAC Editor": "View and safely edit the selected character's current LuAshitacast Lua file.",
             "Results": "Browse, pin, rerun, compare, and export completed simulations.",
             "Aspirational": "Review modeled gear you do not currently own; never published automatically.",
             "Active Buffs": "Configure active songs, rolls, GEO, food, debuffs, and test scenarios.",
@@ -2775,7 +4125,8 @@ class MainWindow(QMainWindow):
         wanted = str(name or "").strip().casefold()
         wanted = {"ja": "active buffs", "job ability": "active buffs", "job abilities": "active buffs"}.get(wanted, wanted)
         for index in range(self.tabs.count()):
-            if self.tabs.tabText(index).casefold() == wanted:
+            tab_label = self.tabs.tabText(index).removesuffix(" *").casefold()
+            if tab_label == wanted:
                 self.tabs.setCurrentIndex(index)
                 return True
             page = self.tabs.widget(index)
@@ -2825,173 +4176,425 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
+        heading = QLabel("Build LuAshitacast starting sets")
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
         intro = QLabel(
-            "Start here for a complete character build. Choose a scenario, check gear readiness, "
-            "build the catalog, optimize every applicable section, and then review the generated profile."
+            "Create practical owned-gear starting sets first. Combat simulation is an optional second pass, "
+            "and publishing always opens an exact diff for review."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        scenario_box = QGroupBox("Scenario presets")
-        scenario_layout = QFormLayout(scenario_box)
-        self.dashboard_scenario_combo = QComboBox()
-        for name, preset in SCENARIO_PRESETS.items():
-            self.dashboard_scenario_combo.addItem(name, preset)
-        self.dashboard_scenario_combo.currentIndexChanged.connect(self._refresh_dashboard_scenario_note)
-        apply_scenario = QPushButton("Apply scenario")
-        apply_scenario.clicked.connect(self.apply_dashboard_scenario)
-        scenario_row = QHBoxLayout()
-        scenario_row.addWidget(self.dashboard_scenario_combo, 1)
-        scenario_row.addWidget(apply_scenario)
-        scenario_layout.addRow("Preset", scenario_row)
-        self.dashboard_scenario_note = QLabel()
-        self.dashboard_scenario_note.setWordWrap(True)
-        scenario_layout.addRow(self.dashboard_scenario_note)
-        layout.addWidget(scenario_box)
+        context_box = QGroupBox("1  Source profile")
+        context_layout = QGridLayout(context_box)
+        self.dashboard_character_value = QLabel("No character selected")
+        self.dashboard_character_value.setObjectName("dashboardValue")
+        self.dashboard_profile_value = QLabel("No LAC profile loaded")
+        self.dashboard_profile_value.setObjectName("dashboardValue")
+        self.dashboard_source_value = QLabel("Accessible + Porter gear")
+        self.dashboard_source_value.setObjectName("dashboardValue")
+        refresh = QPushButton("Refresh inventory and profiles")
+        refresh.clicked.connect(self.refresh_bridge)
+        configure = QPushButton("Configure build")
+        configure.clicked.connect(lambda: self._select_tab("Profile Builder"))
+        context_layout.addWidget(QLabel("Character"), 0, 0)
+        context_layout.addWidget(self.dashboard_character_value, 0, 1)
+        context_layout.addWidget(QLabel("Profile"), 1, 0)
+        context_layout.addWidget(self.dashboard_profile_value, 1, 1)
+        context_layout.addWidget(QLabel("Gear sources"), 2, 0)
+        context_layout.addWidget(self.dashboard_source_value, 2, 1)
+        context_layout.addWidget(refresh, 0, 2)
+        context_layout.addWidget(configure, 1, 2)
+        context_layout.setColumnStretch(1, 1)
+        layout.addWidget(context_box)
 
-        build_box = QGroupBox("Build workflow")
-        build_layout = QHBoxLayout(build_box)
+        build_box = QGroupBox("2  Generate and improve")
+        build_layout = QVBoxLayout(build_box)
         build_layout.setContentsMargins(8, 10, 8, 8)
-        build_layout.setSpacing(10)
-        build_actions = QGridLayout()
-        build_actions.setHorizontalSpacing(6)
-        build_actions.setVerticalSpacing(6)
-        self.dashboard_build_button = QPushButton("Build everything")
+        build_layout.setSpacing(7)
+        steps = QGridLayout()
+        self.dashboard_source_step = QLabel("1  Check source")
+        self.dashboard_base_step = QLabel("2  Create starting sets")
+        self.dashboard_combat_step = QLabel("3  Improve combat sets (optional)")
+        for column, label in enumerate((
+            self.dashboard_source_step,
+            self.dashboard_base_step,
+            self.dashboard_combat_step,
+        )):
+            label.setObjectName("workflowStep")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            steps.addWidget(label, 0, column)
+            steps.setColumnStretch(column, 1)
+        build_layout.addLayout(steps)
+        build_actions = QHBoxLayout()
+        self.dashboard_search_quality = QComboBox()
+        self.dashboard_search_quality.addItems(SEARCH_QUALITY_NAMES)
+        self.dashboard_search_quality.setCurrentText(
+            self.profile_builder_depth.currentText() if hasattr(self, "profile_builder_depth") else "Fast"
+        )
+        self.dashboard_search_quality.setToolTip(
+            "Fast 6x4 · Standard 10x10 · Deep 12x10 without shared starting knowledge."
+        )
+        self.dashboard_search_quality.currentTextChanged.connect(
+            self._set_profile_builder_depth_from_dashboard
+        )
+        if hasattr(self, "profile_builder_depth"):
+            self.profile_builder_depth.currentTextChanged.connect(
+                lambda quality: self.dashboard_search_quality.setCurrentText(quality)
+            )
+        self.dashboard_build_button = QPushButton("Create starting sets")
+        self.dashboard_build_button.setObjectName("primaryAction")
         self.dashboard_build_button.setToolTip(
-            "Build the complete managed profile, then start Optimize all loadouts when combat sections are available."
+            "Create deterministic owned-gear sets without changing the LAC file."
         )
         self.dashboard_build_button.clicked.connect(self.build_everything)
-        optimize = QPushButton("Optimize all loadouts")
-        optimize.clicked.connect(self.optimize_all_profile_builder_sections)
-        profile = QPushButton("Review Profile Builder")
-        profile.clicked.connect(lambda: self._select_tab("Profile Builder"))
-        results = QPushButton("Open Results")
-        results.clicked.connect(lambda: self._select_tab("Results"))
-        build_actions.addWidget(self.dashboard_build_button, 0, 0)
-        build_actions.addWidget(optimize, 0, 1)
-        build_actions.addWidget(profile, 1, 0)
-        build_actions.addWidget(results, 1, 1)
+        self.dashboard_optimize_button = QPushButton("Improve combat sets")
+        self.dashboard_optimize_button.setEnabled(False)
+        self.dashboard_optimize_button.clicked.connect(self.optimize_all_profile_builder_sections)
+        self.dashboard_review_button = QPushButton("Review sets and publish")
+        self.dashboard_review_button.setEnabled(False)
+        self.dashboard_review_button.clicked.connect(lambda: self._select_tab("Profile Builder"))
+        build_actions.addWidget(QLabel("Search quality"))
+        build_actions.addWidget(self.dashboard_search_quality)
+        build_actions.addWidget(self.dashboard_build_button)
+        build_actions.addWidget(self.dashboard_optimize_button)
+        build_actions.addWidget(self.dashboard_review_button)
+        build_actions.addStretch(1)
+        build_layout.addLayout(build_actions)
+        self.dashboard_progress = QProgressBar()
+        self.dashboard_progress.setTextVisible(True)
+        self.dashboard_progress.setFormat("No catalog generated")
+        build_layout.addWidget(self.dashboard_progress)
         self.dashboard_build_status = QLabel("No build has been started.")
         self.dashboard_build_status.setWordWrap(True)
-        self.dashboard_build_status.setObjectName("sectionTitle")
-        build_layout.addLayout(build_actions)
-        build_layout.addWidget(self.dashboard_build_status, 1)
+        self.dashboard_build_status.setObjectName("dashboardStatus")
+        build_layout.addWidget(self.dashboard_build_status)
         layout.addWidget(build_box)
 
-        readiness_box = QGroupBox("Gear readiness")
+        readiness_box = QGroupBox("Readiness details")
         readiness_layout = QVBoxLayout(readiness_box)
         readiness_buttons = QHBoxLayout()
-        check_readiness = QPushButton("Run readiness check")
+        check_readiness = QPushButton("Refresh readiness")
         check_readiness.clicked.connect(self.refresh_gear_readiness)
         readiness_buttons.addWidget(check_readiness)
         readiness_buttons.addStretch(1)
         readiness_layout.addLayout(readiness_buttons)
-        self.dashboard_readiness = QPlainTextEdit()
-        self.dashboard_readiness.setReadOnly(True)
-        self.dashboard_readiness.setMaximumHeight(170)
-        self.dashboard_readiness.setPlaceholderText("Readiness findings will appear here.")
+        self.dashboard_readiness = QLabel("Readiness findings will appear here.")
+        self.dashboard_readiness.setObjectName("readinessDetails")
+        self.dashboard_readiness.setWordWrap(True)
+        self.dashboard_readiness.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         readiness_layout.addWidget(self.dashboard_readiness)
         layout.addWidget(readiness_box)
 
-        favorites_box = QGroupBox("Favorites")
-        favorites_layout = QGridLayout(favorites_box)
-        favorites_layout.setContentsMargins(8, 10, 8, 8)
-        favorites_layout.setHorizontalSpacing(6)
-        favorites_layout.setVerticalSpacing(6)
-        self.favorite_weapon_name = QLineEdit()
-        self.favorite_weapon_name.setPlaceholderText("Name this weapon setup")
-        self.favorite_weapon_combo = QComboBox()
-        save_weapon = QPushButton("Save current weapons")
-        save_weapon.clicked.connect(self.save_favorite_weapon_setup)
-        load_weapon = QPushButton("Load")
-        load_weapon.clicked.connect(self.load_favorite_weapon_setup)
-        delete_weapon = QPushButton("Delete")
-        delete_weapon.clicked.connect(self.delete_favorite_weapon_setup)
-        favorites_layout.addWidget(QLabel("Name"), 0, 0)
-        favorites_layout.addWidget(self.favorite_weapon_name, 0, 1, 1, 2)
-        favorites_layout.addWidget(save_weapon, 0, 3)
-        favorites_layout.addWidget(QLabel("Saved setup"), 1, 0)
-        favorites_layout.addWidget(self.favorite_weapon_combo, 1, 1)
-        favorite_actions = QHBoxLayout()
-        favorite_actions.setContentsMargins(0, 0, 0, 0)
-        favorite_actions.setSpacing(6)
-        favorite_actions.addWidget(load_weapon)
-        favorite_actions.addWidget(delete_weapon)
-        favorite_actions.addStretch(1)
-        favorites_layout.addLayout(favorite_actions, 1, 2, 1, 2)
-        favorites_layout.setColumnStretch(1, 1)
-        self.dashboard_favorites_note = QLabel(
-            "Characters are favorited beside the bridge selector. Pinned Results act as reusable comparison favorites."
+        ws_box = QGroupBox("3  Weapon Skill ranking and shared sets")
+        ws_layout = QVBoxLayout(ws_box)
+        ws_layout.setContentsMargins(8, 10, 8, 8)
+        ws_layout.setSpacing(5)
+        ws_note = QLabel(
+            "Optimize every WS in one weapon family against the Default enemy (Apex Toad). "
+            "Sets within two armor-slot changes are grouped; the largest compatible group inherits Ws_Default."
         )
-        self.dashboard_favorites_note.setWordWrap(True)
-        favorites_layout.addWidget(self.dashboard_favorites_note, 2, 0, 1, 4)
-        layout.addWidget(favorites_box)
+        ws_note.setWordWrap(True)
+        ws_layout.addWidget(ws_note)
+        ws_controls = QHBoxLayout()
+        ws_controls.addWidget(QLabel("Fixed weapon layer"))
+        self.dashboard_ws_overlay = QComboBox()
+        self.dashboard_ws_overlay.setMinimumWidth(240)
+        self.dashboard_ws_run_button = QPushButton("Rank WS and consolidate catalog")
+        self.dashboard_ws_run_button.setEnabled(False)
+        self.dashboard_ws_run_button.clicked.connect(self.run_dashboard_ws_ranking)
+        ws_controls.addWidget(self.dashboard_ws_overlay, 1)
+        ws_controls.addWidget(self.dashboard_ws_run_button)
+        ws_layout.addLayout(ws_controls)
+        self.dashboard_ws_status = QLabel("Create starting sets before running a WS ranking.")
+        self.dashboard_ws_status.setObjectName("dashboardStatus")
+        self.dashboard_ws_status.setWordWrap(True)
+        ws_layout.addWidget(self.dashboard_ws_status)
+        layout.addWidget(ws_box)
         layout.addStretch(1)
-        self._refresh_dashboard_scenario_note()
-        self._refresh_weapon_favorites()
+        self.refresh_gear_readiness()
         self._refresh_build_dashboard()
         return tab
 
-    def _refresh_dashboard_scenario_note(self, *_args):
-        if not hasattr(self, "dashboard_scenario_note"):
-            return
-        preset = self.dashboard_scenario_combo.currentData() or {}
-        self.dashboard_scenario_note.setText(
-            f"Enemy: {preset.get('enemy', 'current')} · TP: {int(preset.get('tp', 1000)):,} · "
-            f"PDT {preset.get('pdt', 0)}% · MDT {preset.get('mdt', 0)}% · DT {preset.get('dt', 0)}% · "
-            f"{preset.get('note', '')}"
-        )
-
-    def apply_dashboard_scenario(self):
-        preset = dict(self.dashboard_scenario_combo.currentData() or {})
-        enemy_name = str(preset.get("enemy") or "")
-        if enemy_name in enemies.preset_enemies:
-            self.enemy_combo.setCurrentText(enemy_name)
-            self._load_enemy(enemy_name)
-        self.tp_value.setValue(int(preset.get("tp", self.tp_value.value())))
-        self.pdt.setValue(int(preset.get("pdt", 0)))
-        self.mdt.setValue(int(preset.get("mdt", 0)))
-        self.dt.setValue(int(preset.get("dt", 0)))
-        self.statusBar().showMessage(
-            f"Applied scenario {self.dashboard_scenario_combo.currentText()} to the optimizer and simulation controls.", 5000
-        )
-        self.refresh_gear_readiness()
+    def _set_profile_builder_depth_from_dashboard(self, quality: str):
+        if hasattr(self, "profile_builder_depth"):
+            self.profile_builder_depth.setCurrentText(_normalized_search_quality(quality))
 
     def build_everything(self):
-        self._dashboard_build_active = True
-        self.dashboard_build_status.setText("Building the managed profile catalog…")
+        self.dashboard_build_status.setText("Creating owned-gear starting sets…")
         self.build_complete_lac_profile()
-        if getattr(self, "_profile_builder_result", None):
-            self._select_tab("Profile Builder")
-            self.optimize_all_profile_builder_sections()
         self._refresh_build_dashboard()
 
     def _refresh_build_dashboard(self):
         if not hasattr(self, "dashboard_build_status"):
             return
+        profile = self._profile_for_job() if hasattr(self, "profile_job_combo") else None
+        character = self.character_combo.currentText().strip() if hasattr(self, "character_combo") else ""
+        self.dashboard_character_value.setText(character or "No character selected")
+        if profile:
+            job = str(profile.get("job") or "").upper()
+            try:
+                profile_name = self.bridge_store.profile_path(job).name
+            except (OSError, ValueError, KeyError):
+                profile_name = f"{job}.lua" if job else "LAC profile"
+            self.dashboard_profile_value.setText(f"{job} · {profile_name}")
+        else:
+            self.dashboard_profile_value.setText("No LAC profile loaded")
+        if hasattr(self, "profile_source_accessible"):
+            source_names = []
+            if self.profile_source_accessible.isChecked():
+                source_names.append("accessible")
+            if self.profile_source_porter.isChecked():
+                source_names.append("Porter")
+            if self.profile_source_transferable.isChecked():
+                source_names.append("transferable")
+            self.dashboard_source_value.setText(" + ".join(source_names) if source_names else "No gear sources selected")
+
+        source_ready = bool(profile and self.bridge_store.data)
+        self._set_workflow_step(self.dashboard_source_step, "complete" if source_ready else "blocked")
+        self.dashboard_build_button.setEnabled(source_ready)
         build = getattr(self, "_profile_builder_result", None) or {}
+        self._refresh_dashboard_ws_options(build)
         if not build:
             self.dashboard_build_status.setText("No build has been started.")
+            self.dashboard_progress.setRange(0, 1)
+            self.dashboard_progress.setValue(0)
+            self.dashboard_progress.setFormat("Ready to generate" if source_ready else "Source profile required")
+            self._set_workflow_step(self.dashboard_base_step, "current" if source_ready else "pending")
+            self._set_workflow_step(self.dashboard_combat_step, "pending")
+            self.dashboard_optimize_button.setEnabled(False)
+            self.dashboard_review_button.setEnabled(False)
+            if hasattr(self, "profile_optimize_all_button"):
+                self.profile_optimize_all_button.setEnabled(False)
+                self.profile_publish_button.setEnabled(False)
             return
         details = build.get("recipe_details") or {}
         combat = sum(1 for value in details.values() if value.get("optimizer"))
         direct = max(0, len(details) - combat)
-        completed = int(getattr(self, "_profile_builder_optimizer_completed_count", 0) or 0)
+        if build.get("settings_stale"):
+            self.dashboard_progress.setRange(0, 1)
+            self.dashboard_progress.setValue(0)
+            self.dashboard_progress.setFormat("Settings changed · rebuild starting sets")
+            self._set_workflow_step(self.dashboard_base_step, "current")
+            self._set_workflow_step(self.dashboard_combat_step, "pending")
+            self.dashboard_optimize_button.setEnabled(False)
+            self.dashboard_review_button.setEnabled(True)
+            self.profile_optimize_all_button.setEnabled(False)
+            self.profile_publish_button.setEnabled(False)
+            self.dashboard_build_status.setText(
+                f"The preview contains {len(build.get('sets') or {})} sets from the previous settings. "
+                "Create the starting sets again before improving or publishing."
+            )
+            return
+        completed = sum(
+            1 for value in details.values()
+            if value.get("optimizer") and value.get("optimization_state") == "optimized"
+        )
         batch_state = str(getattr(self, "_profile_builder_optimizer_batch_state", "ready") or "ready")
+        running = batch_state == "running"
+        self.dashboard_progress.setRange(0, max(1, combat + 1))
+        self.dashboard_progress.setValue(min(combat + 1, completed + 1))
+        self.dashboard_progress.setFormat(
+            f"Starting sets ready · {completed}/{combat} combat sets improved"
+        )
+        self._set_workflow_step(self.dashboard_base_step, "complete")
+        self._set_workflow_step(
+            self.dashboard_combat_step,
+            "complete" if combat == 0 or completed >= combat else "current" if running else "optional",
+        )
+        self.dashboard_optimize_button.setEnabled(bool(combat and completed < combat and not running))
+        self.dashboard_review_button.setEnabled(True)
+        self.profile_optimize_all_button.setEnabled(bool(combat and completed < combat and not running))
+        self.profile_publish_button.setEnabled(not bool(build.get("published")))
         self.dashboard_build_status.setText(
-            f"Catalog: {len(build.get('sets') or {})} sets · {combat} combat sections · {direct} direct-stat sections\n"
-            f"Optimization: {completed}/{combat} combat sections · {batch_state}\n"
-            f"Warnings: {len(build.get('warnings') or [])} · seed {build.get('seed', '—')}"
+            f"{len(build.get('sets') or {})} starting sets: {combat} combat and {direct} utility/defense. "
+            f"{completed}/{combat} combat sets improved; {len(build.get('warnings') or [])} warning(s). "
+            f"{batch_state}."
         )
 
-    def refresh_gear_readiness(self):
+    def _refresh_dashboard_ws_options(self, build: dict):
+        if not hasattr(self, "dashboard_ws_overlay"):
+            return
+        current = self.dashboard_ws_overlay.currentData()
+        self.dashboard_ws_overlay.blockSignals(True)
+        self.dashboard_ws_overlay.clear()
+        for overlay in build.get("overlay_items") or ():
+            overlay_items = overlay.get("gearset") or {}
+            skills = [
+                str(overlay_items.get(slot, {}).get("Skill Type") or "None")
+                for slot in ("main", "ranged")
+            ]
+            skill = next((value for value in skills if value in WS_BY_SKILL), "")
+            if not skill:
+                continue
+            name = str(overlay.get("name") or "Weapon layer")
+            self.dashboard_ws_overlay.addItem(f"{name} · {skill}", name)
+            index = self.dashboard_ws_overlay.count() - 1
+            self.dashboard_ws_overlay.setItemData(index, skill, Qt.ItemDataRole.UserRole + 1)
+        if current:
+            index = self.dashboard_ws_overlay.findData(current)
+            if index >= 0:
+                self.dashboard_ws_overlay.setCurrentIndex(index)
+        self.dashboard_ws_overlay.blockSignals(False)
+        running = bool(self.optimizer_thread and self.optimizer_thread.isRunning())
+        ready = bool(build.get("sets") and self.dashboard_ws_overlay.count() and not build.get("settings_stale"))
+        self.dashboard_ws_run_button.setEnabled(ready and not running)
+        if not build.get("sets"):
+            self.dashboard_ws_status.setText("Create starting sets before running a WS ranking.")
+        elif not self.dashboard_ws_overlay.count():
+            self.dashboard_ws_status.setText("No modeled fixed weapon layer can run a WS ranking.")
+
+    def run_dashboard_ws_ranking(self):
+        """Launch the existing rank optimizer with Profile Builder defaults."""
+        if self.optimizer_thread and self.optimizer_thread.isRunning():
+            QMessageBox.information(self, "Weapon Skill ranking", "Wait for the current optimizer run to finish.")
+            return
+        build = getattr(self, "_profile_builder_result", None) or {}
+        overlay_name = str(self.dashboard_ws_overlay.currentData() or "")
+        overlay = next(
+            (value for value in build.get("overlay_items") or ()
+             if str(value.get("name") or "") == overlay_name),
+            None,
+        )
+        if not build or overlay is None:
+            QMessageBox.information(self, "Weapon Skill ranking", "Create starting sets and choose a weapon layer first.")
+            return
+        overlay_items = overlay.get("gearset") or {}
+        skill = str(self.dashboard_ws_overlay.currentData(Qt.ItemDataRole.UserRole + 1) or "")
+        if skill not in WS_BY_SKILL:
+            QMessageBox.warning(self, "Weapon Skill ranking", "The selected weapon layer has no modeled WS family.")
+            return
+        job_code = str(build.get("job") or "").casefold()
+        job_name = next((name for name, code in JOBS.items() if code == job_code), "")
+        if job_name:
+            self.main_job.setCurrentText(job_name)
+        preset = self._all_buff_presets().get(str(build.get("buff_preset") or ""))
+        if preset:
+            self._apply_buff_state(preset, preserve_job_abilities=True)
+        default_enemy = str(optimizer_scenario("Tp_Default", self.profile_builder_tp.value())["enemy"])
+        self.enemy_combo.setCurrentText(default_enemy)
+        self._load_enemy(default_enemy)
+        self.pdt.setValue(0)
+        self.mdt.setValue(0)
+        self.dt.setValue(0)
+        self.tp_value.setValue(self.profile_builder_tp.value())
+        base = dict((build.get("sets") or {}).get("Ws_Default") or {})
+        if not base:
+            first_default = next((
+                set_name for set_name, details in (build.get("recipe_details") or {}).items()
+                if details.get("section_type") == "Weapon skill"
+                and details.get("variant") == "Default"
+            ), "")
+            base = dict((build.get("sets") or {}).get(first_default) or {})
+        combined = {slot: base.get(slot, gear.Empty) for slot in SLOTS}
+        specified = set(overlay.get("specified_slots") or ())
+        combined.update({
+            slot: overlay_items[slot] for slot in WEAPON_SLOTS
+            if slot in specified and slot in overlay_items
+        })
+        self.quick_set.set_gearset(combined)
+        self.select_all_candidates()
+        self.optimize_action.setCurrentText("Rank weapon-type WS")
+        self._refresh_ranking_weapon_types()
+        self.ranking_weapon_type.setCurrentText(skill)
+        self.seed.setText(str(build.get("seed") or ""))
+        self._dashboard_ws_ranking_active = True
+        self.dashboard_ws_run_button.setEnabled(False)
+        self.dashboard_ws_status.setText(
+            f"Ranking {len(WS_BY_SKILL[skill])} {skill} weapon skills against {default_enemy}…"
+        )
+        self.run_optimizer()
+
+    def _apply_dashboard_ws_ranking(self, result: dict):
+        """Apply one ranked TP tier and collapse its largest similar group."""
+        build = getattr(self, "_profile_builder_result", None) or {}
+        rankings = result.get("rankings") or {}
+        if not build or not rankings:
+            self.dashboard_ws_status.setText("WS ranking completed without usable optimized sets.")
+            return
+        target_tp = int(self.profile_builder_tp.value())
+        tp_key = min(rankings, key=lambda value: abs(int(value) - target_tp))
+        ws_sets = {}
+        for entry in rankings.get(tp_key) or ():
+            player = entry.get("player") if isinstance(entry, dict) else None
+            gearset = getattr(player, "gearset", None)
+            ws_name = str(entry.get("ws_name") or "") if isinstance(entry, dict) else ""
+            if ws_name and isinstance(gearset, dict):
+                ws_sets[ws_name] = {
+                    slot: gearset.get(slot, gear.Empty) for slot in SET_SLOTS
+                }
+        groups = group_similar_ws_sets(ws_sets, max_slot_differences=2)
+        if not groups:
+            self.dashboard_ws_status.setText("WS ranking completed, but no legal gearsets were returned.")
+            return
+        details_by_name = build.get("recipe_details") or {}
+        profile_names = {str(payload.get("name") or "") for payload in self._profile_payloads()}
+        shared_supported = "Ws_Default" in profile_names
+        largest = groups[0]
+        if shared_supported:
+            build["sets"]["Ws_Default"] = dict(largest["gearset"])
+            details_by_name["Ws_Default"] = {
+                "section_type": "Weapon skill",
+                "family": "Shared WS",
+                "variant": "Default",
+                "optimization_state": "optimized",
+                "objective": ("Ranked WS damage",),
+                "ws_group": list(largest["members"]),
+                "simulation_summary": (
+                    f"Shared by {len(largest['members'])} similar WS at {int(tp_key):,} TP"
+                ),
+            }
+        shared_members = set(largest["members"]) if shared_supported else set()
+        for set_name, details in list(details_by_name.items()):
+            optimizer = details.get("optimizer") or {}
+            ws_name = str(optimizer.get("ws_name") or "")
+            if details.get("section_type") != "Weapon skill" or details.get("variant") != "Default":
+                continue
+            if ws_name not in ws_sets:
+                continue
+            if ws_name in shared_members:
+                build["sets"][set_name] = {slot: gear.Empty for slot in SET_SLOTS}
+                details["inherits_from"] = "Ws_Default"
+                details["simulation_summary"] = "Uses the shared Ws_Default ranking group"
+            else:
+                build["sets"][set_name] = dict(ws_sets[ws_name])
+                details.pop("inherits_from", None)
+            details["optimization_state"] = "optimized"
+        build["ws_groups"] = [
+            {"representative": group["representative"], "members": list(group["members"])}
+            for group in groups
+        ]
+        build["published"] = False
+        self._dashboard_ws_ranking_result = result
+        self._populate_profile_builder_results(build)
+        group_text = " · ".join(
+            f"{group['representative']}: {len(group['members'])} WS" for group in groups
+        )
+        prefix = (
+            f"Applied {len(ws_sets)} ranked WS at {int(tp_key):,} TP; "
+            f"{len(largest['members'])} inherit Ws_Default. "
+            if shared_supported else
+            f"Ranked {len(ws_sets)} WS at {int(tp_key):,} TP; this profile has no Ws_Default inheritance point. "
+        )
+        self.dashboard_ws_status.setText(prefix + group_text)
+        self._refresh_build_dashboard()
+
+    @staticmethod
+    def _set_workflow_step(label: QLabel, state: str):
+        label.setProperty("state", state)
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+    def refresh_gear_readiness(self, *_args):
         if not hasattr(self, "dashboard_readiness"):
             return
         profile = self._profile_for_job() if hasattr(self, "profile_job_combo") else None
         if profile is None or not self.bridge_store.data:
-            self.dashboard_readiness.setPlainText(
+            self.dashboard_readiness.setText(
                 "No character/job profile is loaded. Select an Ashita folder and character first."
             )
+            self._refresh_build_dashboard()
             return
         sources = self._profile_builder_sources()
         job = str(profile.get("job") or "").casefold()
@@ -3013,17 +4616,25 @@ class MainWindow(QMainWindow):
         stale_results = sum(
             1 for record in self.result_history.list(self._history_character_key()) if record.get("stale")
         )
-        lines = [
-            f"Sources: accessible={sources.accessible}, porter={sources.porter}, transferable={sources.transferable}",
-            f"Modeled candidate counts: " + ", ".join(f"{slot} {len(values) - 1}" for slot, values in candidates.items()),
-            f"Missing usable slots: {', '.join(missing_slots) if missing_slots else 'none'}",
-            f"Unresolved profile slots: {', '.join(unresolved) if unresolved else 'none'}",
-            f"Incomplete/model-warning items: {len(set(incomplete) | set(warning_items))}",
-            f"Pinned specialty items: {', '.join(pinned) if pinned else 'none'}",
-            f"Selected aspirational upgrades excluded from publishing: {len(aspirational)}",
-            f"Stale saved results: {stale_results}",
-        ]
-        self.dashboard_readiness.setPlainText("\n".join(lines))
+        modeled_slots = len(candidates) - len(missing_slots)
+        incomplete_count = len(set(incomplete) | set(warning_items))
+        issue_parts = []
+        if missing_slots:
+            issue_parts.append(f"No modeled owned item for {', '.join(missing_slots)}")
+        if unresolved:
+            issue_parts.append(f"{len(unresolved)} unresolved profile slot(s)")
+        if incomplete_count:
+            issue_parts.append(f"{incomplete_count} incomplete/model-warning item(s)")
+        if pinned:
+            issue_parts.append(f"{len(pinned)} specialty item(s) will remain pinned")
+        detail = " · ".join(issue_parts) if issue_parts else "No blocking inventory or profile issues found."
+        self.dashboard_readiness.setText(
+            f"<b>{modeled_slots}/{len(candidates)} armor slots have modeled owned candidates.</b><br>"
+            f"{escape(detail)}<br>"
+            f"Aspirational items excluded from publish: {len(aspirational)} · stale saved results: {stale_results}"
+        )
+        self.dashboard_readiness.setToolTip("\n".join(unresolved[:20]))
+        self._refresh_build_dashboard()
 
     def _favorite_weapon_character_key(self) -> str:
         return self._history_character_key()
@@ -3097,34 +4708,109 @@ class MainWindow(QMainWindow):
         self._refresh_weapon_favorites()
         self.statusBar().showMessage(f"Deleted favorite weapon setup: {name}", 4000)
 
+    def _favorite_weapon_box(self) -> QGroupBox:
+        """Keep reusable weapon setups beside the gear they affect."""
+        box = QGroupBox("Saved weapon setups")
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(6, 7, 6, 5)
+        box_layout.setSpacing(0)
+        self.favorite_weapon_name = QLineEdit()
+        self.favorite_weapon_name.setPlaceholderText("Setup name")
+        self.favorite_weapon_name.setMinimumWidth(150)
+        self.favorite_weapon_name.setMaximumWidth(250)
+        self.favorite_weapon_combo = QComboBox()
+        self.favorite_weapon_combo.setMinimumWidth(150)
+        self.favorite_weapon_combo.setMaximumWidth(250)
+        save_weapon = QPushButton("Save")
+        save_weapon.clicked.connect(self.save_favorite_weapon_setup)
+        load_weapon = QPushButton("Load")
+        load_weapon.clicked.connect(self.load_favorite_weapon_setup)
+        delete_weapon = QPushButton("Delete")
+        delete_weapon.clicked.connect(self.delete_favorite_weapon_setup)
+        save_group = QWidget()
+        save_row = QHBoxLayout(save_group)
+        save_row.setContentsMargins(0, 0, 0, 0)
+        save_row.setSpacing(4)
+        save_row.addWidget(self.favorite_weapon_name)
+        save_row.addWidget(save_weapon)
+        save_row.addStretch(1)
+        load_group = QWidget()
+        load_row = QHBoxLayout(load_group)
+        load_row.setContentsMargins(0, 0, 0, 0)
+        load_row.setSpacing(4)
+        load_row.addWidget(self.favorite_weapon_combo)
+        load_row.addWidget(load_weapon)
+        load_row.addWidget(delete_weapon)
+        load_row.addStretch(1)
+        box_layout.addWidget(
+            ResponsiveControlStrip(save_group, load_group, stack_width=690)
+        )
+        self._refresh_weapon_favorites()
+        return box
+
     def _gear_workspace_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         intro = QLabel(
             "Use one workspace for quick checks and complete TP → WS cycles. "
-            "Long simulations are saved in Results with their generated seed."
+            "Long simulations are saved in Results and can be repeated exactly."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
         controls = QGroupBox("Workspace controls")
-        controls_layout = QHBoxLayout(controls)
+        controls_box_layout = QVBoxLayout(controls)
+        controls_box_layout.setContentsMargins(6, 7, 6, 5)
+        controls_box_layout.setSpacing(0)
+        controls_layout = QHBoxLayout()
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(4)
         self.workspace_mode = QComboBox()
+        self.workspace_mode.setMaximumWidth(190)
         self.workspace_mode.addItems(["Single Set", "TP → WS Cycle"])
         self.workspace_mode.setToolTip(
             "Single Set evaluates the current Quick Look gear. TP → WS Cycle keeps separate TP and WS armor sets."
         )
         self.workspace_seed = QLineEdit()
         self.workspace_seed.setPlaceholderText("Generated when a long run starts")
-        self.workspace_seed.setMinimumWidth(190)
+        self.workspace_seed.setMinimumWidth(135)
+        self.workspace_seed.setMaximumWidth(220)
         self.workspace_seed.setToolTip(
             "A visible numeric seed makes two-hour DPS and WS distribution results exactly reproducible."
         )
         controls_layout.addWidget(QLabel("Mode"))
         controls_layout.addWidget(self.workspace_mode)
-        controls_layout.addWidget(QLabel("Run seed"))
-        controls_layout.addWidget(self.workspace_seed, 1)
+        self.workspace_seed.setVisible(False)
+        controls_layout.addStretch(1)
+        primary_group = QWidget()
+        primary_group.setLayout(controls_layout)
+        transfer_layout = QHBoxLayout()
+        self.workspace_generated_label = QLabel("Generated set: none")
+        self.workspace_generated_label.setObjectName("workspaceOrigin")
+        self.workspace_update_generated_button = QPushButton("Update set")
+        self.workspace_update_generated_button.setEnabled(False)
+        self.workspace_update_generated_button.setToolTip(
+            "Copy the current Single Set armor back to the generated catalog entry it came from."
+        )
+        self.workspace_update_generated_button.clicked.connect(self.update_generated_set_from_workspace)
+        self.workspace_export_lac_button = QPushButton("Export set to LAC profile…")
+        self.workspace_export_lac_button.setToolTip(
+            "Review and write one workspace set to the selected character's LuAshitacast profile."
+        )
+        self.workspace_export_lac_button.clicked.connect(self.export_workspace_set_to_lac)
+        self.workspace_export_lac_button.setText("Export to LAC...")
+        transfer_layout.addWidget(self.workspace_generated_label, 1)
+        transfer_layout.addWidget(self.workspace_update_generated_button)
+        transfer_layout.addWidget(self.workspace_export_lac_button)
+        transfer_layout.setContentsMargins(0, 0, 0, 0)
+        transfer_layout.setSpacing(4)
+        secondary_group = QWidget()
+        secondary_group.setLayout(transfer_layout)
+        controls_box_layout.addWidget(
+            ResponsiveControlStrip(primary_group, secondary_group, stack_width=880)
+        )
         layout.addWidget(controls)
+        layout.addWidget(self._favorite_weapon_box())
 
         self.workspace_stack = QStackedWidget()
         self.workspace_stack.addWidget(self._quick_tab())
@@ -3133,20 +4819,225 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.workspace_stack, 1)
         return tab
 
+    @staticmethod
+    def _style_quick_chart_axis(axis):
+        axis.set_facecolor("#17142e")
+        axis.tick_params(colors="#c7c2d2", labelsize=8)
+        axis.xaxis.label.set_color("#d0ccd6")
+        axis.yaxis.label.set_color("#d0ccd6")
+        axis.title.set_color("#fffaff")
+        for spine in axis.spines.values():
+            spine.set_color("#57536f")
+
+    def _render_dps_comparison_graph(self, figure, canvas, summary: dict,
+                                     current_name: str = "Current enemy",
+                                     *, title: str = "Two-hour DPS comparison") -> bool:
+        """Plot the active enemy and optional Profile Builder reference tiers."""
+        if figure is None or canvas is None or not isinstance(summary, dict):
+            return False
+        primary = _dps_series_chart_data(summary)
+        if primary is None:
+            return False
+        figure.clear()
+        figure.set_facecolor("#17142e")
+        axis = figure.add_subplot(111)
+        self._style_quick_chart_axis(axis)
+        colors = ("#fff0a8", "#72c7e8", "#d99bea", "#9de2a8")
+        series = [(str(current_name or "Current enemy"), primary)]
+        for name, reference in (summary.get("reference_summaries") or {}).items():
+            chart = _dps_series_chart_data(reference)
+            if chart is not None:
+                series.append((str(name), chart))
+        for index, (name, chart) in enumerate(series):
+            times, values = chart["total"]
+            axis.plot(
+                times, values, color=colors[index % len(colors)],
+                linewidth=2.4 if index == 0 else 1.5,
+                label=f"{name} · {float(values[-1]):,.1f} DPS",
+            )
+        axis.set_xlim(0.0, 7200.0)
+        axis.set_title(title, loc="left", fontsize=10, fontweight="bold", color="#fffaff")
+        axis.set_xlabel("Elapsed time (seconds)", fontsize=8, color="#d0ccd6")
+        axis.set_ylabel("DPS", fontsize=8, color="#d0ccd6")
+        axis.grid(True, color="#302d4a", linewidth=0.8, alpha=0.8)
+        handles, labels = axis.get_legend_handles_labels()
+        if handles:
+            figure.legend(
+                handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.01),
+                ncol=1, fontsize=6.5, facecolor="#17142e", edgecolor="#57536f",
+                labelcolor="#fffaff", framealpha=0.96,
+            )
+        figure.subplots_adjust(left=0.13, right=0.97, bottom=0.31, top=0.84)
+        canvas.draw_idle()
+        return True
+
+    def _render_quick_result_graph(self, action: str, output, dps_summary: dict | None = None):
+        figure = getattr(self, "quick_result_figure", None)
+        canvas = getattr(self, "quick_result_canvas", None)
+        if figure is None or canvas is None:
+            return
+
+        figure.clear()
+        figure.set_facecolor("#17142e")
+        if action == "ws":
+            axis = figure.add_subplot(111)
+            axis.set_facecolor("#17142e")
+            axis.text(
+                0.5, 0.5, "Sampling 20,000 weapon skills...",
+                color="#fff0a8", ha="center", va="center", fontsize=10,
+                fontweight="bold", transform=axis.transAxes,
+            )
+            axis.set_axis_off()
+            canvas.draw_idle()
+            return
+        chart = _quick_result_chart_data(
+            action, output, tp_target=self.tp_value.value()
+        )
+        if chart is None:
+            axis = figure.add_subplot(111)
+            axis.set_facecolor("#17142e")
+            axis.text(
+                0.5, 0.5, "The evaluation graph will appear here.",
+                color="#a9a4b5", ha="center", va="center", fontsize=9,
+                transform=axis.transAxes,
+            )
+            axis.set_axis_off()
+            figure.subplots_adjust(left=0.04, right=0.96, bottom=0.08, top=0.92)
+            canvas.draw_idle()
+            return
+
+        if chart["kind"] == "tp_pace":
+            if dps_summary is None:
+                axis = figure.add_subplot(111)
+                self._style_quick_chart_axis(axis)
+                axis.text(
+                    0.5, 0.5, "Run a 2-hour DPS comparison to populate this graph.",
+                    color="#fff0a8", ha="center", va="center", fontsize=9,
+                    fontweight="bold", transform=axis.transAxes,
+                )
+                axis.set_axis_off()
+                canvas.draw_idle()
+                return
+            self._render_dps_comparison_graph(
+                figure, canvas, dps_summary, self.enemy_combo.currentText(),
+                title="Two-hour DPS comparison",
+            )
+            return
+        else:
+            axes = figure.subplots(1, 2)
+            labels = (
+                ("Average damage", chart["damage"], "#e6c983", "{:,.0f}"),
+                ("TP return", chart["tp_return"], "#72c7e8", "{:,.1f}"),
+            )
+            for axis, (label, value, color, number_format) in zip(axes, labels):
+                self._style_quick_chart_axis(axis)
+                axis.barh([0], [value], height=0.42, color=color, alpha=0.92)
+                axis.set_xlim(0.0, max(1.0, value * 1.18))
+                axis.set_ylim(-0.7, 0.7)
+                axis.set_yticks([])
+                axis.set_title(
+                    label, loc="left", fontsize=9, fontweight="bold", color="#fffaff"
+                )
+                axis.grid(True, axis="x", color="#302d4a", linewidth=0.8, alpha=0.8)
+                axis.text(
+                    value, 0, number_format.format(value), color="#fffaff",
+                    ha="right" if value else "left", va="center", fontsize=10,
+                    fontweight="bold",
+                )
+                axis.spines["left"].set_visible(False)
+                axis.spines["right"].set_visible(False)
+                axis.spines["top"].set_visible(False)
+            title = "Weapon skill result" if chart["action"] == "ws" else "Spell result"
+            figure.suptitle(title, color="#fffaff", fontsize=10, fontweight="bold", x=0.08, ha="left")
+            figure.subplots_adjust(left=0.08, right=0.96, bottom=0.22, top=0.72, wspace=0.28)
+        canvas.draw_idle()
+
+    def _render_ws_distribution_graph(self, figure, canvas, distribution: dict,
+                                      *, ws_name: str = "Weapon skill") -> bool:
+        chart = _ws_distribution_chart_data(distribution)
+        if figure is None or canvas is None or chart is None:
+            return False
+        figure.clear()
+        figure.set_facecolor("#17142e")
+        axis = figure.add_subplot(111)
+        self._style_quick_chart_axis(axis)
+        edges = chart["edges"]
+        counts = chart["counts"]
+        widths = np.diff(edges)
+        density = counts / max(1.0, float(np.sum(counts)))
+        axis.bar(
+            edges[:-1], density, width=widths, align="edge",
+            color="#72c7e8", edgecolor="#9de2fa", linewidth=0.35, alpha=0.82,
+        )
+        axis.axvline(
+            chart["mean"], color="#fff0a8", linewidth=2,
+            label=f"Mean {chart['mean']:,.0f}",
+        )
+        reference_colors = ("#72c7e8", "#d99bea", "#9de2a8")
+        for index, (name, reference) in enumerate(
+            (distribution.get("reference_distributions") or {}).items()
+        ):
+            reference_chart = _ws_distribution_chart_data(reference)
+            if reference_chart is None:
+                continue
+            axis.axvline(
+                reference_chart["mean"], color=reference_colors[index % len(reference_colors)],
+                linewidth=1.4, linestyle="--",
+                label=f"{name} mean {reference_chart['mean']:,.0f}",
+            )
+        axis.axvspan(chart["p05"], chart["p95"], color="#e6c983", alpha=0.13,
+                    label=f"90% range {chart['p05']:,.0f}-{chart['p95']:,.0f}")
+        axis.set_title(f"{ws_name} - {chart['samples']:,}-sample damage distribution",
+                       loc="left", fontsize=9, fontweight="bold", color="#fffaff", pad=9)
+        axis.set_xlabel("Weapon-skill damage", fontsize=8, color="#d0ccd6")
+        axis.set_ylabel("Sample share", fontsize=8, color="#d0ccd6")
+        axis.grid(True, axis="y", color="#302d4a", linewidth=0.8, alpha=0.8)
+        handles, labels = axis.get_legend_handles_labels()
+        if handles:
+            figure.legend(
+                handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.01),
+                ncol=1, fontsize=6.2, facecolor="#17142e", edgecolor="#57536f",
+                labelcolor="#fffaff", framealpha=0.96,
+            )
+        figure.subplots_adjust(left=0.13, right=0.97, bottom=0.35, top=0.84)
+        canvas.draw_idle()
+        return True
+
+    def _render_cycle_dps_graph(self, summary: dict) -> bool:
+        figure = getattr(self, "cycle_result_figure", None)
+        canvas = getattr(self, "cycle_result_canvas", None)
+        chart = _dps_series_chart_data(summary)
+        if figure is None or canvas is None or chart is None:
+            return False
+        return self._render_dps_comparison_graph(
+            figure, canvas, summary, self.enemy_combo.currentText(),
+            title="TP → WS two-hour DPS comparison",
+        )
+
     def _quick_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
-        # The compact icon grid has a fixed natural height. Keep actions and
-        # results directly beneath it instead of growing an empty editor.
-        layout.addWidget(self.quick_set)
-        buttons = QGridLayout()
-        buttons.setHorizontalSpacing(6)
-        buttons.setVerticalSpacing(6)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        quick_splitter = QSplitter(Qt.Orientation.Horizontal)
+        quick_splitter.setObjectName("quickSplitter")
+        quick_splitter.setOpaqueResize(False)
+        left = QWidget()
+        left.setMinimumWidth(310)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
+        left_layout.addWidget(self.quick_set)
+
+        actions_box = QGroupBox("Actions")
+        actions_layout = QGridLayout(actions_box)
+        actions_layout.setContentsMargins(6, 9, 6, 6)
+        actions_layout.setHorizontalSpacing(4)
+        actions_layout.setVerticalSpacing(4)
         definitions = (
             ("Evaluate WS", lambda: self.evaluate("ws")),
-            ("Evaluate TP round / time to WS", lambda: self.evaluate("attack")),
+            ("Evaluate TP round", lambda: self.evaluate("attack")),
             ("Evaluate spell", lambda: self.evaluate("spell")),
             ("Copy to TP set", lambda: self.tp_set.set_gearset(self.quick_set.items)),
             ("Copy to WS set", lambda: self.ws_set.set_gearset(self.quick_set.items)),
@@ -3154,97 +5045,296 @@ class MainWindow(QMainWindow):
         for index, (label, callback) in enumerate(definitions):
             button = QPushButton(label)
             button.clicked.connect(callback)
-            buttons.addWidget(button, index // 3, index % 3)
+            actions_layout.addWidget(button, index // 2, index % 2)
         save_quick = QPushButton("Save Quick Look result")
         save_quick.setToolTip("Quick evaluations stay out of history unless you explicitly save them.")
         save_quick.clicked.connect(self.save_quick_result)
-        buttons.addWidget(save_quick, 1, 2)
-        for column in range(3):
-            buttons.setColumnStretch(column, 1)
-        layout.addLayout(buttons)
+        actions_layout.addWidget(save_quick, 2, 1)
+        actions_layout.setColumnStretch(0, 1)
+        actions_layout.setColumnStretch(1, 1)
+        left_layout.addWidget(actions_box)
+        result_panel = QFrame()
+        result_panel.setObjectName("quickResultPanel")
+        result_layout = QVBoxLayout(result_panel)
+        result_layout.setContentsMargins(9, 7, 7, 7)
+        result_layout.setSpacing(3)
         self.result_label = QLabel("Select equipment, then evaluate an action.")
-        self.result_label.setObjectName("sectionTitle")
-        layout.addWidget(self.result_label)
-        totals = QGroupBox("Quick Look totals")
+        self.result_label.setObjectName("quickResult")
+        self.result_label.setWordWrap(True)
+        self.result_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.result_label.setMinimumHeight(38)
+        self.result_label.setMaximumHeight(64)
+        result_layout.addWidget(self.result_label)
+        self.quick_reference_checkbox = QCheckBox("Reference enemies")
+        self.quick_reference_checkbox.setObjectName("referenceEnemyToggle")
+        self.quick_reference_checkbox.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
+        )
+        self.quick_reference_checkbox.setChecked(True)
+        self.quick_reference_checkbox.setToolTip(
+            "Include Apex Toad, Apex Knight Lugcrawler, and Apex Archaic Cogs in DPS and WS graphs."
+        )
+        self.quick_reference_checkbox.toggled.connect(self._quick_reference_toggle)
+        result_layout.addWidget(self.quick_reference_checkbox)
+        self.quick_result_figure = None
+        self.quick_result_canvas = None
+        if FigureCanvas is not None and Figure is not None:
+            self.quick_result_figure = Figure(figsize=(4.4, 2.35), dpi=100)
+            self.quick_result_canvas = FigureCanvas(self.quick_result_figure)
+            self.quick_result_canvas.setObjectName("quickResultGraph")
+            self.quick_result_canvas.setAccessibleName("Gear evaluation result graph")
+            self.quick_result_canvas.setMinimumHeight(190)
+            self.quick_result_canvas.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            )
+            result_layout.addWidget(self.quick_result_canvas, 1)
+            self._render_quick_result_graph("", None)
+        else:
+            graph_unavailable = QLabel("Graph unavailable: Matplotlib Qt support is not installed.")
+            graph_unavailable.setObjectName("quickResultGraphFallback")
+            graph_unavailable.setWordWrap(True)
+            graph_unavailable.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            result_layout.addWidget(graph_unavailable, 1)
+        left_layout.addWidget(result_panel, 1)
+        left_scroll = QScrollArea()
+        left_scroll.setObjectName("quickEquipmentScroll")
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        left_scroll.setMinimumWidth(330)
+        left_scroll.setMaximumWidth(350)
+        left_scroll.setWidget(left)
+        quick_splitter.addWidget(left_scroll)
+
+        totals = QGroupBox("Live totals")
+        totals.setMinimumWidth(390)
         totals_layout = QVBoxLayout(totals)
-        totals_header = QHBoxLayout()
-        totals_header.addWidget(QLabel(
+        totals_layout.setContentsMargins(7, 9, 7, 7)
+        totals_layout.setSpacing(4)
+        totals_legend = QLabel(
             "Uses selected gear and Buffs settings. "
-            "<span style='color:#9a6700'><b>Amber</b></span> = under cap, "
-            "<span style='color:#137333'><b>green</b></span> = at cap, "
-            "<span style='color:#b42318'><b>red</b></span> = over cap."
-        ))
-        totals_header.addStretch(1)
+            "<span style='color:#ffe2a8'><b>Amber</b></span> under · "
+            "<span style='color:#b9f6cb'><b>Green</b></span> at · "
+            "<span style='color:#ffc4c1'><b>Rose</b></span> over"
+        )
+        totals_legend.setWordWrap(True)
+        totals_legend.setMinimumWidth(0)
         refresh_totals = QPushButton("Refresh totals")
         refresh_totals.clicked.connect(self.refresh_quick_stats)
-        totals_header.addWidget(refresh_totals)
-        totals_layout.addLayout(totals_header)
+        totals_header = ResponsiveTotalsHeader(totals_legend, refresh_totals)
+        totals_layout.addWidget(totals_header)
         self.quick_stats_scroll = QScrollArea()
         self.quick_stats_scroll.setWidgetResizable(True)
         self.quick_stats_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.quick_stats_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.quick_stats_widget = QWidget()
+        self.quick_stats_widget.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         self.quick_stats_layout = QGridLayout(self.quick_stats_widget)
         self.quick_stats_layout.setContentsMargins(0, 0, 0, 0)
         self.quick_stats_scroll.setWidget(self.quick_stats_widget)
         self.quick_stats_scroll.setMinimumHeight(220)
-        self.quick_stats_scroll.setMaximumHeight(390)
         totals_layout.addWidget(self.quick_stats_scroll)
-        layout.addWidget(totals, 1)
+        quick_splitter.addWidget(totals)
+        quick_splitter.setStretchFactor(0, 0)
+        quick_splitter.setStretchFactor(1, 1)
+        quick_splitter.setSizes([330, 570])
+        layout.addWidget(quick_splitter, 1)
         return tab
 
     def _cycle_workspace_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        heading = QLabel("TP → WS cycle workspace")
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
         note = QLabel(
-            "Weapons stay in the fixed row of each set. Armor can differ between TP and WS; "
-            "copy, swap, or load optimizer results here before running a cycle."
+            "Build the repeating cycle from two explicit sets. TP controls the melee phase; "
+            "WS controls the selected weapon skill and its damage phase."
         )
+        note.setObjectName("cycleIntro")
         note.setWordWrap(True)
         layout.addWidget(note)
         sets = QSplitter(Qt.Orientation.Horizontal)
-        sets.addWidget(self.tp_set)
-        sets.addWidget(self.ws_set)
-        sets.setStretchFactor(0, 1)
-        sets.setStretchFactor(1, 1)
-        sets.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        sets.setMinimumHeight(326)
-        sets.setMaximumHeight(350)
-        layout.addWidget(sets)
-        controls = QGridLayout()
+        sets.setObjectName("cycleSetSplitter")
+        sets.setChildrenCollapsible(False)
+        set_column = QWidget()
+        set_column.setObjectName("cycleSetColumn")
+        set_column.setMinimumWidth(205)
+        set_column.setMaximumWidth(260)
+        set_column_layout = QVBoxLayout(set_column)
+        set_column_layout.setContentsMargins(0, 0, 0, 0)
+        set_column_layout.setSpacing(6)
+        tp_panel = QGroupBox("TP phase · melee set")
+        tp_panel.setObjectName("cycleSetPanel")
+        tp_layout = QVBoxLayout(tp_panel)
+        tp_layout.setContentsMargins(5, 7, 5, 5)
+        tp_layout.addWidget(self.tp_set, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.cycle_tp_summary = QLabel()
+        self.cycle_tp_summary.setObjectName("cycleSetSummary")
+        self.cycle_tp_summary.setWordWrap(True)
+        tp_layout.addWidget(self.cycle_tp_summary)
+        ws_panel = QGroupBox("WS phase · weapon-skill set")
+        ws_panel.setObjectName("cycleSetPanel")
+        ws_layout = QVBoxLayout(ws_panel)
+        ws_layout.setContentsMargins(5, 7, 5, 5)
+        ws_layout.addWidget(self.ws_set, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.cycle_ws_summary = QLabel()
+        self.cycle_ws_summary.setObjectName("cycleSetSummary")
+        self.cycle_ws_summary.setWordWrap(True)
+        ws_layout.addWidget(self.cycle_ws_summary)
+        tp_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        ws_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        set_column_layout.addWidget(tp_panel)
+        set_column_layout.addWidget(ws_panel)
+        set_column_layout.addStretch(1)
+        sets.addWidget(set_column)
+        sets.setStretchFactor(0, 0)
+        right_column = QWidget()
+        right_column.setObjectName("cycleResultColumn")
+        right_column.setMinimumWidth(320)
+        right_layout = QVBoxLayout(right_column)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+        actions_box = QGroupBox("Cycle actions")
+        actions_box.setObjectName("cycleActionPanel")
+        controls = QGridLayout(actions_box)
+        controls.setContentsMargins(7, 8, 7, 7)
         controls.setHorizontalSpacing(6)
-        controls.setVerticalSpacing(6)
+        controls.setVerticalSpacing(5)
         self.plot_dps_checkbox = QCheckBox("Keep legacy plot option")
         self.plot_dps_checkbox.setToolTip(
             "The normal Results view embeds plots. This option is retained for compatibility with saved settings."
         )
         self.plot_dps_checkbox.setVisible(False)
         self.simulate_button = QPushButton("Run two-hour DPS simulation")
+        self.simulate_button.setText("Run 2-hour DPS")
+        self.simulate_button.setObjectName("cycleRunAction")
+        self.simulate_button.setMinimumHeight(30)
         self.simulate_button.clicked.connect(self.run_simulation)
         self.cancel_simulation_button = QPushButton("Stop")
+        self.cancel_simulation_button.setObjectName("cycleStopAction")
+        self.cancel_simulation_button.setMinimumHeight(30)
         self.cancel_simulation_button.setEnabled(False)
         self.cancel_simulation_button.clicked.connect(self.stop_simulation)
-        distribution = QPushButton("Generate WS distribution")
+        distribution = QPushButton("Generate WS damage graph")
+        distribution.setText("WS damage graph")
+        distribution.setObjectName("cycleSecondaryAction")
+        distribution.setMinimumHeight(30)
         distribution.setToolTip("Sample the default 20,000 weapon skills and save the compact histogram to Results.")
         distribution.clicked.connect(self.plot_ws_distribution)
         copy_tp_ws = QPushButton("Copy TP → WS")
         copy_tp_ws.clicked.connect(lambda: self.ws_set.set_gearset(self.tp_set.items))
         swap = QPushButton("Swap TP / WS")
         swap.clicked.connect(self.swap_tp_ws_sets)
-        controls.addWidget(self.simulate_button, 0, 0)
-        controls.addWidget(self.cancel_simulation_button, 0, 1)
-        controls.addWidget(distribution, 0, 2)
-        controls.addWidget(copy_tp_ws, 1, 0)
-        controls.addWidget(swap, 1, 1)
+        copy_tp_ws.setObjectName("cycleSecondaryAction")
+        swap.setObjectName("cycleSecondaryAction")
+        controls.addWidget(self.simulate_button, 0, 0, 1, 2)
+        controls.addWidget(self.cancel_simulation_button, 0, 2)
+        controls.addWidget(distribution, 1, 0)
+        controls.addWidget(copy_tp_ws, 1, 1)
+        controls.addWidget(swap, 1, 2)
         for column in range(3):
             controls.setColumnStretch(column, 1)
-        layout.addLayout(controls)
-        self.plot_status = QLabel("Long runs show their seed and open in Results when complete.")
+        right_layout.addWidget(actions_box)
+        status_box = QGroupBox("Cycle status")
+        status_box.setObjectName("cycleStatusPanel")
+        status_layout = QVBoxLayout(status_box)
+        status_layout.setContentsMargins(7, 8, 7, 7)
+        self.cycle_reference_checkbox = QCheckBox("Reference enemies")
+        self.cycle_reference_checkbox.setObjectName("referenceEnemyToggle")
+        self.cycle_reference_checkbox.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
+        )
+        self.cycle_reference_checkbox.setChecked(True)
+        self.cycle_reference_checkbox.setToolTip(
+            "Include the three Profile Builder reference enemies in the 2-hour and WS graphs."
+        )
+        status_layout.addWidget(self.cycle_reference_checkbox)
+        self.plot_status = QLabel("Ready · choose a WS and run a reproducible cycle.")
+        self.plot_status.setObjectName("cycleStatus")
         self.plot_status.setWordWrap(True)
-        layout.addWidget(self.plot_status)
-        layout.addStretch(1)
-        return tab
+        status_layout.addWidget(self.plot_status)
+        right_layout.addWidget(status_box)
+        self.cycle_result_figure = None
+        self.cycle_result_canvas = None
+        graph_panel = QFrame()
+        graph_panel.setObjectName("cycleResultPanel")
+        graph_panel.setMinimumWidth(0)
+        graph_layout = QVBoxLayout(graph_panel)
+        graph_layout.setContentsMargins(7, 7, 7, 7)
+        graph_title = QLabel("Simulation graph")
+        graph_title.setObjectName("sectionTitle")
+        graph_layout.addWidget(graph_title)
+        if FigureCanvas is not None and Figure is not None:
+            self.cycle_result_figure = Figure(figsize=(8.0, 4.5), dpi=100)
+            self.cycle_result_canvas = FigureCanvas(self.cycle_result_figure)
+            self.cycle_result_canvas.setObjectName("cycleResultGraph")
+            self.cycle_result_canvas.setAccessibleName("Two-hour DPS or weapon-skill distribution graph")
+            self.cycle_result_canvas.setMinimumHeight(300)
+            self.cycle_result_canvas.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            )
+            graph_layout.addWidget(self.cycle_result_canvas, 1)
+            self._render_cycle_graph_placeholder()
+        else:
+            graph_unavailable = QLabel("Graph unavailable: Matplotlib Qt support is not installed.")
+            graph_unavailable.setObjectName("quickResultGraphFallback")
+            graph_unavailable.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            graph_layout.addWidget(graph_unavailable, 1)
+        right_layout.addWidget(graph_panel, 1)
+        sets.addWidget(right_column)
+        sets.setStretchFactor(1, 1)
+        sets.setSizes([225, 720])
+        layout.addWidget(sets, 1)
+        self.tp_set.changed.connect(self._refresh_cycle_set_summaries)
+        self.ws_set.changed.connect(self._refresh_cycle_set_summaries)
+        self.ws_combo.currentTextChanged.connect(self._refresh_cycle_set_summaries)
+        self.tp_value.valueChanged.connect(self._refresh_cycle_set_summaries)
+        self._refresh_cycle_set_summaries()
+        scroll = QScrollArea()
+        scroll.setObjectName("cycleWorkspaceScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(tab)
+        return scroll
+
+    def _render_cycle_graph_placeholder(self, message: str = "Run the two-hour cycle or sample 20,000 weapon skills."):
+        figure = getattr(self, "cycle_result_figure", None)
+        canvas = getattr(self, "cycle_result_canvas", None)
+        if figure is None or canvas is None:
+            return
+        figure.clear()
+        figure.set_facecolor("#17142e")
+        axis = figure.add_subplot(111)
+        axis.set_facecolor("#17142e")
+        axis.text(0.5, 0.5, message, color="#a9a4b5", ha="center", va="center",
+                  fontsize=9, transform=axis.transAxes)
+        axis.set_axis_off()
+        canvas.draw_idle()
+
+    def _refresh_cycle_set_summaries(self, *_args):
+        """Keep the TP/WS cards readable without opening each gear picker."""
+        if not hasattr(self, "cycle_tp_summary"):
+            return
+        tp_main = item_name(self.tp_set.items.get("main", gear.Empty))
+        tp_sub = item_name(self.tp_set.items.get("sub", gear.Empty))
+        ws_main = item_name(self.ws_set.items.get("main", gear.Empty))
+        ws_sub = item_name(self.ws_set.items.get("sub", gear.Empty))
+        self.cycle_tp_summary.setText(
+            f"Main: {tp_main}  ·  Sub: {tp_sub}  ·  Threshold: {self.tp_value.value():,} TP"
+        )
+        ws_name = self.ws_combo.currentText().strip() or "None"
+        self.cycle_ws_summary.setText(
+            f"Main: {ws_main}  ·  Sub: {ws_sub}  ·  WS: {ws_name}"
+        )
 
     def _magic_damage_tab(self) -> QWidget:
         """Provide a formula-backed spell damage workspace separate from WS Quick Look."""
@@ -3452,6 +5542,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(note)
         self.quick_ability_status = QLabel()
         self.quick_ability_status.setObjectName("sectionTitle")
+        self.quick_ability_status.setWordWrap(True)
         outer.addWidget(self.quick_ability_status)
 
         content = QWidget()
@@ -3477,7 +5568,8 @@ class MainWindow(QMainWindow):
         custom_layout = QVBoxLayout(custom_box)
         self.abilities_json = QPlainTextEdit("{}")
         self.abilities_json.setPlaceholderText('{"Ability name": true}')
-        self.abilities_json.setMaximumHeight(70)
+        self.abilities_json.setMaximumWidth(620)
+        self.abilities_json.setMaximumHeight(60)
         self.abilities_json.setToolTip(
             "Optional JSON values for abilities not listed above. Standard "
             "checkboxes update this object automatically."
@@ -3699,47 +5791,66 @@ class MainWindow(QMainWindow):
             return "at", f"At {cap * 100:.1f}% cap"
         return "under", f"Under {cap * 100:.1f}% cap"
 
-    def _quick_card(self, label: str, value: str, subtitle: str = "", state: str = "neutral") -> QFrame:
-        colors = {
-            "neutral": ("#263238", "#ffffff"),
-            "under": ("#9a6700", "#fff8e1"),
-            "at": ("#137333", "#e8f5e9"),
-            "over": ("#b42318", "#ffebe9"),
+    def _quick_stat_row(self, label: str, value: str, accent: str = "",
+                        state: str = "neutral") -> QFrame:
+        accent_colors = {
+            "neutral": "#8cf3b2",
+            "under": "#ffe2a8",
+            "at": "#36bde8",
+            "over": "#ffc4c1",
         }
-        foreground, background = colors.get(state, colors["neutral"])
-        card = QFrame()
-        card.setStyleSheet(
-            f"QFrame {{ border: 1px solid #c7d0d9; border-radius: 5px; background: {background}; }}"
-        )
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(9, 6, 9, 6)
+        row = QFrame()
+        row.setObjectName("quickStatRow")
+        row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(5, 1, 5, 1)
+        row_layout.setSpacing(4)
         name = QLabel(label)
-        name.setStyleSheet("font-weight: 600; color: #344054; border: none; background: transparent;")
+        name.setObjectName("quickStatName")
         amount = QLabel(value)
-        amount.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {foreground}; border: none; background: transparent;")
-        amount.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        card_layout.addWidget(name)
-        card_layout.addWidget(amount)
-        if subtitle:
-            detail = QLabel(subtitle)
-            detail.setStyleSheet(f"font-size: 10px; color: {foreground}; border: none; background: transparent;")
-            card_layout.addWidget(detail)
-        return card
+        amount.setObjectName("quickStatValue")
+        amount.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        amount.setMinimumWidth(58)
+        row_layout.addWidget(name, 1)
+        # Attribute rows are a compact base + equipment pair.  Render those
+        # as one right-aligned numeric group so every total and delta shares a
+        # stable right edge instead of leaving a floating accent column.
+        if re.fullmatch(r"[+-][\d,.]+(?:%|s)?", accent or ""):
+            amount.setText(
+                f"{escape(str(value))} "
+                f"<span style='color:{accent_colors.get(state, accent_colors['neutral'])}'>"
+                f"{escape(accent)}</span>"
+            )
+            amount.setMinimumWidth(136)
+            row_layout.addWidget(amount)
+        else:
+            bonus = QLabel(accent)
+            bonus.setObjectName("quickStatAccent")
+            bonus.setStyleSheet(f"color: {accent_colors.get(state, accent_colors['neutral'])};")
+            bonus.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            bonus.setMinimumWidth(74)
+            row_layout.addWidget(amount)
+            row_layout.addWidget(bonus)
+        return row
 
-    def _quick_section(self, title: str, cards: list[tuple[str, str, str, str]]) -> QGroupBox:
-        section = QGroupBox(title)
-        grid = QGridLayout(section)
-        grid.setContentsMargins(8, 12, 8, 8)
-        grid.setHorizontalSpacing(7)
-        grid.setVerticalSpacing(7)
-        for index, (label, value, subtitle, state) in enumerate(cards):
-            grid.addWidget(self._quick_card(label, value, subtitle, state), index // 4, index % 4)
-        for column in range(4):
-            grid.setColumnStretch(column, 1)
-        return section
+    def _quick_section(self, title: str, rows: list[tuple[str, str, str, str]]) -> QGroupBox:
+        return ResponsiveStatSection(
+            title,
+            [self._quick_stat_row(label, value, accent, state)
+             for label, value, accent, state in rows],
+        )
 
     def _render_quick_stats(self, player, enemy):
         stats = player.stats
+        base_player = create_player.create_player(
+            player.main_job,
+            player.sub_job,
+            player.master_level,
+            gearset={slot: dict(gear.Empty) for slot in SLOTS},
+            buffs=player.buffs,
+            abilities=player.abilities,
+        )
+        base_stats = base_player.stats
         while self.quick_stats_layout.count():
             item = self.quick_stats_layout.takeAt(0)
             if item.widget():
@@ -3750,6 +5861,16 @@ class MainWindow(QMainWindow):
 
         def pct(name: str) -> str:
             return self._quick_stat_value(stats.get(name, 0) / 100, percent=True)
+
+        def base_bonus(name: str):
+            base = float(base_stats.get(name, 0))
+            total = float(stats.get(name, 0))
+            bonus = total - base
+            if abs(bonus) < 0.0005:
+                colored = ""
+            else:
+                colored = f"{'+' if bonus > 0 else '-'}{self._quick_stat_value(abs(bonus))}"
+            return name, self._quick_stat_value(base), colored, "neutral" if bonus >= 0 else "over"
 
         def cap_card(label: str, raw: float, cap: float, *, negative: bool = False, percent: bool = True):
             state, detail = self._cap_state(raw, cap, negative=negative)
@@ -3793,7 +5914,9 @@ class MainWindow(QMainWindow):
                 ("Total haste", self._quick_stat_value(min(source_haste, 0.25 + 0.25 + 448 / 1024), percent=True), "Combined source caps", "neutral"),
                 cap_card("Delay reduction", stats.get("Delay Reduction", 0), 0.80, percent=True),
             ]),
-            self._quick_section("Attributes", [(name, value(name), "", "neutral") for name in ("STR", "DEX", "VIT", "AGI", "INT", "MND", "CHR")]),
+            self._quick_section("Attributes · base + equipment", [
+                base_bonus(name) for name in ("STR", "DEX", "VIT", "AGI", "INT", "MND", "CHR")
+            ]),
             self._quick_section("Offense", [(label, value(name), "", "neutral") for label, name in (
                 ("Main accuracy", "Accuracy1"), ("Off-hand accuracy", "Accuracy2"),
                 ("Main attack", "Attack1"), ("Off-hand attack", "Attack2"),
@@ -3861,6 +5984,8 @@ class MainWindow(QMainWindow):
         grid.setVerticalSpacing(10)
         self.candidate_buttons = {}
         self.candidate_detail_labels = {}
+        self.candidate_cards = {}
+        self.candidate_slot_labels = {}
         for index, slot in enumerate(SLOTS):
             button = QPushButton("1 selected")
             button.setObjectName("candidateButton")
@@ -3886,6 +6011,8 @@ class MainWindow(QMainWindow):
             grid.addWidget(card, row, column)
             self.candidate_buttons[slot] = button
             self.candidate_detail_labels[slot] = detail
+            self.candidate_cards[slot] = card
+            self.candidate_slot_labels[slot] = label
         select_all = QPushButton("Select all gear in all slots")
         select_all.setMinimumHeight(34)
         select_all.setToolTip("Include every available item for every optimizer slot.")
@@ -3893,7 +6020,8 @@ class MainWindow(QMainWindow):
         grid.addWidget(select_all, 4, 0, 1, 4)
         self.exclude_under_119 = QCheckBox("Remove items under item level 119")
         self.exclude_under_119.setToolTip(
-            "Filter optimizer candidates in main, head, body, hands, legs, and feet. "
+            "Deselect optimizer candidates below item level 119 in head, body, "
+            "hands, legs, and feet. "
             "Items without item-level metadata are kept."
         )
         self.exclude_under_119.toggled.connect(self._candidate_filter_changed)
@@ -3930,14 +6058,12 @@ class MainWindow(QMainWindow):
         self.optimize_action = QComboBox()
         self.optimize_action.addItems([
             "Weapon skill", "Rank weapon-type WS", "Attack round", "Spell",
-            "Combined TP + WS", "Tradeoff optimization", WARM_CACHE_ACTION,
+            "Combined TP + WS", "Tradeoff optimization",
         ])
         self.optimize_action.setToolTip(
             "Combined TP + WS finds the best WS set first, then optimizes the TP set "
             "against that WS set using the same main/sub weapons and full-cycle DPS "
-            "(TP-round damage plus WS damage, divided by TP time plus the 2-second WS delay). "
-            "Warm cache runs the selected weapon-type WS at 1,000/2,000/3,000 TP with a "
-            "stable seed so later identical rankings restore immediately."
+            "(TP-round damage plus WS damage, divided by TP time plus the 2-second WS delay)."
         )
         self.metric_combo = QComboBox()
         self.ranking_weapon_type = QComboBox()
@@ -3962,7 +6088,7 @@ class MainWindow(QMainWindow):
             "Maximum allowed primary-performance loss from the best primary set."
         )
         self.tradeoff_depth = QComboBox()
-        self.tradeoff_depth.addItems(["Fast", "Deep"])
+        self.tradeoff_depth.addItems(["Fast", "Standard"])
         self.tradeoff_depth.setToolTip(
             "Fast keeps the normal optimizer's tradeoffs. Deep explores additional "
             "primary-loss bands and is intended for overnight searches."
@@ -3994,12 +6120,26 @@ class MainWindow(QMainWindow):
             "When disabled, only the TP set must meet them; the WS set is optimized for damage."
         )
         self.restarts = QSpinBox()
-        self.restarts.setRange(1, 10)
-        self.restarts.setValue(3)
+        self.restarts.setRange(1, 12)
+        self.restarts.setValue(6)
         self.restarts.setToolTip(
             "Independent search runs from different starting points. More runs improve "
-            "coverage but add work. Limited to 10 runs."
+            "coverage but add work. Limited to 12 runs."
         )
+        self.optimizer_quality = QComboBox()
+        self.optimizer_quality.addItems([*SEARCH_QUALITY_NAMES, "Custom"])
+        self.optimizer_quality.setCurrentText("Fast")
+        self.optimizer_quality.setToolTip(
+            "Fast uses 6 searches x 4 passes. Standard uses 10 x 10 and may reuse a "
+            "validated prior winner. Deep uses 12 x 10 independent searches and never "
+            "uses cross-character or cross-job starting knowledge."
+        )
+        self.optimizer_passes = QSpinBox()
+        self.optimizer_passes.setRange(1, 20)
+        self.optimizer_passes.setValue(4)
+        self.optimizer_passes.setToolTip("Convergence passes performed by each independent search.")
+        self._applying_search_quality = False
+        self.optimizer_quality.currentTextChanged.connect(self._apply_optimizer_quality)
         self.workers = QSpinBox()
         self.workers.setRange(0, max(1, os.cpu_count() or 1))
         self.workers.setToolTip("0 uses available CPU cores while leaving one free.")
@@ -4011,8 +6151,9 @@ class MainWindow(QMainWindow):
         )
         self.parallel_mode.currentTextChanged.connect(self._refresh_parallel_mode)
         self.restarts.valueChanged.connect(
-            lambda _value: self._refresh_parallel_mode(self.parallel_mode.currentText())
+            self._optimizer_search_controls_changed
         )
+        self.optimizer_passes.valueChanged.connect(self._optimizer_search_controls_changed)
         self.seed = QLineEdit()
         self.seed.setPlaceholderText("random")
         self.seed.setToolTip(
@@ -4031,23 +6172,26 @@ class MainWindow(QMainWindow):
         form.addRow("Ranking weapon type", self.ranking_weapon_type)
         form.addRow("Sub-stat damage action", self.substat_base_action)
         form.addRow("Max damage loss from best", self.substat_loss_percent)
-        form.addRow("Tradeoff search depth", self.tradeoff_depth)
+        self.tradeoff_depth.setVisible(False)
         for index, combo in enumerate(self.substat_combos, start=1):
             form.addRow(f"Secondary stat priority {index}", combo)
         form.addRow("Minimum PDT reduction %", self.pdt)
         form.addRow("Minimum MDT reduction %", self.mdt)
         form.addRow("Minimum DT reduction %", self.dt)
         form.addRow(self.combined_defense_both)
+        form.addRow("Search quality", self.optimizer_quality)
         form.addRow("Worker mode", self.parallel_mode)
         form.addRow("Search runs", self.restarts)
+        form.addRow("Passes per run", self.optimizer_passes)
         form.addRow("Parallel workers", self.workers)
-        form.addRow("Optimizer seed", self.seed)
         form.addRow(self.prune_candidates)
-        self.optimize_button = QPushButton("Run optimizer")
-        self.optimize_button.setMinimumHeight(32)
+        self.optimize_button = QPushButton("Start optimization")
+        self.optimize_button.setObjectName("optimizerStartAction")
+        self.optimize_button.setMinimumHeight(42)
         self.optimize_button.clicked.connect(self.run_optimizer)
-        self.stop_optimizer_button = QPushButton("Stop optimizer")
-        self.stop_optimizer_button.setMinimumHeight(32)
+        self.stop_optimizer_button = QPushButton("Stop")
+        self.stop_optimizer_button.setObjectName("optimizerStopAction")
+        self.stop_optimizer_button.setMinimumHeight(42)
         self.stop_optimizer_button.setEnabled(False)
         self.stop_optimizer_button.setToolTip("Request a cooperative stop after the current candidate calculation.")
         self.stop_optimizer_button.clicked.connect(self.stop_optimizer)
@@ -4066,35 +6210,70 @@ class MainWindow(QMainWindow):
         self.equip_best_button.setMinimumHeight(32)
         self.equip_best_button.setEnabled(False)
         self.equip_best_button.clicked.connect(self.equip_best)
-        run_controls = QHBoxLayout()
-        run_controls.setContentsMargins(0, 0, 0, 0)
-        run_controls.addWidget(self.optimize_button)
-        run_controls.addWidget(self.stop_optimizer_button)
-        run_controls.addWidget(self.overnight_button)
-        run_controls.addWidget(self.stop_overnight_button)
-        form.addRow(run_controls)
-        form.addRow(self.equip_best_button)
         top.addWidget(options)
-        layout.addLayout(top)
-        status_controls = QHBoxLayout()
-        self.show_optimizer_status_button = QPushButton("Show simulation status")
+
+        self.optimizer_control_panel = QFrame()
+        self.optimizer_control_panel.setObjectName("optimizerControlPanel")
+        self.optimizer_control_panel.setProperty("state", "idle")
+        control_layout = QVBoxLayout(self.optimizer_control_panel)
+        self.optimizer_control_layout = control_layout
+        control_layout.setContentsMargins(10, 8, 10, 8)
+        control_layout.setSpacing(7)
+        activity_row = QHBoxLayout()
+        activity_row.setSpacing(10)
+        self.optimizer_run_state_label = QLabel(OPTIMIZER_STATE_LABELS["idle"])
+        self.optimizer_run_state_label.setObjectName("optimizerRunState")
+        self.optimizer_run_state_label.setProperty("state", "idle")
+        self.optimizer_run_summary = QLabel("Configure the search, then start optimization.")
+        self.optimizer_run_summary.setObjectName("optimizerRunSummary")
+        self.optimizer_run_summary.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        activity_row.addWidget(self.optimizer_run_state_label)
+        activity_row.addWidget(self.optimizer_run_summary, 1)
+        control_layout.addLayout(activity_row)
+        self.optimizer_run_progress = QProgressBar()
+        self.optimizer_run_progress.setObjectName("optimizerRunProgress")
+        self.optimizer_run_progress.setRange(0, 1000)
+        self.optimizer_run_progress.setValue(0)
+        self.optimizer_run_progress.setFormat("Ready")
+        control_layout.addWidget(self.optimizer_run_progress)
+
+        primary_controls = QHBoxLayout()
+        self.optimizer_primary_controls = primary_controls
+        primary_controls.setSpacing(7)
+        primary_controls.addWidget(self.optimize_button, 2)
+        primary_controls.addWidget(self.stop_optimizer_button, 1)
+        self.show_optimizer_status_button = QPushButton("Show simulation")
+        self.show_optimizer_status_button.setObjectName("optimizerShowAction")
+        self.show_optimizer_status_button.setMinimumHeight(42)
         self.show_optimizer_status_button.setToolTip(
             "Open the optimizer log, overall progress, and per-run status in a separate window."
         )
         self.show_optimizer_status_button.clicked.connect(self.show_optimizer_status)
-        status_controls.addWidget(self.show_optimizer_status_button)
-        status_controls.addStretch(1)
-        self.show_top_sets_button = QPushButton("Show best sets (up to 5)")
+        primary_controls.addWidget(self.show_optimizer_status_button, 1)
+        self.show_top_sets_button = QPushButton("Show Gear")
+        self.show_top_sets_button.setMinimumHeight(42)
         self.show_top_sets_button.setEnabled(False)
         self.show_top_sets_button.clicked.connect(self.show_top_sets)
-        status_controls.addWidget(self.show_top_sets_button)
-        layout.addLayout(status_controls)
+        primary_controls.addWidget(self.show_top_sets_button, 1)
+        control_layout.addLayout(primary_controls)
+
+        secondary_controls = QHBoxLayout()
+        secondary_controls.setSpacing(7)
+        secondary_controls.addWidget(QLabel("Result"))
+        secondary_controls.addWidget(self.equip_best_button)
+        secondary_controls.addStretch(1)
+        control_layout.addLayout(secondary_controls)
+        layout.addWidget(self.optimizer_control_panel)
+        layout.addLayout(top)
         layout.addStretch(1)
         self._build_optimizer_status_dialog()
         self._refresh_optimizer_metrics(self.optimize_action.currentText())
         self._refresh_ranking_weapon_types()
         self._refresh_combined_options(self.optimize_action.currentText())
         self._refresh_parallel_mode(self.parallel_mode.currentText())
+        self._apply_optimizer_quality("Fast")
         self._refresh_candidate_preset_names()
         for slot in SLOTS:
             self._update_candidate_button(slot)
@@ -4103,24 +6282,49 @@ class MainWindow(QMainWindow):
     def _build_optimizer_status_dialog(self):
         """Keep progress details out of the candidate-selection layout."""
         self.optimizer_status_dialog = QDialog(self)
+        self.optimizer_status_dialog.setObjectName("simulationStatusDialog")
         self.optimizer_status_dialog.setWindowTitle("Simulation status")
         self.optimizer_status_dialog.setMinimumSize(640, 460)
-        self.optimizer_status_dialog.resize(900, 720)
+        self.optimizer_status_dialog.resize(960, 600)
         self.optimizer_status_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.optimizer_status_dialog.installEventFilter(self)
         status_layout = QVBoxLayout(self.optimizer_status_dialog)
         status_layout.setContentsMargins(12, 12, 12, 12)
         status_layout.setSpacing(10)
+        log_controls = QHBoxLayout()
+        log_controls.addWidget(QLabel("Log filter"))
+        self.optimizer_log_filter = QLineEdit()
+        self.optimizer_log_filter.setPlaceholderText("Filter messages, runs, or errors...")
+        self.optimizer_log_filter.setClearButtonEnabled(True)
+        self.optimizer_log_filter.textChanged.connect(self._render_optimizer_log)
+        log_controls.addWidget(self.optimizer_log_filter, 1)
+        clear_log = QPushButton("Clear log")
+        clear_log.setToolTip("Remove the current live log entries without changing the simulation.")
+        clear_log.clicked.connect(self._clear_optimizer_log)
+        log_controls.addWidget(clear_log)
+        latest_log = QPushButton("Latest")
+        latest_log.setToolTip("Scroll the live log to the newest entry.")
+        latest_log.clicked.connect(lambda: self.optimizer_log.verticalScrollBar().setValue(
+            self.optimizer_log.verticalScrollBar().maximum()
+        ))
+        log_controls.addWidget(latest_log)
+        status_layout.addLayout(log_controls)
         self.optimizer_log = QTextEdit()
         self.optimizer_log.setReadOnly(True)
         self.optimizer_log.setAcceptRichText(True)
         self.optimizer_log.setPlaceholderText("Optimizer progress appears here.")
+        self.optimizer_log.setMinimumHeight(108)
+        self.optimizer_log.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         status_layout.addWidget(self.optimizer_log, 1)
         status_box = QGroupBox("Search status")
+        status_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         status_grid = QGridLayout(status_box)
         status_grid.setContentsMargins(12, 12, 12, 12)
         status_grid.setHorizontalSpacing(24)
         status_grid.setVerticalSpacing(10)
-        self.optimizer_progress_value = QLabel("Approx. progress: —")
+        self.optimizer_progress_value = QLabel("Overall progress: —")
         self.optimizer_eta_value = QLabel("Estimated time remaining: —")
         self.optimizer_best_value = QLabel("Best metric: —")
         self.optimizer_phase_value = QLabel("Current phase: —")
@@ -4128,22 +6332,39 @@ class MainWindow(QMainWindow):
             self.optimizer_progress_value, self.optimizer_eta_value,
             self.optimizer_best_value, self.optimizer_phase_value,
         ):
-            label.setFixedWidth(360)
+            label.setMinimumWidth(0)
+            label.setWordWrap(True)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.optimizer_progress_value.setObjectName("simulationProgressValue")
+        self.optimizer_eta_value.setObjectName("simulationEtaValue")
+        self.optimizer_best_value.setObjectName("simulationResultValue")
+        self.optimizer_phase_value.setObjectName("simulationPhaseValue")
         status_grid.addWidget(self.optimizer_progress_value, 0, 0)
         status_grid.addWidget(self.optimizer_eta_value, 0, 1)
         status_grid.addWidget(self.optimizer_best_value, 1, 0)
         status_grid.addWidget(self.optimizer_phase_value, 1, 1)
         status_layout.addWidget(status_box)
         self.optimizer_runs_box = QGroupBox("Per-run status")
+        self.optimizer_runs_box.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
         self.optimizer_runs_layout = QGridLayout(self.optimizer_runs_box)
-        self.optimizer_runs_layout.setContentsMargins(8, 8, 8, 8)
+        # Keep the run matrix compact: Standard has ten cards and Deep has
+        # twelve, so a generous card gutter quickly makes the status window
+        # taller than the useful log area.
+        self.optimizer_runs_layout.setContentsMargins(6, 6, 6, 6)
+        self.optimizer_runs_layout.setHorizontalSpacing(6)
+        self.optimizer_runs_layout.setVerticalSpacing(6)
+        self.optimizer_runs_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.optimizer_runs_placeholder = QLabel(
             "Run the optimizer to show a fixed status section for each search run."
         )
         self.optimizer_runs_layout.addWidget(self.optimizer_runs_placeholder, 0, 0)
         status_layout.addWidget(self.optimizer_runs_box)
         self.profile_builder_batch_box = QGroupBox("Profile Builder loadout batch")
+        self.profile_builder_batch_box.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
         profile_batch_layout = QGridLayout(self.profile_builder_batch_box)
         self.profile_builder_batch_section = QLabel("No Profile Builder batch is active.")
         self.profile_builder_batch_progress = QLabel()
@@ -4157,22 +6378,43 @@ class MainWindow(QMainWindow):
             profile_batch_layout.addWidget(label, row, 0)
         self.profile_builder_batch_box.setVisible(False)
         status_layout.addWidget(self.profile_builder_batch_box)
-        self.optimizer_activity = QLabel("Idle")
-        self.optimizer_activity.setAlignment(Qt.AlignmentFlag.AlignRight)
-        status_layout.addWidget(self.optimizer_activity)
-        cache_controls = QHBoxLayout()
+        activity_bar = QWidget()
+        activity_bar.setObjectName("simulationFooter")
+        activity_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        cache_controls = QHBoxLayout(activity_bar)
+        cache_controls.setContentsMargins(0, 0, 0, 0)
         self.cache_status_value = QLabel()
-        clear_cache = QPushButton("Clear cache")
-        clear_cache.setToolTip("Remove saved simulation results without changing character settings or bridge data.")
-        clear_cache.clicked.connect(self.clear_simulation_cache)
-        cache_controls.addWidget(self.cache_status_value)
+        self.cache_status_value.setVisible(False)
         cache_controls.addStretch(1)
-        cache_controls.addWidget(clear_cache)
-        status_layout.addLayout(cache_controls)
+        self.optimizer_activity = QLabel("Idle")
+        self.optimizer_activity.setObjectName("simulationActivity")
+        self.optimizer_activity.setAlignment(Qt.AlignmentFlag.AlignRight)
+        cache_controls.addWidget(self.optimizer_activity)
+        status_layout.addWidget(activity_bar)
         self._refresh_cache_status()
+        self.optimizer_close_when_done = QCheckBox("Close when all simulations finish")
+        self.optimizer_close_when_done.setToolTip(
+            "Keep this window open between Profile Builder loadouts, then close it after the full batch finishes."
+        )
+        self.optimizer_close_when_done.setChecked(
+            self.settings.value("optimizer/close_status_when_done", False, bool)
+        )
+        self.optimizer_close_when_done.toggled.connect(
+            lambda enabled: self.settings.setValue(
+                "optimizer/close_status_when_done", bool(enabled)
+            )
+        )
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.optimizer_status_dialog.hide)
-        status_layout.addWidget(buttons)
+        bottom_bar = QWidget()
+        bottom_bar.setObjectName("simulationFooter")
+        bottom_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        bottom_controls = QHBoxLayout(bottom_bar)
+        bottom_controls.setContentsMargins(0, 0, 0, 0)
+        bottom_controls.addWidget(self.optimizer_close_when_done)
+        bottom_controls.addStretch(1)
+        bottom_controls.addWidget(buttons)
+        status_layout.addWidget(bottom_bar)
 
     def show_optimizer_status(self):
         self._refresh_cache_status()
@@ -4181,22 +6423,104 @@ class MainWindow(QMainWindow):
         self.optimizer_status_dialog.raise_()
         self.optimizer_status_dialog.activateWindow()
 
+    def show_results_workspace(self):
+        """Open the persistent Results workspace from the global simulation strip."""
+        self.refresh_results_history()
+        self._select_tab("Results")
+
+    def _schedule_optimizer_status_close(self):
+        if hasattr(self, "optimizer_close_when_done") and self.optimizer_close_when_done.isChecked():
+            QTimer.singleShot(250, self._close_optimizer_status_if_finished)
+
+    def _close_optimizer_status_if_finished(self):
+        if not self.optimizer_close_when_done.isChecked():
+            return
+        running = any(
+            thread is not None and thread.isRunning()
+            for thread in (self.optimizer_thread, self.overnight_thread)
+        )
+        batch_pending = bool(
+            getattr(self, "_profile_builder_optimizer_active", None)
+            or getattr(self, "_profile_builder_optimizer_queue", [])
+        )
+        if running or batch_pending:
+            QTimer.singleShot(250, self._close_optimizer_status_if_finished)
+            return
+        self.optimizer_status_dialog.hide()
+
+    def _set_optimizer_run_ui(self, state: str, summary: str | None = None,
+                              progress: float | None = None):
+        """Keep the Optimize tab's persistent run indicator synchronized."""
+        if not hasattr(self, "optimizer_control_panel"):
+            return
+        state = state if state in OPTIMIZER_STATE_LABELS else "idle"
+        self.optimizer_run_state_label.setText(OPTIMIZER_STATE_LABELS[state])
+        if summary is not None:
+            self.optimizer_run_summary.setText(str(summary))
+        for widget in (self.optimizer_control_panel, self.optimizer_run_state_label):
+            widget.setProperty("state", state)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+        if hasattr(self, "simulation_header_panel"):
+            self.simulation_header_panel.setProperty("state", state)
+            self.simulation_header_panel.style().unpolish(self.simulation_header_panel)
+            self.simulation_header_panel.style().polish(self.simulation_header_panel)
+        if hasattr(self, "optimizer_header_eta"):
+            self.optimizer_header_eta.setProperty("state", state)
+            self.optimizer_header_eta.style().unpolish(self.optimizer_header_eta)
+            self.optimizer_header_eta.style().polish(self.optimizer_header_eta)
+            if state in {"completed", "restored"}:
+                self._set_optimizer_header_eta(status="complete")
+            elif state == "failed":
+                self._set_optimizer_header_eta(status="unavailable")
+            elif state in {"stopping", "stopped"}:
+                self._set_optimizer_header_eta(status="stopped")
+        if progress is None and state in {"starting", "running", "warming", "stopping"}:
+            self.optimizer_run_progress.setRange(0, 0)
+            self.optimizer_run_progress.setFormat("")
+            return
+        value = (
+            100.0 if state in {"completed", "restored"} else 0.0
+        ) if progress is None else max(0.0, min(100.0, float(progress)))
+        self.optimizer_run_progress.setRange(0, 1000)
+        self.optimizer_run_progress.setValue(round(value * 10))
+        self.optimizer_run_progress.setFormat(
+            f"{value:.1f}%" if state in {"starting", "running", "warming", "stopping"}
+            else OPTIMIZER_STATE_LABELS[state].title()
+        )
+
+    def _set_optimizer_header_eta(
+        self, remaining: float | None = None, status: str | None = None,
+    ):
+        """Show a short seconds-only ETA beside the persistent progress bar."""
+        if not hasattr(self, "optimizer_header_eta"):
+            return
+        if status is not None:
+            text = f"Est. Time Remaining: {status}"
+        elif remaining is None:
+            text = "Est. Time Remaining: --"
+        else:
+            text = f"Est. Time Remaining: {max(0, math.ceil(float(remaining)))}s"
+        self.optimizer_header_eta.setText(text)
+
     def _refresh_profile_builder_batch_status(self):
         if hasattr(self, "dashboard_build_status"):
             self._refresh_build_dashboard()
-        if not hasattr(self, "profile_builder_batch_box"):
-            return
         active = getattr(self, "_profile_builder_optimizer_active", None)
         queue = list(getattr(self, "_profile_builder_optimizer_queue", []))
         total = int(getattr(self, "_profile_builder_optimizer_total", 0) or 0)
         completed = int(getattr(self, "_profile_builder_optimizer_completed_count", 0) or 0)
         state = str(getattr(self, "_profile_builder_optimizer_batch_state", "") or "")
+        if hasattr(self, "profile_stop_button"):
+            self.profile_stop_button.setEnabled(bool(active or queue) and state == "running")
+        if not hasattr(self, "profile_builder_batch_box"):
+            return
         visible = bool(active or queue or total or state)
         self.profile_builder_batch_box.setVisible(visible)
         if not visible:
             return
         depth = self.profile_builder_depth.currentText() if hasattr(self, "profile_builder_depth") else "Fast"
-        passes, restarts = (4, 1) if depth == "Fast" else (10, 3)
+        passes, restarts, _shared = _search_quality_settings(depth)
         if active:
             details = ((getattr(self, "_profile_builder_result", {}) or {}).get("recipe_details") or {}).get(active, {})
             scenario = details.get("optimizer") or {}
@@ -4219,7 +6543,7 @@ class MainWindow(QMainWindow):
             f"Loadouts: {completed}/{total or completed} complete · {len(queue)} queued"
         )
         self.profile_builder_batch_depth.setText(
-            f"Search depth: {depth} · {restarts} seeded run(s) × {passes} passes per combat loadout."
+            f"Search quality: {depth} · {restarts} search run(s) × {passes} passes per combat loadout."
         )
 
     def _aspirational_tab(self) -> QWidget:
@@ -4258,6 +6582,8 @@ class MainWindow(QMainWindow):
         self.aspirational_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.aspirational_table.setAlternatingRowColors(True)
         self.aspirational_table.setIconSize(QSize(32, 32))
+        self.aspirational_table.verticalHeader().setVisible(False)
+        self.aspirational_table.verticalHeader().setDefaultSectionSize(36)
         self.aspirational_table.setColumnWidth(0, 96)
         self.aspirational_table.setColumnWidth(1, 190)
         self.aspirational_table.setColumnWidth(2, 120)
@@ -4448,6 +6774,31 @@ class MainWindow(QMainWindow):
         if current in values:
             self.ranking_weapon_type.setCurrentText(current)
 
+    def _apply_optimizer_quality(self, quality: str):
+        if quality not in SEARCH_QUALITY or not hasattr(self, "optimizer_passes"):
+            return
+        passes, restarts, _shared = _search_quality_settings(quality)
+        self._applying_search_quality = True
+        try:
+            self.restarts.setValue(restarts)
+            self.optimizer_passes.setValue(passes)
+            self.tradeoff_depth.setCurrentText("Fast" if quality == "Fast" else "Standard")
+        finally:
+            self._applying_search_quality = False
+        self._refresh_parallel_mode(self.parallel_mode.currentText())
+
+    def _optimizer_search_controls_changed(self, _value=None):
+        if not getattr(self, "_applying_search_quality", False):
+            expected = next((
+                name for name, policy in SEARCH_QUALITY.items()
+                if int(policy["restarts"]) == self.restarts.value()
+                and int(policy["passes"]) == self.optimizer_passes.value()
+            ), "Custom")
+            self.optimizer_quality.blockSignals(True)
+            self.optimizer_quality.setCurrentText(expected)
+            self.optimizer_quality.blockSignals(False)
+        self._refresh_parallel_mode(self.parallel_mode.currentText())
+
     def _refresh_parallel_mode(self, mode: str):
         split_one_run = mode == "Split one search run"
         self.restarts.setEnabled(not split_one_run)
@@ -4482,7 +6833,7 @@ class MainWindow(QMainWindow):
         heading.addWidget(QLabel("Completed simulations, rankings, optimizers, and saved Quick Look checks"))
         heading.addStretch(1)
         self.results_filter = QLineEdit()
-        self.results_filter.setPlaceholderText("Filter title, job, enemy, WS, or seed...")
+        self.results_filter.setPlaceholderText("Filter title, job, enemy, or weapon skill...")
         self.results_filter.textChanged.connect(self.refresh_results_history)
         heading.addWidget(self.results_filter)
         self.results_favorites_only = QCheckBox("Pinned only")
@@ -4491,31 +6842,51 @@ class MainWindow(QMainWindow):
         heading.addWidget(self.results_favorites_only)
         layout.addLayout(heading)
 
-        self.results_table = QTableWidget(0, 8)
+        self.results_table = QTableWidget(0, 7)
         self.results_table.setHorizontalHeaderLabels(
-            ["Result", "Type", "Scenario", "Metric", "Seed", "Age", "Pinned", "Status"]
+            ["Result", "Type", "Scenario", "Metric", "Age", "Pinned", "Status"]
         )
         self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.results_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.results_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.results_table.setAlternatingRowColors(True)
+        self.results_table.setWordWrap(False)
+        self.results_table.verticalHeader().setVisible(False)
+        self.results_table.verticalHeader().setDefaultSectionSize(28)
+        results_header = self.results_table.horizontalHeader()
+        results_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        results_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        results_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for column in (3, 4, 5, 6):
+            results_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.results_table.setColumnWidth(0, 230)
         self.results_table.itemSelectionChanged.connect(self._result_selection_changed)
         layout.addWidget(self.results_table, 2)
 
         detail_box = QGroupBox("Result details")
         detail_layout = QVBoxLayout(detail_box)
         self.results_detail = QPlainTextEdit()
+        self.results_detail.setObjectName("resultDetailsText")
         self.results_detail.setReadOnly(True)
-        self.results_detail.setMaximumHeight(180)
-        self.results_detail.setPlaceholderText("Select a result to see its seed, scenario, metrics, warnings, and gear.")
+        self.results_detail.setFixedHeight(116)
+        self.results_detail.setPlaceholderText("Select a result to see its scenario, metrics, warnings, and gear.")
         detail_layout.addWidget(self.results_detail)
         self.results_gear_table = QTableWidget(0, 4)
         self.results_gear_table.setHorizontalHeaderLabels(["Set", "Slot", "Gear", "Relevant stats"])
         self.results_gear_table.setIconSize(QSize(30, 30))
         self.results_gear_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.results_gear_table.setMaximumHeight(190)
+        self.results_gear_table.setWordWrap(False)
+        self.results_gear_table.verticalHeader().setVisible(False)
+        self.results_gear_table.verticalHeader().setDefaultSectionSize(34)
+        gear_header = self.results_gear_table.horizontalHeader()
+        gear_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        gear_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        gear_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        gear_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.results_gear_table.setColumnWidth(2, 260)
+        self.results_gear_table.setFixedHeight(42)
         detail_layout.addWidget(self.results_gear_table)
-        layout.addWidget(detail_box, 1)
+        layout.addWidget(detail_box)
 
         buttons = QGridLayout()
         buttons.setHorizontalSpacing(6)
@@ -4524,8 +6895,8 @@ class MainWindow(QMainWindow):
         refresh.clicked.connect(self.refresh_results_history)
         load = QPushButton("Load into workspace")
         load.clicked.connect(self.load_history_result)
-        rerun = QPushButton("Rerun selected")
-        rerun.setToolTip("Rerun a saved cycle/distribution, or generate plots for an optimizer winner with a complete TP/WS pair.")
+        rerun = QPushButton("Repeat exact run")
+        rerun.setToolTip("Repeat the saved calculation using its internally retained reproducibility data.")
         rerun.clicked.connect(self.rerun_history_result)
         compare = QPushButton("Compare selected")
         compare.clicked.connect(self.compare_history_results)
@@ -4650,20 +7021,20 @@ class MainWindow(QMainWindow):
             values = (
                 record.get("title", ""), record.get("kind", ""),
                 f"{scenario.get('enemy', '')} · {scenario.get('ws', '')}",
-                self._history_metric_text(payload), payload.get("seed", ""),
+                self._history_metric_text(payload),
                 _result_age_text(record.get("created_at", time.time())),
                 "Yes" if record.get("pinned") else "No",
                 "Stale" if record.get("stale") else "Current",
             )
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
+                cell.setToolTip(str(value))
                 if column == 0:
                     cell.setData(Qt.ItemDataRole.UserRole, int(record["id"]))
                 self.results_table.setItem(row, column, cell)
             if record.get("id") == self._history_selected_id:
                 selected_row = row
         self.results_table.blockSignals(False)
-        self.results_table.resizeColumnsToContents()
         if selected_row >= 0:
             self.results_table.selectRow(selected_row)
         elif records:
@@ -4688,6 +7059,8 @@ class MainWindow(QMainWindow):
         self.results_detail.clear()
         self.results_gear_table.setRowCount(0)
         if not record:
+            self.results_detail.setFixedHeight(80)
+            self.results_gear_table.setFixedHeight(42)
             return
         payload = record.get("payload") or {}
         scenario = payload.get("scenario") or {}
@@ -4698,7 +7071,7 @@ class MainWindow(QMainWindow):
             scenario_tp = 0
         lines = [
             f"{record.get('title', '')} · {record.get('kind', '')}",
-            f"Seed: {payload.get('seed', '—')} · {_result_age_text(record.get('created_at', time.time()))}",
+            f"Saved {_result_age_text(record.get('created_at', time.time()))}",
             f"Scenario: {scenario.get('job', '')} · {scenario.get('enemy', '')} · "
             f"{scenario.get('ws', '')} at {scenario_tp:,} TP",
             "Metrics: " + " · ".join(
@@ -4715,6 +7088,12 @@ class MainWindow(QMainWindow):
         for warning in payload.get("warnings") or []:
             lines.append(f"WARNING: {warning}")
         self.results_detail.setPlainText("\n".join(lines))
+        visible_lines = max(4, min(7, len(lines)))
+        detail_height = (
+            visible_lines * self.results_detail.fontMetrics().lineSpacing()
+            + 18
+        )
+        self.results_detail.setFixedHeight(detail_height)
         row = 0
         for set_name, gearset in (payload.get("gearsets") or {}).items():
             if not isinstance(gearset, dict):
@@ -4732,7 +7111,10 @@ class MainWindow(QMainWindow):
                 self.results_gear_table.setItem(row, 2, gear_cell)
                 self.results_gear_table.setItem(row, 3, QTableWidgetItem(self._history_relevant_stats(item)))
                 row += 1
-        self.results_gear_table.resizeColumnsToContents()
+        visible_rows = min(row, 5)
+        header_height = max(26, self.results_gear_table.horizontalHeader().sizeHint().height())
+        rows_height = visible_rows * self.results_gear_table.verticalHeader().defaultSectionSize()
+        self.results_gear_table.setFixedHeight(header_height + rows_height + 4)
 
     def compare_history_results(self):
         records = self._selected_history_records()
@@ -4796,7 +7178,23 @@ class MainWindow(QMainWindow):
             return
         self.load_history_result()
         kind = str(record.get("kind") or "")
-        if kind == "distribution":
+        payload = record.get("payload") or {}
+        saved_seed = payload.get("seed")
+        if saved_seed not in (None, ""):
+            self.workspace_seed.setText(str(saved_seed))
+        if kind == "optimizer" and isinstance(payload.get("optimizer"), dict):
+            scenario = payload.get("scenario") or {}
+            action = str(scenario.get("action") or "optimizer").removeprefix("optimizer: ")
+            self._optimizer_action_in_progress = action
+            context = self._optimizer_cache_context((
+                JOBS[self.main_job.currentText()], JOBS.get(self.sub_job.currentText(), "None"),
+                self.master_level.value(), self._combat_context()["buffs"],
+                self._combat_context()["abilities"],
+            ))
+            restored = self._restore_optimizer_payload(payload["optimizer"], context)
+            self._optimizer_done(restored)
+            self._select_tab("Optimizer")
+        elif kind == "distribution":
             self.plot_ws_distribution()
         elif kind in {"cycle", "optimizer"} and {
             key for key in (record.get("payload") or {}).get("gearsets", {})
@@ -4837,17 +7235,23 @@ class MainWindow(QMainWindow):
         """Build the structured equivalent of the legacy Active Buffs pane."""
         tab = QWidget()
         outer = QVBoxLayout(tab)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
         note = QLabel(
             "Enable only buffs currently active. These controls feed the existing "
             "calculation engine. Save named variations when you need to switch quickly."
         )
+        note.setObjectName("buffIntro")
         note.setWordWrap(True)
         outer.addWidget(note)
 
         preset_box = QGroupBox("Buff presets")
         preset_layout = QHBoxLayout(preset_box)
+        preset_layout.setContentsMargins(8, 10, 8, 7)
+        preset_layout.setSpacing(6)
         self.buff_preset_combo = QComboBox()
-        self.buff_preset_combo.setMinimumWidth(220)
+        self.buff_preset_combo.setMinimumWidth(200)
+        self.buff_preset_combo.setMaximumWidth(360)
         self.buff_preset_combo.setToolTip(
             "Select a saved buff configuration. BG Wiki presets also set the "
             "custom test enemy values used for those sets."
@@ -4859,7 +7263,8 @@ class MainWindow(QMainWindow):
         save_preset.clicked.connect(self.save_buff_preset)
         delete_preset.clicked.connect(self.delete_buff_preset)
         preset_layout.addWidget(QLabel("Variation"))
-        preset_layout.addWidget(self.buff_preset_combo, 1)
+        preset_layout.addWidget(self.buff_preset_combo)
+        preset_layout.addStretch(1)
         preset_layout.addWidget(load_preset)
         preset_layout.addWidget(save_preset)
         preset_layout.addWidget(delete_preset)
@@ -4869,13 +7274,34 @@ class MainWindow(QMainWindow):
             "(Marcato plus GEO Fury/Frailty). Both include the 1350 evasion / "
             "1500 defense / 340 VIT and AGI / 280 INT and MND test enemy."
         )
+        preset_note.setObjectName("buffPresetNote")
         preset_note.setWordWrap(True)
         outer.addWidget(preset_note)
-        content = QWidget()
-        grid = QGridLayout(content)
+
+        def compact_form(form: QFormLayout):
+            form.setContentsMargins(8, 11, 8, 8)
+            form.setHorizontalSpacing(8)
+            form.setVerticalSpacing(4)
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            form.setFormAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
+        def compact_combo(combo: QComboBox, width: int = 250):
+            combo.setMaximumWidth(width)
+            combo.setMinimumContentsLength(12)
+            combo.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            )
+            combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+        def compact_spin(spin: QSpinBox, width: int = 145):
+            spin.setMaximumWidth(width)
+            spin.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         whm = QGroupBox("White Magic and food")
         whm_form = QFormLayout(whm)
+        compact_form(whm_form)
         self.whm_enabled = QCheckBox("Enable White Magic")
         self.shell_v = QCheckBox("Shell V")
         self.dia_combo = QComboBox()
@@ -4893,6 +7319,12 @@ class MainWindow(QMainWindow):
         self.enhancing_skill.setValue(500)
         self.food_combo = QComboBox()
         self.food_combo.addItems(["None", *sorted(gear.all_food)])
+        for combo in (
+            self.dia_combo, self.haste_combo, self.boost_combo,
+            self.storm_combo, self.food_combo,
+        ):
+            compact_combo(combo)
+        compact_spin(self.enhancing_skill)
         whm_form.addRow(self.whm_enabled)
         whm_form.addRow(self.shell_v)
         whm_form.addRow("Dia", self.dia_combo)
@@ -4901,14 +7333,15 @@ class MainWindow(QMainWindow):
         whm_form.addRow("Storm", self.storm_combo)
         whm_form.addRow("Enhancing skill", self.enhancing_skill)
         whm_form.addRow("Food", self.food_combo)
-        grid.addWidget(whm, 0, 0)
 
         bard = QGroupBox("Bard songs")
         bard_form = QFormLayout(bard)
+        compact_form(bard_form)
         self.bard_enabled = QCheckBox("Enable Bard songs")
         self.song_bonus = QSpinBox()
         self.song_bonus.setRange(0, 9)
         self.song_bonus.setPrefix("Songs +")
+        compact_spin(self.song_bonus)
         self.song_combos = []
         bard_form.addRow(self.bard_enabled)
         bard_form.addRow("Instrument bonus", self.song_bonus)
@@ -4916,6 +7349,7 @@ class MainWindow(QMainWindow):
         for index in range(5):
             combo = QComboBox()
             combo.addItems(song_names)
+            compact_combo(combo)
             combo.currentTextChanged.connect(lambda _text, current=combo: self._clear_duplicate_combo(
                 current, self.song_combos
             ))
@@ -4927,14 +7361,15 @@ class MainWindow(QMainWindow):
         self.soul_voice.toggled.connect(lambda enabled: enabled and self.marcato.setChecked(False))
         bard_form.addRow(self.marcato)
         bard_form.addRow(self.soul_voice)
-        grid.addWidget(bard, 0, 1)
 
         corsair = QGroupBox("Corsair rolls")
         cor_form = QFormLayout(corsair)
+        compact_form(cor_form)
         self.cor_enabled = QCheckBox("Enable Corsair rolls")
         self.roll_bonus = QSpinBox()
         self.roll_bonus.setRange(0, 8)
         self.roll_bonus.setPrefix("Rolls +")
+        compact_spin(self.roll_bonus)
         cor_form.addRow(self.cor_enabled)
         cor_form.addRow("Roll bonus", self.roll_bonus)
         self.roll_combos = []
@@ -4947,8 +7382,10 @@ class MainWindow(QMainWindow):
             potency = QComboBox()
             potency.addItems(["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI"])
             potency.setCurrentText("IX")
+            compact_combo(potency, 72)
             combo = QComboBox()
             combo.addItems(roll_names)
+            compact_combo(combo, 230)
             combo.currentTextChanged.connect(lambda _text, current=combo: self._clear_duplicate_combo(
                 current, self.roll_combos
             ))
@@ -4963,14 +7400,15 @@ class MainWindow(QMainWindow):
         cor_form.addRow(self.crooked_cards)
         cor_form.addRow(self.cor_job_bonus)
         cor_form.addRow(self.light_shot)
-        grid.addWidget(corsair, 1, 0)
 
         geo = QGroupBox("Geomancy bubbles")
         geo_form = QFormLayout(geo)
+        compact_form(geo_form)
         self.geo_enabled = QCheckBox("Enable Geomancy")
         self.geo_bonus = QSpinBox()
         self.geo_bonus.setRange(0, 10)
         self.geo_bonus.setPrefix("Geomancy +")
+        compact_spin(self.geo_bonus)
         bubble_names = ["None", *sorted(set(buff_data.geo) | set(buff_data.geo_debuffs))]
         self.indi_combo = QComboBox()
         self.geo_combo = QComboBox()
@@ -4978,11 +7416,13 @@ class MainWindow(QMainWindow):
         for combo, prefix in ((self.indi_combo, "Indi-"), (self.geo_combo, "Geo-"),
                               (self.entrust_combo, "Entrust-")):
             combo.addItems(["None", *[prefix + name for name in bubble_names[1:]]])
+            compact_combo(combo)
             combo.currentTextChanged.connect(self._clear_duplicate_bubbles)
         self.geo_potency = QSpinBox()
         self.geo_potency.setRange(0, 100)
         self.geo_potency.setValue(100)
         self.geo_potency.setSuffix("%")
+        compact_spin(self.geo_potency)
         self.blaze_of_glory = QCheckBox("Blaze of Glory (Geo only)")
         self.bolster = QCheckBox("Bolster (Indi and Geo)")
         self.blaze_of_glory.toggled.connect(lambda enabled: enabled and self.bolster.setChecked(False))
@@ -4995,10 +7435,7 @@ class MainWindow(QMainWindow):
         geo_form.addRow("Debuff potency", self.geo_potency)
         geo_form.addRow(self.blaze_of_glory)
         geo_form.addRow(self.bolster)
-        grid.addWidget(geo, 1, 1)
-
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
+        content = ResponsiveBuffGrid([whm, bard, corsair, geo])
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -5171,8 +7608,16 @@ class MainWindow(QMainWindow):
         index = combo.findText(value)
         combo.setCurrentIndex(index if index >= 0 else combo.findText(fallback))
 
-    def _apply_buff_state(self, state: dict):
-        """Apply a saved preset while suppressing intermediate recalculations."""
+    def _apply_buff_state(self, state: dict, *, preserve_job_abilities: bool = False):
+        """Apply a saved preset while suppressing intermediate recalculations.
+
+        Profile Builder presets describe party/general buffs. They must not
+        silently clear checked job abilities such as Hasso or Impetus.
+        """
+        active_abilities = (
+            self.abilities_json.toPlainText()
+            if preserve_job_abilities and hasattr(self, "abilities_json") else None
+        )
         controls = [
             self.whm_enabled, self.shell_v, self.dia_combo, self.haste_combo,
             self.boost_combo, self.storm_combo, self.enhancing_skill, self.food_combo,
@@ -5234,7 +7679,10 @@ class MainWindow(QMainWindow):
             if hasattr(self, "buffs_json"):
                 self.buffs_json.setPlainText(str(state.get("additional_buffs_json", "{}")))
             if hasattr(self, "abilities_json"):
-                self.abilities_json.setPlainText(str(state.get("abilities_json", "{}")))
+                self.abilities_json.setPlainText(
+                    active_abilities if active_abilities is not None
+                    else str(state.get("abilities_json", "{}"))
+                )
         finally:
             self.enemy_combo.blockSignals(False)
             for control in controls:
@@ -5312,32 +7760,300 @@ class MainWindow(QMainWindow):
             else:
                 selected.add(value)
 
+    def _lac_editor_tab(self) -> QWidget:
+        tab = QWidget()
+        tab.setObjectName("lacEditorTab")
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(7, 7, 7, 7)
+        layout.setSpacing(5)
+
+        toolbar = QFrame()
+        toolbar.setObjectName("lacEditorToolbar")
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(7, 6, 7, 6)
+        toolbar_layout.setSpacing(6)
+        toolbar_layout.addWidget(QLabel("Profile"))
+        self.lac_editor_job_combo = QComboBox()
+        self.lac_editor_job_combo.setMinimumWidth(150)
+        self.lac_editor_job_combo.setMaximumWidth(240)
+        self.lac_editor_job_combo.currentTextChanged.connect(self._lac_editor_job_changed)
+        toolbar_layout.addWidget(self.lac_editor_job_combo)
+        self.lac_editor_path_label = QLabel("Load a character to open its current LAC file.")
+        self.lac_editor_path_label.setObjectName("lacEditorPath")
+        self.lac_editor_path_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.lac_editor_path_label.setMinimumWidth(0)
+        self.lac_editor_path_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        toolbar_layout.addWidget(self.lac_editor_path_label, 1)
+        self.lac_editor_reload_button = QPushButton("Reload from disk")
+        self.lac_editor_reload_button.setEnabled(False)
+        self.lac_editor_reload_button.clicked.connect(
+            lambda: self._refresh_lac_editor(force=True)
+        )
+        self.lac_editor_save_button = QPushButton("Save LAC file")
+        self.lac_editor_save_button.setObjectName("lacEditorSave")
+        self.lac_editor_save_button.setEnabled(False)
+        self.lac_editor_save_button.clicked.connect(self.save_lac_editor)
+        toolbar_layout.addWidget(self.lac_editor_reload_button)
+        toolbar_layout.addWidget(self.lac_editor_save_button)
+        layout.addWidget(toolbar)
+
+        self.lac_editor = LuaCodeEditor()
+        self.lac_editor.setPlaceholderText(
+            "Select an imported character and LAC job profile to open the Lua source."
+        )
+        self.lac_editor.setEnabled(False)
+        self.lac_editor.document().modificationChanged.connect(
+            self._lac_editor_modified_changed
+        )
+        layout.addWidget(self.lac_editor, 1)
+        self.lac_editor_status = QLabel(
+            "Read and edit the live character profile. Saving creates a timestamped backup first."
+        )
+        self.lac_editor_status.setObjectName("lacEditorStatus")
+        self.lac_editor_status.setWordWrap(True)
+        layout.addWidget(self.lac_editor_status)
+
+        save_action = QAction("Save LAC file", tab)
+        save_action.setShortcut(QKeySequence.StandardKey.Save)
+        save_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        save_action.triggered.connect(self.save_lac_editor)
+        tab.addAction(save_action)
+        self._lac_editor_path: Path | None = None
+        self._lac_editor_source_hash = ""
+        self._lac_editor_job_label = ""
+        self._refresh_lac_editor_jobs(load=False)
+        return tab
+
+    def _refresh_lac_editor_jobs(self, *, load: bool = True):
+        if not hasattr(self, "lac_editor_job_combo"):
+            return
+        jobs = [
+            self.profile_job_combo.itemText(index)
+            for index in range(self.profile_job_combo.count())
+        ]
+        preferred = self.profile_job_combo.currentText()
+        self.lac_editor_job_combo.blockSignals(True)
+        self.lac_editor_job_combo.clear()
+        self.lac_editor_job_combo.addItems(jobs)
+        if preferred in jobs:
+            self.lac_editor_job_combo.setCurrentText(preferred)
+        self.lac_editor_job_combo.blockSignals(False)
+        self.lac_editor_job_combo.setEnabled(bool(jobs))
+        if load:
+            self._refresh_lac_editor()
+
+    def _profile_job_for_editor_changed(self, job_label: str):
+        if not hasattr(self, "lac_editor_job_combo"):
+            return
+        self.lac_editor_job_combo.blockSignals(True)
+        self.lac_editor_job_combo.setCurrentText(job_label)
+        self.lac_editor_job_combo.blockSignals(False)
+        self._refresh_lac_editor()
+
+    def _lac_editor_job_changed(self, job_label: str):
+        if job_label and self.profile_job_combo.currentText() != job_label:
+            self.profile_job_combo.setCurrentText(job_label)
+        else:
+            self._refresh_lac_editor()
+
+    def _confirm_lac_editor_transition(self) -> bool:
+        if not hasattr(self, "lac_editor") or not self.lac_editor.document().isModified():
+            return True
+        answer = QMessageBox.warning(
+            self, "Unsaved LAC changes",
+            "Save the current LAC changes before opening another profile?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if answer == QMessageBox.StandardButton.Save:
+            return self.save_lac_editor()
+        if answer == QMessageBox.StandardButton.Discard:
+            self.lac_editor.document().setModified(False)
+            return True
+        return False
+
+    def _restore_lac_editor_job_choice(self):
+        if not self._lac_editor_job_label:
+            return
+        self.lac_editor_job_combo.blockSignals(True)
+        self.lac_editor_job_combo.setCurrentText(self._lac_editor_job_label)
+        self.lac_editor_job_combo.blockSignals(False)
+
+    def _refresh_lac_editor(self, *, force: bool = False) -> bool:
+        if not hasattr(self, "lac_editor"):
+            return False
+        label = self.lac_editor_job_combo.currentText().strip()
+        if not label or not self.bridge_store.data:
+            if not self.lac_editor.document().isModified():
+                self.lac_editor.clear()
+                self.lac_editor.setEnabled(False)
+                self.lac_editor_path_label.setText("No current LAC profile loaded")
+                self.lac_editor_reload_button.setEnabled(False)
+                self.lac_editor_save_button.setEnabled(False)
+            return False
+        job = JOBS.get(label, label).casefold()
+        try:
+            path = self.bridge_store.profile_path(job)
+            changed_profile = self._lac_editor_path is not None and path != self._lac_editor_path
+            if path == self._lac_editor_path and not force:
+                return True
+            if (force or changed_profile) and not self._confirm_lac_editor_transition():
+                self._restore_lac_editor_job_choice()
+                return False
+            if not path.is_file():
+                raise FileNotFoundError(f"LAC profile does not exist: {path}")
+            source = path.read_text(encoding="utf-8")
+            self.lac_editor.blockSignals(True)
+            self.lac_editor.setPlainText(source)
+            self.lac_editor.document().setModified(False)
+            self.lac_editor.blockSignals(False)
+            self._lac_editor_path = path
+            self._lac_editor_source_hash = bridge_hash(source)
+            self._lac_editor_job_label = label
+            self.lac_editor.setEnabled(True)
+            self.lac_editor_reload_button.setEnabled(True)
+            self.lac_editor_save_button.setEnabled(False)
+            self.lac_editor_path_label.setText(str(path))
+            self.lac_editor_path_label.setToolTip(str(path))
+            self.lac_editor_status.setText(
+                f"{len(source.splitlines()):,} lines · UTF-8 · no unsaved changes"
+            )
+            self._set_lac_editor_tab_modified(False)
+            return True
+        except Exception as error:
+            if not self.lac_editor.document().isModified():
+                self.lac_editor.blockSignals(True)
+                self.lac_editor.clear()
+                self.lac_editor.document().setModified(False)
+                self.lac_editor.blockSignals(False)
+                self.lac_editor.setEnabled(False)
+                self._lac_editor_path = None
+                self._lac_editor_source_hash = ""
+                self.lac_editor_path_label.setText("LAC profile unavailable")
+                self._set_lac_editor_tab_modified(False)
+            self.lac_editor_status.setText(str(error))
+            self.lac_editor_reload_button.setEnabled(False)
+            self.lac_editor_save_button.setEnabled(False)
+            return False
+
+    def _lac_editor_disk_changed(self, path: Path):
+        if not hasattr(self, "lac_editor") or self._lac_editor_path != path:
+            return
+        if self.lac_editor.document().isModified():
+            self.lac_editor_status.setText(
+                "The LAC file changed on disk while this editor has unsaved changes. "
+                "Save is blocked by conflict protection; review and reload first."
+            )
+            return
+        self._refresh_lac_editor(force=True)
+
+    def _set_lac_editor_tab_modified(self, modified: bool):
+        if not hasattr(self, "tabs"):
+            return
+        for index in range(self.tabs.count()):
+            if self.tabs.widget(index) is self.lac_editor.parentWidget():
+                self.tabs.setTabText(index, "LAC Editor *" if modified else "LAC Editor")
+                break
+
+    def _lac_editor_modified_changed(self, modified: bool):
+        available = self._lac_editor_path is not None and self.lac_editor.isEnabled()
+        self.lac_editor_save_button.setEnabled(bool(modified and available))
+        self._set_lac_editor_tab_modified(bool(modified))
+        if modified:
+            self.lac_editor_status.setText(
+                "Unsaved changes · Ctrl+S saves atomically and creates a backup."
+            )
+
+    def save_lac_editor(self) -> bool:
+        path = getattr(self, "_lac_editor_path", None)
+        if path is None or not hasattr(self, "lac_editor"):
+            return False
+        try:
+            source = self.lac_editor.toPlainText()
+            backup, new_hash = write_profile_source(
+                path, source, expected_hash=self._lac_editor_source_hash,
+            )
+            self._lac_editor_source_hash = new_hash
+            self.lac_editor.document().setModified(False)
+            profile = self._profile_for_job()
+            if profile is not None:
+                profile["source_hash"] = new_hash
+            write_reload_request(self.bridge_store.bridge_path.parent, {
+                "schema_version": 3,
+                "character_key": (self.bridge_store.data.get("character") or {}).get("key"),
+                "job": JOBS.get(self._lac_editor_job_label, self._lac_editor_job_label).casefold(),
+                "profile": path.name,
+                "profile_hash": new_hash,
+                "set": "Manual LAC editor save",
+            })
+            self.lac_editor_status.setText(
+                f"Saved {path.name} · backup: {backup.name}"
+            )
+            self.statusBar().showMessage(
+                f"Saved {path.name}; backup created in {backup.parent.name}", 6000
+            )
+            return True
+        except Exception as error:
+            QMessageBox.critical(self, "Save LAC file", str(error))
+            return False
+
     def _profile_builder_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+        heading = QLabel("Create, inspect, and publish LAC starting sets")
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
         profile_controls = QHBoxLayout()
         self.profile_job_combo = QComboBox()
         self.profile_job_combo.currentTextChanged.connect(self._refresh_profile_jobs)
+        self.profile_job_combo.currentTextChanged.connect(self.refresh_gear_readiness)
+        self.profile_job_combo.currentTextChanged.connect(self._profile_builder_settings_changed)
         refresh = QPushButton("Refresh profile data")
         refresh.clicked.connect(self.refresh_bridge)
-        profile_controls.addWidget(QLabel("LuAshitacast job:"))
+        profile_controls.addWidget(QLabel("LAC job"))
         profile_controls.addWidget(self.profile_job_combo)
         profile_controls.addWidget(refresh)
         profile_controls.addStretch(1)
+        profile_help = QLabel("Base generation is quick and read-only. Combat improvement can run afterward.")
+        profile_help.setWordWrap(True)
+        profile_controls.addWidget(profile_help, 1)
         layout.addLayout(profile_controls)
 
-        builder = QGroupBox("One-button profile build")
-        builder_form = QFormLayout(builder)
+        builder = QGroupBox("Build settings")
+        builder_grid = QGridLayout(builder)
+        builder_grid.setContentsMargins(6, 7, 6, 6)
+        builder_grid.setHorizontalSpacing(6)
+        builder_grid.setVerticalSpacing(3)
         self.profile_source_accessible = QCheckBox("Accessible owned gear")
         self.profile_source_accessible.setChecked(True)
         self.profile_source_porter = QCheckBox("Porter / stored owned gear")
         self.profile_source_porter.setChecked(True)
         self.profile_source_transferable = QCheckBox("Transferable gear")
+        for checkbox in (
+            self.profile_source_accessible,
+            self.profile_source_porter,
+            self.profile_source_transferable,
+        ):
+            checkbox.toggled.connect(self.refresh_gear_readiness)
+            checkbox.toggled.connect(self._profile_builder_settings_changed)
         self.profile_builder_depth = QComboBox()
-        self.profile_builder_depth.addItems(["Fast", "Deep"])
+        self.profile_builder_depth.addItems(SEARCH_QUALITY_NAMES)
+        if hasattr(self, "dashboard_search_quality"):
+            self.profile_builder_depth.setCurrentText(self.dashboard_search_quality.currentText())
+            self.profile_builder_depth.currentTextChanged.connect(
+                lambda quality: self.dashboard_search_quality.setCurrentText(quality)
+            )
         self.profile_builder_depth.setToolTip(
-            "Fast: 1 seeded search run with 4 optimizer passes per combat section. "
-            "Deep: 3 seeded search runs with 10 passes each; slower but explores more local gear combinations."
+            "Fast: 6 searches x 4 passes. Standard: 10 x 10 with validated shared starting "
+            "knowledge. Deep: 12 x 10 independent searches with exact-result reuse only."
         )
         depth_help = QPushButton("?")
         depth_help.setFixedWidth(28)
@@ -5354,68 +8070,157 @@ class MainWindow(QMainWindow):
         self.profile_builder_tp.setValue(1000)
         self.profile_builder_buff = QComboBox()
         self.profile_builder_buff.addItems(self._all_buff_presets().keys())
-        self.profile_build_button = QPushButton("Build complete LAC profile")
+        self.profile_builder_buff.currentTextChanged.connect(self._profile_builder_settings_changed)
+        self.profile_builder_depth.currentTextChanged.connect(self._profile_builder_settings_changed)
+        self.profile_builder_tp.valueChanged.connect(self._profile_builder_settings_changed)
+        self.profile_builder_seed.textChanged.connect(self._profile_builder_settings_changed)
+        self.profile_build_button = QPushButton("Create starting sets")
+        self.profile_build_button.setObjectName("primaryAction")
         self.profile_build_button.clicked.connect(self.build_complete_lac_profile)
-        self.profile_optimize_all_button = QPushButton("Optimize all loadouts")
+        self.profile_optimize_all_button = QPushButton("Improve all combat sets")
         self.profile_optimize_all_button.setEnabled(False)
         self.profile_optimize_all_button.setToolTip(
-            "Optimize every generated section: direct-stat recipes are refreshed first, then the normal simulator/optimizer "
-            "runs sequentially for every TP and weapon-skill section. "
+            "Run the normal simulator/optimizer sequentially for every generated TP and weapon-skill section. "
             "Each section applies its own Apex enemy tier, TP target, metric, and PDT/MDT/DT floors. "
-            "Specialty stat recipes use explicit caps and priorities instead of an invented damage formula."
+            "Direct-stat utility and defense sets are already complete after base generation."
         )
         self.profile_optimize_all_button.clicked.connect(self.optimize_all_profile_builder_sections)
-        self.profile_optimize_direct_button = QPushButton("Optimize direct-stat sections")
-        self.profile_optimize_direct_button.setEnabled(False)
-        self.profile_optimize_direct_button.setToolTip(
-            "Re-run the bounded cap-aware stat optimizer for specialty sets such as Precast, SIR, Dt, Evasion, MEVA, Cure, and Preshot."
-        )
+        self.profile_optimize_direct_button = QPushButton("Refresh direct-stat sets")
+        self.profile_optimize_direct_button.setVisible(False)
         self.profile_optimize_direct_button.clicked.connect(self.optimize_direct_profile_builder_sections)
-        self.profile_publish_button = QPushButton("Review and publish generated profile")
+        self.profile_stop_button = QPushButton("Stop")
+        self.profile_stop_button.setEnabled(False)
+        self.profile_stop_button.clicked.connect(self.stop_optimizer)
+        self.profile_publish_button = QPushButton("Review changes and publish")
         self.profile_publish_button.setEnabled(False)
         self.profile_publish_button.clicked.connect(self.publish_profile_builder_result)
         self.profile_builder_status = QLabel(
-            "Builds armor-only managed sets. Weapon overlay slots stay fixed; aspirational gear is reported separately."
+            "No starting sets created."
         )
+        self.profile_builder_status.setObjectName("dashboardStatus")
         self.profile_builder_status.setWordWrap(True)
-        builder_form.addRow(self.profile_source_accessible)
-        builder_form.addRow(self.profile_source_porter)
-        builder_form.addRow(self.profile_source_transferable)
-        builder_form.addRow("Buff preset", self.profile_builder_buff)
-        builder_form.addRow("WS TP", self.profile_builder_tp)
-        builder_form.addRow("Search depth", depth_row)
-        builder_form.addRow("Batch seed", self.profile_builder_seed)
-        builder_form.addRow(self.profile_build_button)
-        builder_form.addRow(self.profile_optimize_all_button)
-        builder_form.addRow(self.profile_optimize_direct_button)
-        builder_form.addRow(self.profile_publish_button)
-        builder_form.addRow(self.profile_builder_status)
+        builder_grid.addWidget(self.profile_source_accessible, 0, 0)
+        builder_grid.addWidget(self.profile_source_porter, 0, 1)
+        builder_grid.addWidget(self.profile_source_transferable, 0, 2)
+        builder_grid.addWidget(QLabel("Buff preset"), 1, 0)
+        builder_grid.addWidget(self.profile_builder_buff, 2, 0)
+        builder_grid.addWidget(QLabel("WS TP"), 1, 1)
+        builder_grid.addWidget(self.profile_builder_tp, 2, 1)
+        builder_grid.addWidget(QLabel("Combat search"), 1, 2)
+        builder_grid.addLayout(depth_row, 2, 2)
+        self.profile_builder_seed.setVisible(False)
+        actions = QHBoxLayout()
+        actions.addWidget(self.profile_build_button)
+        actions.addWidget(self.profile_optimize_all_button)
+        actions.addWidget(self.profile_stop_button)
+        actions.addWidget(self.profile_publish_button)
+        actions.addStretch(1)
+        builder_grid.addLayout(actions, 3, 0, 1, 4)
+        builder_grid.addWidget(self.profile_builder_status, 4, 0, 1, 4)
+        for column in range(4):
+            builder_grid.setColumnStretch(column, 1)
         layout.addWidget(builder)
-        builder_note = QLabel(
-            "Build settings and publishing live here. The initial build uses bounded stat recipes; "
-            "use Run optimizer for this section or Optimize all loadouts "
-            "to replace TP and WS previews with simulator-backed results. Optimize direct-stat sections reruns the "
-            "cap-aware specialty recipes. Default, Acc, HighAcc, and Hybrid sections "
-            "automatically use their own enemy and defensive scenario; Hybrid uses PDT 50% and MDT 25%."
-        )
-        builder_note.setWordWrap(True)
-        layout.addWidget(builder_note)
-        generated = QGroupBox("Generated gear sets")
+
+        generated = QGroupBox("Generated set catalog")
         generated_layout = QVBoxLayout(generated)
-        self.profile_builder_results = QScrollArea()
-        self.profile_builder_results.setWidgetResizable(True)
-        self.profile_builder_results.setMinimumHeight(320)
-        self.profile_builder_results_widget = QWidget()
-        self.profile_builder_results_layout = QVBoxLayout(self.profile_builder_results_widget)
-        self.profile_builder_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        empty_results = QLabel(
-            "Press Build complete LAC profile to preview the generated sets here."
+        generated_layout.setContentsMargins(6, 7, 6, 6)
+        generated_layout.setSpacing(4)
+        catalog_toolbar = QHBoxLayout()
+        catalog_toolbar.setSpacing(5)
+        self.profile_builder_catalog_summary = QLabel("Create starting sets to populate the catalog.")
+        self.profile_builder_filter = QComboBox()
+        self.profile_builder_filter.addItems([
+            "All sets", "Needs improvement", "Warnings", "TP", "Weapon skill", "Utility / defense",
+        ])
+        self.profile_builder_filter.currentTextChanged.connect(self._populate_profile_builder_results)
+        catalog_toolbar.addWidget(self.profile_builder_catalog_summary, 1)
+        catalog_toolbar.addWidget(QLabel("Show"))
+        catalog_toolbar.addWidget(self.profile_builder_filter)
+        generated_layout.addLayout(catalog_toolbar)
+
+        catalog_splitter = ResponsiveCatalogSplitter()
+        catalog_splitter.setObjectName("profileCatalogSplitter")
+        self.profile_builder_table = QTableWidget(0, 4)
+        self.profile_builder_table.setHorizontalHeaderLabels(["Set", "Type", "Variant", "Status"])
+        self.profile_builder_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.profile_builder_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.profile_builder_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.profile_builder_table.setAlternatingRowColors(True)
+        self.profile_builder_table.setWordWrap(False)
+        self.profile_builder_table.setMinimumWidth(280)
+        self.profile_builder_table.setMinimumHeight(190)
+        self.profile_builder_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.profile_builder_table.verticalHeader().setVisible(False)
+        self.profile_builder_table.verticalHeader().setDefaultSectionSize(28)
+        self.profile_builder_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in (1, 2, 3):
+            self.profile_builder_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.profile_builder_table.currentCellChanged.connect(self._profile_builder_selection_changed)
+        catalog_splitter.addWidget(self.profile_builder_table)
+
+        detail = QWidget()
+        detail.setMinimumWidth(300)
+        detail.setMinimumHeight(240)
+        detail_layout = QVBoxLayout(detail)
+        detail_layout.setContentsMargins(6, 2, 2, 2)
+        detail_layout.setSpacing(4)
+        self.profile_builder_selected_title = QLabel("Select a generated set")
+        self.profile_builder_selected_title.setObjectName("sectionTitle")
+        self.profile_builder_selected_title.setWordWrap(True)
+        self.profile_builder_selected_title.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
         )
-        empty_results.setObjectName("sectionTitle")
-        empty_results.setWordWrap(True)
-        self.profile_builder_results_layout.addWidget(empty_results)
-        self.profile_builder_results.setWidget(self.profile_builder_results_widget)
-        generated_layout.addWidget(self.profile_builder_results)
+        self.profile_builder_selected_optimize = QPushButton("Improve selected set")
+        self.profile_builder_selected_optimize.setEnabled(False)
+        self.profile_builder_selected_optimize.clicked.connect(self._optimize_selected_profile_builder_set)
+        self.profile_builder_load_workspace = QPushButton("Load in Gear Workspace")
+        self.profile_builder_load_workspace.setEnabled(False)
+        self.profile_builder_load_workspace.clicked.connect(self.load_generated_set_into_workspace)
+        detail_layout.addWidget(self.profile_builder_selected_title)
+        detail_actions = QHBoxLayout()
+        detail_actions.setSpacing(5)
+        detail_actions.addWidget(self.profile_builder_load_workspace)
+        detail_actions.addWidget(self.profile_builder_selected_optimize)
+        detail_actions.addStretch(1)
+        detail_layout.addLayout(detail_actions)
+        self.profile_builder_selected_recipe = QLabel(
+            "The selected set's objective, scenario, warnings, and equipment appear here."
+        )
+        self.profile_builder_selected_recipe.setObjectName("profileRecipe")
+        self.profile_builder_selected_recipe.setTextFormat(Qt.TextFormat.RichText)
+        self.profile_builder_selected_recipe.setWordWrap(True)
+        detail_layout.addWidget(self.profile_builder_selected_recipe)
+        self.profile_builder_preview = ProfileGearPreview(self)
+        detail_layout.addWidget(self.profile_builder_preview)
+        self.profile_builder_alternative_row = QWidget()
+        alternative_row = QHBoxLayout(self.profile_builder_alternative_row)
+        alternative_row.setContentsMargins(0, 0, 0, 0)
+        alternative_row.setSpacing(5)
+        alternative_row.addWidget(QLabel("Optimizer choice"))
+        self.profile_builder_alternative_combo = QComboBox()
+        self.profile_builder_alternative_combo.setEnabled(False)
+        self.profile_builder_alternative_combo.setToolTip(
+            "After improvement, choose one of the three best legal optimizer sets for this catalog entry."
+        )
+        self.profile_builder_apply_alternative = QPushButton("Apply choice")
+        self.profile_builder_apply_alternative.setEnabled(False)
+        self.profile_builder_apply_alternative.clicked.connect(self.apply_profile_builder_alternative)
+        alternative_row.addWidget(self.profile_builder_alternative_combo, 1)
+        alternative_row.addWidget(self.profile_builder_apply_alternative)
+        self.profile_builder_alternative_row.setVisible(False)
+        detail_layout.addWidget(self.profile_builder_alternative_row)
+        self.profile_builder_selected_warning = QLabel()
+        self.profile_builder_selected_warning.setObjectName("profileWarning")
+        self.profile_builder_selected_warning.setWordWrap(True)
+        self.profile_builder_selected_warning.setVisible(False)
+        detail_layout.addWidget(self.profile_builder_selected_warning)
+        detail_layout.addStretch(1)
+        catalog_splitter.addWidget(detail)
+        catalog_splitter.setHandleWidth(4)
+        catalog_splitter.setStretchFactor(0, 0)
+        catalog_splitter.setStretchFactor(1, 1)
+        catalog_splitter.setSizes([430, 620])
+        generated_layout.addWidget(catalog_splitter, 1)
         layout.addWidget(generated, 1)
         return tab
 
@@ -5448,24 +8253,44 @@ class MainWindow(QMainWindow):
             transferable=self.profile_source_transferable.isChecked(),
         )
 
+    def _profile_builder_settings_changed(self, *_args):
+        build = getattr(self, "_profile_builder_result", None)
+        if not build or getattr(self, "_profile_builder_optimizer_active", None):
+            return
+        build["settings_stale"] = True
+        self.profile_builder_status.setText(
+            "Build settings changed. Create starting sets again before improving or publishing."
+        )
+        self._refresh_build_dashboard()
+
     def show_profile_builder_depth_help(self):
         QMessageBox.information(
             self,
             "Profile Builder search depth",
-            "Fast runs one deterministic optimizer search with four passes for each TP or WS section. "
-            "It is intended for a quick first catalog and usually finds strong local upgrades.\n\n"
-            "Deep runs three deterministic restarts with ten passes each. It costs substantially more time, "
-            "but starts from more paths and has a better chance of finding a different local optimum.\n\n"
-            "Both modes keep the selected weapon overlay locked and use the visible batch seed. "
+            "Fast runs six optimizer searches with four passes for each TP or WS section.\n\n"
+            "Standard runs ten searches with ten passes and may use one fully validated prior winner "
+            "as a starting path.\n\n"
+            "Deep runs twelve independent searches with ten passes. It can reuse only exact completed "
+            "calculations and never uses cross-character or cross-job starting knowledge.\n\n"
+            "All modes keep the selected weapon overlay locked and manage reproducibility automatically. "
             "Direct-stat specialty recipes such as Fast Cast, SIR, DT, Evasion, and MEVA do not use combat searches.",
         )
 
     def _clear_profile_builder_results(self):
-        while self.profile_builder_results_layout.count():
-            child = self.profile_builder_results_layout.takeAt(0)
-            widget = child.widget()
-            if widget is not None:
-                widget.deleteLater()
+        self.profile_builder_table.setRowCount(0)
+        self.profile_builder_selected_title.setText("Select a generated set")
+        self.profile_builder_selected_recipe.setText(
+            "The selected set's objective, scenario, warnings, and equipment appear here."
+        )
+        self.profile_builder_selected_warning.clear()
+        self.profile_builder_selected_warning.setVisible(False)
+        self.profile_builder_selected_optimize.setEnabled(False)
+        self.profile_builder_load_workspace.setEnabled(False)
+        self.profile_builder_alternative_combo.clear()
+        self.profile_builder_alternative_combo.setEnabled(False)
+        self.profile_builder_apply_alternative.setEnabled(False)
+        self.profile_builder_alternative_row.setVisible(False)
+        self.profile_builder_preview.set_gearset({})
 
     def _profile_builder_gear_tile(self, slot: str, item: dict) -> QWidget:
         tile = QFrame()
@@ -5486,171 +8311,412 @@ class MainWindow(QMainWindow):
         tile_layout.addWidget(name, 1)
         return tile
 
-    def _populate_profile_builder_results(self, build: dict):
-        """Render the completed catalog so the build is reviewable before publishing."""
-        self._clear_profile_builder_results()
-        sets = build.get("sets") or {}
-        overlays = build.get("overlay_items") or []
-        summary = QLabel(
-            f"{len(sets)} generated armor sets · {len(overlays)} fixed weapon overlays · "
-            f"seed {build.get('seed')} · runtime {float(build.get('runtime', 0.0)):.2f}s"
+    @staticmethod
+    def _profile_builder_set_status(details: dict) -> str:
+        if details.get("optimization_state") == "running":
+            return "Running"
+        if details.get("optimization_state") == "workspace":
+            status = "Workspace edited"
+        elif details.get("optimizer"):
+            status = "Optimized" if details.get("optimization_state") == "optimized" else "Starting set"
+        else:
+            status = "Ready"
+        has_warning = bool(details.get("direct_warnings")) or bool(
+            (details.get("simulation_defense") or {}).get("fallback")
         )
-        summary.setObjectName("sectionTitle")
-        summary.setWordWrap(True)
-        self.profile_builder_results_layout.addWidget(summary)
-        method_note = QLabel(
-            "Initial generation uses bounded direct-stat optimization for specialty recipes and fixed weapon overlays. "
-            "Use Optimize direct-stat sections to rerun those cap-aware recipes; use the combat controls on TP and WS "
-            "sections to replace their previews with simulator-backed winners."
-        )
-        method_note.setWordWrap(True)
-        method_note.setStyleSheet("color: #8a4b08;")
-        self.profile_builder_results_layout.addWidget(method_note)
-
-        if overlays:
-            overlay_box = QGroupBox("Fixed weapon overlays (kept ahead of armor)")
-            overlay_layout = QGridLayout(overlay_box)
-            overlay_layout.setColumnStretch(1, 1)
-            for row, overlay in enumerate(overlays):
-                label = QLabel(
-                    f"{overlay.get('name', 'Overlay')} · "
-                    f"{weapon_category(overlay)}"
-                )
-                label.setToolTip(
-                    "These slots remain controlled by the existing LuAshitacast weapon cycle."
-                )
-                overlay_layout.addWidget(label, row, 0)
-                slots = overlay.get("gearset") or {}
-                visible_slots = [
-                    slot for slot in ("main", "sub", "ranged", "ammo")
-                    if slot in slots and item_name(slots[slot]) != "Empty"
-                ]
-                for column, slot in enumerate(visible_slots, start=1):
-                    overlay_layout.addWidget(
-                        self._profile_builder_gear_tile(slot, slots[slot]), row, column
-                    )
-                if not visible_slots:
-                    overlay_layout.addWidget(QLabel("No weapon slots found"), row, 1)
-            self.profile_builder_results_layout.addWidget(overlay_box)
-
-        for set_name, equipment in sets.items():
-            set_box = QGroupBox(str(set_name))
-            set_layout = QGridLayout(set_box)
-            set_layout.setContentsMargins(6, 6, 6, 6)
-            details = build.get("recipe_details", {}).get(set_name, {})
-            objective = ", ".join(details.get("objective") or ()) or "No priority stats recorded"
-            caps = ", ".join(
-                f"{stat} {target:g}" for stat, target in details.get("caps") or ()
-            )
-            note_lines = [
-                f"Priority: {objective}"
-                + (f" · Required caps: {caps}" if caps else "")
-                + (" · Defensive reduction requirement" if details.get("require_damage_cap") else "")
-            ]
-            if details.get("simulation_summary"):
-                note_lines.append(f"Simulation: {details['simulation_summary']}")
-            optimizer_info = details.get("optimizer") or {}
-            if optimizer_info:
-                reductions = " · ".join(
-                    f"{label} ≥{int(optimizer_info.get(label.casefold(), 0) or 0)}%"
-                    for label in ("PDT", "MDT", "DT")
-                    if int(optimizer_info.get(label.casefold(), 0) or 0) > 0
-                ) or "no reduction floor"
-                note_lines.append(
-                    f"Optimizer scenario: {optimizer_info.get('enemy', 'current enemy')} · "
-                    f"{int(optimizer_info.get('tp', 1000) or 1000):,} TP · {reductions}"
-                )
-            defense = details.get("simulation_defense") or {}
-            actual = defense.get("actual") or {}
-            if actual:
-                note_lines.append(
-                    "Defense: " + " · ".join(
-                        f"{label} {_reduction_text(actual.get(label, 0))}"
-                        for label in ("PDT", "MDT", "DT")
-                    )
-                )
-            if defense.get("fallback"):
-                requested = defense.get("requested") or {}
-                requested_labels = [
-                    f"{label} {_reduction_text(requested.get(label, 0))}"
-                    for label in ("PDT", "MDT", "DT")
-                    if float(requested.get(label, 0) or 0) < 0
-                ]
-                note_lines.append(
-                    "⚠ Defensive minimum unavailable; using the best legal set"
-                    + (" (requested " + ", ".join(requested_labels) + ")." if requested_labels else ".")
-                )
-            recipe_note = QLabel("\n".join(note_lines))
-            recipe_note.setWordWrap(True)
-            recipe_note.setStyleSheet(
-                "color: #9a3412; font-weight: 600;" if defense.get("fallback") else "color: #555555;"
-            )
-            set_layout.addWidget(recipe_note, 0, 0, 1, 3)
-            if optimizer_info:
-                run_button = QPushButton("Run optimizer for this section")
-                run_button.setToolTip(
-                    "Load this starting set, keep its weapon overlay locked, and run the normal simulator/optimizer."
-                )
-                run_button.clicked.connect(
-                    lambda _checked=False, name=str(set_name):
-                    self.run_profile_builder_section_optimizer(name)
-                )
-                set_layout.addWidget(run_button, 0, 3)
-            else:
-                direct_label = QLabel(
-                    "Direct-stat optimized" if details.get("direct_optimized") else "Direct-stat specialty recipe"
-                )
-                direct_label.setStyleSheet("color: #8a4b08;")
-                direct_label.setToolTip(
-                    "This set uses a bounded stat/cap optimizer because it does not have a complete combat formula."
-                )
-                set_layout.addWidget(direct_label, 0, 3)
-            overlay = self._profile_builder_overlay_for_set(set_name, overlays)
-            if overlay:
-                overlay_items = overlay.get("gearset") or {}
-                specified_slots = set(overlay.get("specified_slots") or ())
-                weapon_box = QGroupBox(
-                    f"Fixed weapon setup · {overlay.get('name', 'overlay')}"
-                )
-                weapon_layout = QHBoxLayout(weapon_box)
-                weapon_layout.setContentsMargins(5, 3, 5, 3)
-                for slot in WEAPON_SLOTS:
-                    item = (
-                        overlay_items.get(slot, gear.Empty)
-                        if slot in specified_slots else gear.Empty
-                    )
-                    weapon_layout.addWidget(self._profile_builder_gear_tile(slot, item), 1)
-                set_layout.addWidget(weapon_box, 1, 0, 1, 4)
-            armor_row_offset = 2 if overlay else 1
-            for index, slot in enumerate(ARMOR_SLOTS):
-                row, column = divmod(index, 3)
-                set_layout.addWidget(
-                    self._profile_builder_gear_tile(slot, equipment.get(slot, gear.Empty)),
-                    row + armor_row_offset, column,
-                )
-            self.profile_builder_results_layout.addWidget(set_box)
-
-        if not sets:
-            self.profile_builder_results_layout.addWidget(QLabel("The build returned no sets."))
-        warnings = build.get("warnings") or []
-        if warnings:
-            warning_box = QGroupBox(f"Build warnings ({len(warnings)})")
-            warning_layout = QVBoxLayout(warning_box)
-            warning_text = QLabel("\n".join(f"• {warning}" for warning in warnings))
-            warning_text.setWordWrap(True)
-            warning_layout.addWidget(warning_text)
-            self.profile_builder_results_layout.addWidget(warning_box)
-        self.profile_builder_results_layout.addStretch(1)
+        return f"{status} · warning" if has_warning else status
 
     @staticmethod
-    def _profile_builder_overlay_for_set(set_name: str, overlays: list[dict]) -> dict | None:
+    def _profile_builder_set_label(set_name: str, details: dict) -> str:
+        """Translate internal LAC identifiers into scan-friendly catalog labels."""
+        section_type = str(details.get("section_type") or "Utility")
+        family = str(details.get("family") or set_name).replace("_", " ")
+        raw_variant = str(details.get("variant") or "Default")
+        variant = {
+            "Acc": "Accuracy",
+            "HighAcc": "High accuracy",
+            "Hybrid": "Hybrid · Default",
+            "HybridAcc": "Hybrid · Accuracy",
+            "HybridHighAcc": "Hybrid · High accuracy",
+        }.get(raw_variant, raw_variant)
+        if section_type == "TP":
+            label = f"TP · {variant}"
+            overlay = str(details.get("weapon_overlay") or "")
+            if overlay:
+                overlay = re.sub(r"^(Weapon|Gun|Range|Ranged)_?", "", overlay)
+                label += f" · {overlay}"
+            return label
+        if section_type == "Weapon skill":
+            label = f"{family} · {variant}"
+            overlay = str(details.get("weapon_overlay") or "")
+            if overlay:
+                overlay = re.sub(r"^(Weapon|Gun|Range|Ranged)_?", "", overlay)
+                label += f" · {overlay}"
+            return label
+        return family
+
+    def _profile_builder_filter_match(self, details: dict, status: str) -> bool:
+        selected = self.profile_builder_filter.currentText()
+        section_type = str(details.get("section_type") or "Utility")
+        has_warning = bool(details.get("direct_warnings")) or bool(
+            (details.get("simulation_defense") or {}).get("fallback")
+        )
+        if selected == "Needs improvement":
+            return bool(
+                details.get("optimizer")
+                and details.get("optimization_state") != "optimized"
+            )
+        if selected == "Warnings":
+            return has_warning
+        if selected in {"TP", "Weapon skill"}:
+            return section_type == selected
+        if selected == "Utility / defense":
+            return section_type in {"Utility", "Defense"}
+        return True
+
+    def _populate_profile_builder_results(self, build=None):
+        """Populate a scan-friendly catalog and one selected-set detail pane."""
+        if not isinstance(build, dict):
+            build = getattr(self, "_profile_builder_result", None) or {}
+        current_item = self.profile_builder_table.item(self.profile_builder_table.currentRow(), 0)
+        current_name = current_item.data(Qt.ItemDataRole.UserRole) if current_item else ""
+        self.profile_builder_table.blockSignals(True)
+        self.profile_builder_table.setRowCount(0)
+        sets = build.get("sets") or {}
+        overlays = build.get("overlay_items") or []
+        details_by_name = build.get("recipe_details") or {}
+        shown_names = []
+        for set_name, equipment in sets.items():
+            details = details_by_name.get(set_name, {})
+            status = self._profile_builder_set_status(details)
+            if not self._profile_builder_filter_match(details, status):
+                continue
+            row = self.profile_builder_table.rowCount()
+            self.profile_builder_table.insertRow(row)
+            values = (
+                self._profile_builder_set_label(str(set_name), details),
+                str(details.get("section_type") or "Utility"),
+                str(details.get("variant") or "Default"),
+                status,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, str(set_name))
+                if status.startswith("Optimized"):
+                    item.setForeground(QColor("#8cf3b2"))
+                elif status.startswith("Starting") and details.get("optimizer"):
+                    item.setForeground(QColor("#ffe2a8"))
+                if details.get("direct_warnings"):
+                    item.setToolTip("\n".join(details["direct_warnings"]))
+                self.profile_builder_table.setItem(row, column, item)
+            shown_names.append(str(set_name))
+        self.profile_builder_table.blockSignals(False)
+        warnings = len(build.get("warnings") or [])
+        self.profile_builder_catalog_summary.setText(
+            f"{len(sets)} sets · {len(overlays)} fixed weapon overlays · {warnings} warning(s) · "
+            "automatic reproducibility"
+            if sets else "Create starting sets to populate the catalog."
+        )
+        if shown_names:
+            selected_name = current_name if current_name in shown_names else shown_names[0]
+            selected_row = shown_names.index(selected_name)
+            self.profile_builder_table.selectRow(selected_row)
+            self.profile_builder_table.setCurrentCell(selected_row, 0)
+            self._show_profile_builder_set(selected_name)
+        else:
+            self._clear_profile_builder_results()
+            if sets:
+                self.profile_builder_catalog_summary.setText(
+                    f"No sets match {self.profile_builder_filter.currentText().lower()}."
+                )
+
+    def _profile_builder_selection_changed(self, current_row: int, _current_column: int,
+                                           _previous_row: int, _previous_column: int):
+        item = self.profile_builder_table.item(current_row, 0)
+        if item:
+            self._show_profile_builder_set(str(item.data(Qt.ItemDataRole.UserRole) or item.text()))
+
+    def _show_profile_builder_set(self, set_name: str):
+        build = getattr(self, "_profile_builder_result", None) or {}
+        equipment = (build.get("sets") or {}).get(set_name)
+        details = (build.get("recipe_details") or {}).get(set_name, {})
+        if equipment is None:
+            return
+        optimizer_info = details.get("optimizer") or {}
+        overlay = self._profile_builder_overlay_for_set(
+            set_name,
+            build.get("overlay_items") or [],
+            str(optimizer_info.get("ws_name") or ""),
+        )
+        self.profile_builder_preview.set_gearset(equipment, overlay)
+        status = self._profile_builder_set_status(details)
+        label = self._profile_builder_set_label(set_name, details)
+        self.profile_builder_selected_title.setText(f"{label} · {status}")
+        priorities = list(details.get("objective") or ())
+        priority_cells = []
+        for index, stat in enumerate(priorities, start=1):
+            priority_cells.append(
+                f"<td width='28' style='color:#e6c983'><b>{index:02d}</b></td>"
+                f"<td width='190' style='color:#f5f1ff'>{escape(str(stat))}</td>"
+            )
+        priority_rows = []
+        for index in range(0, len(priority_cells), 2):
+            cells = priority_cells[index:index + 2]
+            if len(cells) == 1:
+                cells.append("<td width='28'></td><td width='190'></td>")
+            priority_rows.append("<tr>" + "".join(cells) + "</tr>")
+        priority_html = (
+            "<table cellspacing='0' cellpadding='1'>" + "".join(priority_rows) + "</table>"
+            if priority_rows else "<span style='color:#918ca0'>No stat priorities recorded</span>"
+        )
+        sections = [
+            "<div style='margin-bottom:5px'><b style='color:#e6c983'>STAT PRIORITY</b>"
+            f"{priority_html}</div>"
+        ]
+        cap_results = list(details.get("cap_results") or ())
+        if cap_results:
+            cap_html = " &nbsp; ".join(
+                f"<b>{escape(str(row.get('stat') or 'Stat'))}</b> "
+                f"{float(row.get('reached') or 0):g} / {float(row.get('target') or 0):g}"
+                for row in cap_results
+            )
+            sections.append(f"<div><b>Modeled gear:</b> {cap_html}</div>")
+        if details.get("require_damage_cap"):
+            sections.append(
+                f"<div><b>Defense floor:</b> PDT {float(details.get('pdt_target') or 50):g}% &nbsp; "
+                f"MDT {float(details.get('mdt_target') or 50):g}%</div>"
+            )
+        if optimizer_info:
+            floors = ", ".join(
+                f"{label} {int(optimizer_info.get(label.casefold(), 0) or 0)}%"
+                for label in ("PDT", "MDT", "DT")
+                if int(optimizer_info.get(label.casefold(), 0) or 0) > 0
+            ) or "no defensive floor"
+            sections.append(
+                f"<div><b>Combat test:</b> {escape(str(optimizer_info.get('enemy', 'current enemy')))} &nbsp; "
+                f"{int(optimizer_info.get('tp', 1000) or 1000):,} TP &nbsp; {escape(floors)}</div>"
+            )
+        else:
+            sections.append("<div><b>Method:</b> direct stat/cap search</div>")
+        if details.get("simulation_summary"):
+            sections.append(f"<div><b>Result:</b> {escape(str(details['simulation_summary']))}</div>")
+        if overlay:
+            fixed = []
+            overlay_items = overlay.get("gearset") or {}
+            for slot in WEAPON_SLOTS:
+                item = overlay_items.get(slot, gear.Empty)
+                if item_name(item) != "Empty":
+                    fixed.append(f"{slot.upper()}: {item_name(item)}")
+            sections.append(
+                f"<div><b>Fixed weapon layer:</b> {escape(' · '.join(fixed) or str(overlay.get('name', 'profile overlay')))}</div>"
+            )
+        self.profile_builder_selected_recipe.setText("".join(sections))
+
+        warnings = list(details.get("direct_warnings") or [])
+        defense = details.get("simulation_defense") or {}
+        if defense.get("fallback"):
+            warnings.append("Defensive minimum was unavailable; this is the best legal set found.")
+        self.profile_builder_selected_warning.setText("\n".join(f"⚠ {warning}" for warning in warnings))
+        self.profile_builder_selected_warning.setVisible(bool(warnings))
+        self.profile_builder_selected_optimize.setProperty("set_name", set_name)
+        self.profile_builder_selected_optimize.setText(
+            "Improve selected set" if optimizer_info else "Refresh selected set"
+        )
+        running = bool(self.optimizer_thread and self.optimizer_thread.isRunning())
+        self.profile_builder_selected_optimize.setEnabled(not running)
+        self.profile_builder_load_workspace.setProperty("set_name", set_name)
+        self.profile_builder_load_workspace.setEnabled(not running)
+        alternatives = list(details.get("optimizer_alternatives") or ())[:3]
+        self.profile_builder_alternative_combo.blockSignals(True)
+        self.profile_builder_alternative_combo.clear()
+        for index, choice in enumerate(alternatives, start=1):
+            label = str(choice.get("label") or f"Optimizer set {index}")
+            metric = choice.get("metric")
+            if isinstance(metric, (int, float)):
+                label += f" · {float(metric):,.3f}"
+            self.profile_builder_alternative_combo.addItem(label, index - 1)
+        self.profile_builder_alternative_combo.blockSignals(False)
+        self.profile_builder_alternative_combo.setEnabled(bool(alternatives) and not running)
+        self.profile_builder_apply_alternative.setProperty("set_name", set_name)
+        self.profile_builder_apply_alternative.setEnabled(bool(alternatives) and not running)
+        self.profile_builder_alternative_row.setVisible(bool(alternatives))
+
+    def load_generated_set_into_workspace(self):
+        set_name = str(self.profile_builder_load_workspace.property("set_name") or "")
+        build = getattr(self, "_profile_builder_result", None) or {}
+        equipment = (build.get("sets") or {}).get(set_name)
+        details = (build.get("recipe_details") or {}).get(set_name, {})
+        if not set_name or not isinstance(equipment, dict):
+            return
+        combined = dict(equipment)
+        overlay = self._profile_builder_overlay_for_set(
+            set_name, build.get("overlay_items") or [],
+            str((details.get("optimizer") or {}).get("ws_name") or ""),
+        )
+        if overlay:
+            overlay_items = overlay.get("gearset") or {}
+            specified = set(overlay.get("specified_slots") or ())
+            combined.update({
+                slot: overlay_items[slot] for slot in WEAPON_SLOTS
+                if slot in specified and slot in overlay_items
+            })
+        self.quick_set.set_gearset(combined)
+        self._workspace_generated_set_name = set_name
+        self.workspace_generated_label.setText(f"Generated set: {set_name}")
+        self.workspace_update_generated_button.setEnabled(True)
+        self.workspace_mode.setCurrentText("Single Set")
+        self._select_tab("Gear Workspace")
+        self.statusBar().showMessage(
+            f"Loaded {set_name}. Edit it, then use Update generated set to return it to the catalog.",
+            7000,
+        )
+
+    def update_generated_set_from_workspace(self):
+        set_name = str(getattr(self, "_workspace_generated_set_name", "") or "")
+        build = getattr(self, "_profile_builder_result", None) or {}
+        if not set_name or set_name not in (build.get("sets") or {}):
+            self.workspace_update_generated_button.setEnabled(False)
+            return
+        build["sets"][set_name] = {
+            slot: self.quick_set.items.get(slot, gear.Empty) for slot in SET_SLOTS
+        }
+        details = (build.get("recipe_details") or {}).get(set_name, {})
+        details["workspace_edited"] = True
+        details["optimization_state"] = "workspace"
+        build["published"] = False
+        self._populate_profile_builder_results(build)
+        self.statusBar().showMessage(f"Updated generated set {set_name} from Gear Workspace", 6000)
+
+    def export_workspace_set_to_lac(self):
+        """Review and atomically write one workspace set to the active profile."""
+        profile = self._profile_for_job()
+        if profile is None or not self.bridge_store.data:
+            QMessageBox.information(self, "Export workspace set", "Load a character LAC profile first.")
+            return
+        editor = self.quick_set
+        source_label = "Single Set"
+        if self.workspace_mode.currentText() == "TP → WS Cycle":
+            source_label, accepted = QInputDialog.getItem(
+                self, "Export workspace set", "Workspace source:",
+                ["TP Set", "WS Set"], 0, False,
+            )
+            if not accepted:
+                return
+            editor = self.tp_set if source_label == "TP Set" else self.ws_set
+        default_name = str(getattr(self, "_workspace_generated_set_name", "") or "")
+        if not default_name:
+            default_name = "Tp_Default" if source_label == "TP Set" else "Ws_Default"
+        set_name, accepted = QInputDialog.getText(
+            self, "Export workspace set", "LAC set name:", text=default_name,
+        )
+        set_name = set_name.strip()
+        if not accepted or not set_name:
+            return
+        try:
+            job = str(profile.get("job") or "").upper()
+            path = self.bridge_store.profile_path(job)
+            source = path.read_text(encoding="utf-8")
+            exported = {set_name: {slot: editor.items.get(slot, gear.Empty) for slot in SLOTS}}
+            updated = prepare_managed_update(source, exported, add_wsdist_cycle=False)
+            diff = "".join(difflib.unified_diff(
+                source.splitlines(keepends=True), updated.splitlines(keepends=True),
+                fromfile=f"{path.name} (current)", tofile=f"{path.name} ({set_name})",
+            ))
+            if not diff:
+                QMessageBox.information(self, "Export workspace set", f"{set_name} already matches the workspace.")
+                return
+            if not self._confirm_profile_diff(f"Export {set_name} to LAC profile", diff):
+                return
+            backup, new_hash = write_managed_sets(
+                path, exported, expected_hash=str(profile.get("source_hash") or ""),
+                add_wsdist_cycle=False,
+            )
+            profile["source_hash"] = new_hash
+            build = getattr(self, "_profile_builder_result", None) or {}
+            if (build.get("profile") or {}) is profile:
+                build["profile"]["source_hash"] = new_hash
+            write_reload_request(self.bridge_store.bridge_path.parent, {
+                "schema_version": 3,
+                "character_key": (self.bridge_store.data.get("character") or {}).get("key"),
+                "job": job, "profile": path.name, "profile_hash": new_hash,
+                "set": set_name,
+            })
+            self._lac_editor_disk_changed(path)
+            QMessageBox.information(
+                self, "Export workspace set",
+                f"Exported {set_name} to {path.name}.\nBackup: {backup.name}",
+            )
+        except Exception as error:
+            QMessageBox.critical(self, "Export workspace set", str(error))
+
+    def apply_profile_builder_alternative(self):
+        set_name = str(self.profile_builder_apply_alternative.property("set_name") or "")
+        build = getattr(self, "_profile_builder_result", None) or {}
+        details = (build.get("recipe_details") or {}).get(set_name, {})
+        alternatives = list(details.get("optimizer_alternatives") or ())
+        index = int(self.profile_builder_alternative_combo.currentData() or 0)
+        if not set_name or not 0 <= index < len(alternatives):
+            return
+        gearset = alternatives[index].get("gearset") or {}
+        build["sets"][set_name] = {
+            slot: gearset.get(slot, gear.Empty) for slot in SET_SLOTS
+        }
+        details["selected_alternative"] = index
+        details["optimization_state"] = "optimized"
+        build["published"] = False
+        self._populate_profile_builder_results(build)
+        self.statusBar().showMessage(
+            f"Applied optimizer choice {index + 1} to {set_name}", 5000
+        )
+
+    def _optimize_selected_profile_builder_set(self):
+        set_name = str(self.profile_builder_selected_optimize.property("set_name") or "")
+        build = getattr(self, "_profile_builder_result", None) or {}
+        details = (build.get("recipe_details") or {}).get(set_name, {})
+        if not set_name or set_name not in (build.get("sets") or {}):
+            return
+        if details.get("optimizer"):
+            self.run_profile_builder_section_optimizer(set_name)
+        else:
+            self.optimize_direct_profile_builder_sections([set_name])
+
+    @staticmethod
+    def _profile_builder_overlay_for_set(set_name: str, overlays: list[dict],
+                                         ws_name: str = "") -> dict | None:
         """Select the matching fixed weapon cycle for a generated override."""
+        for overlay in overlays:
+            suffix = re.sub(r"^(Weapon|Gun|Range|Ranged)_?", "", str(overlay.get("name") or ""))
+            if suffix and str(set_name).endswith(f"_{suffix}"):
+                return overlay
+        required_skill = next(
+            (skill for skill, names in WS_BY_SKILL.items() if ws_name in names),
+            "",
+        )
+        if required_skill:
+            slot = "ranged" if required_skill in RANGED_WEAPON_TYPES else "main"
+            matching = [
+                overlay for overlay in overlays
+                if str((overlay.get("gearset") or {}).get(slot, {}).get("Skill Type") or "")
+                == required_skill
+            ]
+            if slot == "main":
+                matching.sort(key=lambda overlay: item_name(
+                    (overlay.get("gearset") or {}).get("ranged", gear.Empty)
+                ) != "Empty")
+            if matching:
+                return matching[0]
         for overlay in overlays:
             category = weapon_category(overlay)
             if str(set_name).endswith(f"_{category}"):
                 return overlay
-            suffix = re.sub(r"^(Weapon|Gun|Range|Ranged)_?", "", str(overlay.get("name") or ""))
-            if suffix and str(set_name).endswith(f"_{suffix}"):
+        # Bridge profile sets are name-sorted, so a specialized Weapon_Bow can
+        # appear before the normal melee cycle. For an unsuffixed TP/WS set,
+        # prefer the first layer without an equipped ranged weapon. This maps
+        # Malware's normal SAM sets to Weapon_Masamune instead of Weapon_Bow.
+        for overlay in overlays:
+            ranged = (overlay.get("gearset") or {}).get("ranged", gear.Empty)
+            if item_name(ranged) == "Empty":
                 return overlay
         return overlays[0] if overlays else None
 
@@ -5680,7 +8746,7 @@ class MainWindow(QMainWindow):
         preset_name = str(build.get("buff_preset") or self.profile_builder_buff.currentText())
         preset = self._all_buff_presets().get(preset_name)
         if preset:
-            self._apply_buff_state(preset)
+            self._apply_buff_state(preset, preserve_job_abilities=True)
         enemy_name = str(scenario.get("enemy") or "")
         if enemy_name in enemies.preset_enemies:
             self.enemy_combo.setCurrentText(enemy_name)
@@ -5693,7 +8759,9 @@ class MainWindow(QMainWindow):
         self.dt.setValue(int(scenario.get("dt") or 0))
         combined = dict(equipment)
         overlays = build.get("overlay_items") or []
-        overlay = self._profile_builder_overlay_for_set(set_name, overlays)
+        overlay = self._profile_builder_overlay_for_set(
+            set_name, overlays, str(optimizer_info.get("ws_name") or "")
+        )
         if overlay:
             # Armor-only generated sets intentionally inherit the first fixed
             # weapon cycle so the optimizer starts from the real profile setup.
@@ -5734,13 +8802,17 @@ class MainWindow(QMainWindow):
         if self.optimizer_thread and self.optimizer_thread.isRunning():
             QMessageBox.information(self, "Profile Builder", "Wait for the current optimizer run to finish.")
             return
-        if not self._configure_profile_builder_set_for_optimizer(set_name, show_optimizer=True):
+        if not self._configure_profile_builder_set_for_optimizer(set_name, show_optimizer=False):
             return
         self._profile_builder_optimizer_active = str(set_name)
         self._profile_builder_optimizer_queue = []
         self._profile_builder_optimizer_total = 1
         self._profile_builder_optimizer_completed_count = 0
         self._profile_builder_optimizer_batch_state = "running"
+        details = ((getattr(self, "_profile_builder_result", {}) or {}).get("recipe_details") or {}).get(set_name, {})
+        details["previous_optimization_state"] = details.get("optimization_state", "base")
+        details["optimization_state"] = "running"
+        self._populate_profile_builder_results()
         self._refresh_profile_builder_batch_status()
         self.profile_builder_status.setText(f"Simulating {set_name} through the optimizer...")
         self.run_optimizer()
@@ -5776,6 +8848,7 @@ class MainWindow(QMainWindow):
         job = str(build.get("job") or "").casefold()
         sources = self._profile_builder_sources()
         candidates = bridge_candidates(self.bridge_store, job, sources)
+        context = self._combat_context()
         payloads = self._profile_payloads()
         overlays = build.get("overlay_items") or []
         warnings = list(build.get("warnings") or [])
@@ -5790,10 +8863,15 @@ class MainWindow(QMainWindow):
                 set_name,
                 tuple(details.get("objective") or ()),
                 tuple(tuple(cap) for cap in details.get("caps") or ()),
-                bool(details.get("require_damage_cap")),
+                require_damage_cap=bool(details.get("require_damage_cap")),
+                pdt_target=float(details.get("pdt_target") or 50),
+                mdt_target=float(details.get("mdt_target") or 50),
             )
             pinned = pin_unmodeled_slots(payloads, set_name)
-            overlay = self._profile_builder_overlay_for_set(set_name, overlays)
+            overlay = self._profile_builder_overlay_for_set(
+                set_name, overlays,
+                str((details.get("optimizer") or {}).get("ws_name") or ""),
+            )
             weapons = {}
             if overlay:
                 overlay_items = overlay.get("gearset") or {}
@@ -5803,18 +8881,30 @@ class MainWindow(QMainWindow):
                     for slot in WEAPON_SLOTS
                     if slot in specified and slot in overlay_items
                 }
-            built = build_stat_set(set_name, candidates, recipe, weapons=weapons, pinned=pinned)
+            built = build_stat_set(
+                set_name,
+                candidates,
+                recipe,
+                weapons=weapons,
+                pinned=pinned,
+                starting=(build.get("sets") or {}).get(set_name),
+                buffs=context["buffs"],
+                abilities=context["abilities"],
+            )
             build["sets"][set_name] = built.equipment
             direct_warnings = [
                 f"{set_name}: {warning}" for warning in built.warnings
             ]
             details["direct_warnings"] = direct_warnings
+            details["cap_results"] = list(built.cap_results)
             details["direct_optimized"] = True
+            details["optimization_state"] = "ready"
             details["direct_runtime"] = time.perf_counter() - started
             warnings.extend(direct_warnings)
             completed += 1
         build["warnings"] = warnings
         build["sources"] = sources
+        build["published"] = False
         build["runtime"] = float(build.get("runtime") or 0.0) + (time.perf_counter() - started)
         self._populate_profile_builder_results(build)
         self.profile_builder_status.setText(
@@ -5825,38 +8915,36 @@ class MainWindow(QMainWindow):
         self.profile_optimize_direct_button.setEnabled(
             any(not details.get("optimizer") for details in details_by_name.values())
         )
+        self._refresh_build_dashboard()
 
     def optimize_all_profile_builder_sections(self):
         if self.optimizer_thread and self.optimizer_thread.isRunning():
             QMessageBox.information(self, "Profile Builder", "Wait for the current optimizer run to finish.")
             return
         build = getattr(self, "_profile_builder_result", None) or {}
-        direct_queue = [
-            str(name) for name, details in (build.get("recipe_details") or {}).items()
-            if not details.get("optimizer") and name in (build.get("sets") or {})
-        ]
-        if direct_queue:
-            self.optimize_direct_profile_builder_sections(direct_queue)
-            build = getattr(self, "_profile_builder_result", None) or build
         queue = [
             str(name) for name, details in (build.get("recipe_details") or {}).items()
-            if details.get("optimizer") and name in (build.get("sets") or {})
+            if details.get("optimizer")
+            and details.get("optimization_state") != "optimized"
+            and name in (build.get("sets") or {})
         ]
         if not queue:
-            if direct_queue:
-                self.profile_builder_status.setText(
-                    "All generated direct-stat sections were optimized. Review the refreshed preview before publishing."
-                )
-                return
-            QMessageBox.information(self, "Profile Builder", "Build the profile before optimizing its sections.")
+            message = (
+                "Every combat set is already improved. Select one set to run it again."
+                if build else "Generate base sets before improving combat sections."
+            )
+            QMessageBox.information(self, "Profile Builder", message)
             return
         self._profile_builder_optimizer_queue = queue
         self._profile_builder_optimizer_active = None
         self._profile_builder_optimizer_total = len(queue)
         self._profile_builder_optimizer_completed_count = 0
         self._profile_builder_optimizer_batch_state = "running"
+        self._profile_builder_optimizer_batch_started_at = time.monotonic()
+        self._optimizer_progress_samples = []
         self.profile_optimize_all_button.setEnabled(False)
         self.profile_optimize_direct_button.setEnabled(False)
+        self.profile_stop_button.setEnabled(True)
         self._refresh_profile_builder_batch_status()
         self._start_next_profile_builder_optimizer_section()
 
@@ -5867,6 +8955,7 @@ class MainWindow(QMainWindow):
             self._profile_builder_optimizer_batch_state = "complete"
             self.profile_optimize_all_button.setEnabled(True)
             self.profile_optimize_direct_button.setEnabled(True)
+            self.profile_stop_button.setEnabled(False)
             self.profile_builder_status.setText("All requested loadouts were optimized. Review the updated gear preview before publishing.")
             self._refresh_profile_builder_batch_status()
             return
@@ -5875,6 +8964,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._start_next_profile_builder_optimizer_section)
             return
         self._profile_builder_optimizer_active = set_name
+        details = ((getattr(self, "_profile_builder_result", {}) or {}).get("recipe_details") or {}).get(set_name, {})
+        details["previous_optimization_state"] = details.get("optimization_state", "base")
+        details["optimization_state"] = "running"
+        self._populate_profile_builder_results()
         total = len(queue) + 1
         self._refresh_profile_builder_batch_status()
         self.profile_builder_status.setText(
@@ -5893,7 +8986,7 @@ class MainWindow(QMainWindow):
         player = self.best_player
         if player is not None and set_name in (build.get("sets") or {}):
             build["sets"][set_name] = {
-                slot: player.gearset.get(slot, gear.Empty) for slot in ARMOR_SLOTS
+                slot: player.gearset.get(slot, gear.Empty) for slot in SET_SLOTS
             }
             details = (build.get("recipe_details") or {}).get(set_name)
             if details is not None:
@@ -5904,6 +8997,29 @@ class MainWindow(QMainWindow):
                     self.metric_combo.currentText(), ws_name,
                 )
                 details["simulation_defense"] = _optimizer_defense_summary(player)
+                alternatives = []
+                for index, result in enumerate(self.optimizer_top_results[:3], start=1):
+                    candidate = result.get("player")
+                    if candidate is None:
+                        candidate = (
+                            result.get("ws_player") if action == "weapon skill"
+                            else result.get("tp_player")
+                        )
+                    candidate_gearset = getattr(candidate, "gearset", None)
+                    if not isinstance(candidate_gearset, dict):
+                        continue
+                    alternatives.append({
+                        "label": str(result.get("label") or f"Top set {index}"),
+                        "metric": result.get("metric"),
+                        "seed": result.get("seed"),
+                        "gearset": {
+                            slot: candidate_gearset.get(slot, gear.Empty) for slot in SET_SLOTS
+                        },
+                    })
+                details["optimizer_alternatives"] = alternatives
+                details["optimization_state"] = "optimized"
+                details.pop("previous_optimization_state", None)
+                build["published"] = False
             self._populate_profile_builder_results(build)
         self._profile_builder_optimizer_active = None
         self._profile_builder_optimizer_completed_count = (
@@ -5915,6 +9031,7 @@ class MainWindow(QMainWindow):
         else:
             self.profile_optimize_all_button.setEnabled(True)
             self.profile_optimize_direct_button.setEnabled(True)
+            self.profile_stop_button.setEnabled(False)
             self._profile_builder_optimizer_batch_state = "complete"
             self.profile_builder_status.setText(
                 f"Optimizer result applied to {set_name}. Review the updated preview before publishing."
@@ -5922,14 +9039,20 @@ class MainWindow(QMainWindow):
             self._refresh_profile_builder_batch_status()
 
     def _cancel_profile_builder_optimizer_queue(self, reason: str):
-        if not getattr(self, "_profile_builder_optimizer_active", None):
+        active = getattr(self, "_profile_builder_optimizer_active", None)
+        if not active:
             return
+        details = ((getattr(self, "_profile_builder_result", {}) or {}).get("recipe_details") or {}).get(active, {})
+        if details.get("optimization_state") == "running":
+            details["optimization_state"] = details.pop("previous_optimization_state", "base")
         self._profile_builder_optimizer_active = None
         self._profile_builder_optimizer_queue = []
         self._profile_builder_optimizer_batch_state = "stopped"
         self.profile_optimize_all_button.setEnabled(True)
         self.profile_optimize_direct_button.setEnabled(True)
+        self.profile_stop_button.setEnabled(False)
         self.profile_builder_status.setText(f"Profile Builder optimization stopped: {reason}")
+        self._populate_profile_builder_results()
         self._refresh_profile_builder_batch_status()
 
     def build_complete_lac_profile(self):
@@ -5938,9 +9061,12 @@ class MainWindow(QMainWindow):
         profile = self._profile_for_job()
         if profile is None or not self.bridge_store.data:
             QMessageBox.information(self, "Profile Builder", "Load a character-specific LAC profile first.")
-            return
+            return False
         try:
             job = str(profile.get("job") or "").casefold()
+            job_name = next((name for name, code in JOBS.items() if code == job), "")
+            if job_name:
+                self.main_job.setCurrentText(job_name)
             payloads = self._profile_payloads()
             sources = self._profile_builder_sources()
             candidates = bridge_candidates(self.bridge_store, job, sources)
@@ -5949,116 +9075,25 @@ class MainWindow(QMainWindow):
             seed_text = self.profile_builder_seed.text().strip()
             batch_seed = int(seed_text) if seed_text else secrets.randbits(31)
             self.profile_builder_seed.setText(str(batch_seed))
-            names = {payload["name"] for payload in payloads}
-            recipes = profile_recipes(job, names)
-            recipes.extend((
-                # Combat armor is intentionally generated as armor-only. Weapon
-                # overlays remain LAC's source of truth and are never replaced.
-                ProfileRecipe("Tp_Default", ("DA", "TA", "QA", "Store TP", "Attack", "Accuracy")),
-                ProfileRecipe("Tp_Acc", ("Accuracy", "Attack", "Store TP", "DA", "TA")),
-                ProfileRecipe("Tp_HighAcc", ("Accuracy", "Store TP", "Attack", "DA")),
-                ProfileRecipe("Tp_Hybrid", ("DA", "TA", "Store TP", "Attack", "Accuracy"), require_damage_cap=True),
-            ))
-            overlays = weapon_overlays(payloads)
-            result = {}
-            warnings = []
-            category_results = {}
-            recipe_details = {}
-
-            def add_recipe(recipe):
-                """Build a base armor set plus only meaningful weapon overrides."""
-                recipe_details[recipe.name] = {
-                    "objective": recipe.objective,
-                    "caps": recipe.caps,
-                    "require_damage_cap": recipe.require_damage_cap,
-                }
-                pinned = pin_unmodeled_slots(payloads, recipe.name)
-                base = build_stat_set(recipe.name, candidates, recipe, pinned=pinned)
-                result[recipe.name] = base.equipment
-                recipe_details[recipe.name]["direct_warnings"] = [
-                    f"{recipe.name}: {warning}" for warning in base.warnings
-                ]
-                warnings.extend(recipe_details[recipe.name]["direct_warnings"])
-                for overlay in overlays:
-                    weapons = {
-                        slot: overlay["gearset"][slot]
-                        for slot in overlay.get("specified_slots", ()) if slot in {"main", "sub", "ranged", "ammo"}
-                    }
-                    built = build_stat_set(recipe.name, candidates, recipe, weapons=weapons, pinned=pinned)
-                    if built.equipment == base.equipment:
-                        continue
-                    category = weapon_category(overlay)
-                    category_name = f"{recipe.name}_{category}"
-                    prior = category_results.get(category_name)
-                    if prior is None:
-                        result[category_name] = built.equipment
-                        category_results[category_name] = built.equipment
-                        recipe_details[category_name] = dict(recipe_details[recipe.name])
-                    elif prior != built.equipment:
-                        suffix = re.sub(r"^(Weapon|Gun|Range|Ranged)_?", "", overlay["name"])
-                        result[f"{recipe.name}_{suffix}"] = built.equipment
-                        recipe_details[f"{recipe.name}_{suffix}"] = dict(recipe_details[recipe.name])
-                    category_detail = recipe_details.get(category_name)
-                    if category_detail is not None and prior is None:
-                        category_detail["direct_warnings"] = [
-                            f"{recipe.name}/{overlay['name']}: {warning}" for warning in built.warnings
-                        ]
-                        warnings.extend(category_detail["direct_warnings"])
-                    elif prior is not None and prior != built.equipment:
-                        exact_name = f"{recipe.name}_{re.sub(r'^(Weapon|Gun|Range|Ranged)_?', '', overlay['name'])}"
-                        exact_detail = recipe_details.get(exact_name)
-                        if exact_detail is not None:
-                            exact_detail["direct_warnings"] = [
-                                f"{recipe.name}/{overlay['name']}: {warning}" for warning in built.warnings
-                            ]
-                            warnings.extend(exact_detail["direct_warnings"])
-
-            combat_tp_names = {"Tp_Default", "Tp_Acc", "Tp_HighAcc", "Tp_Hybrid"}
-            for recipe in recipes:
-                add_recipe(recipe)
-                if recipe.name in combat_tp_names:
-                    for section_name, details in recipe_details.items():
-                        if section_name == recipe.name or section_name.startswith(f"{recipe.name}_"):
-                            details["optimizer"] = {
-                                "action": "attack round", "metric": "Time to WS",
-                                **optimizer_scenario(section_name, self.profile_builder_tp.value()),
-                            }
-            # Existing named WS handlers determine the WS family catalog. The
-            # same deterministic armor recipes are emitted for every supported
-            # variant; a later combat build can replace these through the
-            # normal optimizer without changing LAC structure.
-            ws_families = {}
-            for payload in payloads:
-                descriptor = payload.get("descriptor") or {}
-                family = str(descriptor.get("family") or "")
-                ws_name = str(descriptor.get("ws_name") or "")
-                if descriptor.get("role") == "ws" and family and ws_name:
-                    ws_families.setdefault(family, ws_name)
-            for family, ws_name in sorted(ws_families.items(), key=lambda item: item[0].casefold()):
-                for variant, objective, defensive in (
-                    ("Default", ("Weapon Skill Damage", "STR", "DEX", "VIT", "Attack", "Accuracy"), False),
-                    ("Acc", ("Accuracy", "Weapon Skill Accuracy", "Attack", "STR"), False),
-                    ("HighAcc", ("Accuracy", "Weapon Skill Accuracy", "Attack"), False),
-                    ("Hybrid", ("Weapon Skill Damage", "STR", "Attack", "Accuracy"), True),
-                ):
-                    set_name = f"{family}_{variant}"
-                    recipe = ProfileRecipe(set_name, objective, require_damage_cap=defensive)
-                    add_recipe(recipe)
-                    for section_name, details in recipe_details.items():
-                        if section_name == set_name or section_name.startswith(f"{set_name}_"):
-                            details["optimizer"] = {
-                                "action": "weapon skill", "ws_name": ws_name,
-                                "metric": "Damage dealt",
-                                **optimizer_scenario(section_name, self.profile_builder_tp.value()),
-                            }
+            preset = self._all_buff_presets().get(self.profile_builder_buff.currentText())
+            if preset:
+                self._apply_buff_state(preset, preserve_job_abilities=True)
+            context = self._combat_context()
+            catalog = build_profile_catalog(
+                job,
+                payloads,
+                candidates,
+                self.profile_builder_tp.value(),
+                buffs=context["buffs"],
+                abilities=context["abilities"],
+            )
             self._profile_builder_result = {
-                "sets": result, "seed": batch_seed, "job": job.upper(), "profile": profile,
-                "warnings": warnings, "overlays": [(item["name"], weapon_category(item)) for item in overlays],
-                "overlay_items": overlays,
-                "recipe_details": recipe_details,
+                **catalog,
+                "seed": batch_seed, "job": job.upper(), "profile": profile,
                 "runtime": time.perf_counter() - started,
                 "sources": sources,
                 "buff_preset": self.profile_builder_buff.currentText(),
+                "published": False,
             }
             self._profile_builder_optimizer_active = None
             self._profile_builder_optimizer_queue = []
@@ -6069,19 +9104,23 @@ class MainWindow(QMainWindow):
             self._populate_profile_builder_results(self._profile_builder_result)
             overlay_text = ", ".join(name for name, _category in self._profile_builder_result["overlays"]) or "no weapon overlays"
             self.profile_builder_status.setText(
-                f"Built {len(result)} managed armor sets in {self._profile_builder_result['runtime']:.2f}s "
-                f"using direct-stat recipes · seed {batch_seed} · fixed overlays: {overlay_text}. "
-                + (f"{len(warnings)} warning(s); review before publishing." if warnings else "Ready for review and atomic publish.")
+                f"Created {len(catalog['sets'])} owned-gear starting sets in "
+                f"{self._profile_builder_result['runtime']:.2f}s · fixed overlays: {overlay_text}. "
+                + (f"{len(catalog['warnings'])} warning(s); review highlighted sets." if catalog["warnings"] else
+                   "Ready to publish or optionally improve combat sets.")
             )
             self.profile_publish_button.setEnabled(True)
             self.profile_optimize_all_button.setEnabled(
-                any(details.get("optimizer") for details in recipe_details.values())
+                any(details.get("optimizer") for details in catalog["recipe_details"].values())
             )
             self.profile_optimize_direct_button.setEnabled(
-                any(not details.get("optimizer") for details in recipe_details.values())
+                any(not details.get("optimizer") for details in catalog["recipe_details"].values())
             )
+            self._refresh_build_dashboard()
+            return True
         except Exception as error:
             QMessageBox.critical(self, "Profile Builder", str(error))
+            return False
 
     def publish_profile_builder_result(self):
         build = getattr(self, "_profile_builder_result", None)
@@ -6108,11 +9147,14 @@ class MainWindow(QMainWindow):
                 "job": build["job"], "profile": path.name, "profile_hash": new_hash,
                 "set": "Profile Builder managed catalog", "seed": build["seed"],
             })
+            self._lac_editor_disk_changed(path)
             QMessageBox.information(
                 self, "Profile Builder",
                 f"Published {len(build['sets'])} managed armor sets to {path.name}.\nBackup: {backup.name}",
             )
             self.profile_publish_button.setEnabled(False)
+            build["published"] = True
+            self._refresh_build_dashboard()
         except Exception as error:
             QMessageBox.critical(self, "Profile Builder", str(error))
 
@@ -6143,6 +9185,8 @@ class MainWindow(QMainWindow):
         elif self.main_job.currentText() in jobs:
             self.profile_job_combo.setCurrentText(self.main_job.currentText())
         self.profile_job_combo.blockSignals(False)
+        if hasattr(self, "lac_editor_job_combo"):
+            self._refresh_lac_editor_jobs()
 
     def _profile_payloads(self) -> list[dict]:
         profile = self._profile_for_job()
@@ -6318,6 +9362,8 @@ class MainWindow(QMainWindow):
             if slot in item.get("Slots", ())
         )
         for item in items:
+            if slot == "ear1" and is_right_ear_only(item):
+                continue
             jobs = [str(value).lower() for value in item.get("Jobs", gear.all_jobs)]
             name = item_name(item)
             if job not in jobs or name in seen or _blacklist_matches(item, self.gear_blacklist):
@@ -6356,17 +9402,71 @@ class MainWindow(QMainWindow):
     def optimizer_items_for_slot(self, slot: str) -> list[dict]:
         # Transferable gear can be equipped from a normal picker; opted-in
         # aspirational gear is candidate-only and never enters Quick Look.
-        items = [*self.items_for_slot(slot), *self.aspirational_items_for_slot(slot)]
+        items = [*self.items_for_slot(slot), *self.porter_items_for_slot(slot),
+                 *self.aspirational_items_for_slot(slot)]
+        items = [
+            item for item in items
+            if not _blacklist_matches(item, self.gear_blacklist)
+        ]
+        unique = {}
+        for item in items:
+            unique.setdefault(item_name(item), item)
+        items = list(unique.values())
+        if slot == "ear1":
+            items = [item for item in items if not is_right_ear_only(item)]
         if not getattr(self, "exclude_under_119", None) or not self.exclude_under_119.isChecked():
             return items
-        if slot not in ITEM_LEVEL_FILTER_SLOTS:
-            return items
-        filtered = []
+        return [
+            item for item in items
+            if _item_level_candidate_allowed(slot, self._item_level(item), True)
+        ]
+
+    def blacklisted_optimizer_items_for_slot(self, slot: str) -> list[dict]:
+        """Return applicable blocked gear for the picker's read-only footer."""
+        job = JOBS[self.main_job.currentText()]
+        items = [*self.equipment.get(slot, [])]
+        items.extend(
+            item for item in self.shared_catalog.values()
+            if slot in item.get("Slots", ())
+        )
+        items.extend(self.porter_items_for_slot(slot))
+        items.extend(self.aspirational_items_for_slot(slot))
+        result = []
+        seen = set()
         for item in items:
-            level = self._item_level(item)
-            if level is None or level >= 119:
-                filtered.append(item)
-        return filtered
+            name = item_name(item)
+            jobs = [str(value).lower() for value in item.get("Jobs", gear.all_jobs)]
+            if (
+                name in seen
+                or job not in jobs
+                or (slot == "ear1" and is_right_ear_only(item))
+                or not _blacklist_matches(item, self.gear_blacklist)
+            ):
+                continue
+            seen.add(name)
+            result.append(item)
+        return sorted(result, key=lambda item: item_name(item).casefold())
+
+    def porter_items_for_slot(self, slot: str) -> list[dict]:
+        """Return selected-job Porter inventory as optimizer-only candidates."""
+        if slot not in SET_SLOTS or not self.bridge_store.data:
+            return []
+        if hasattr(self, "profile_source_porter") and not self.profile_source_porter.isChecked():
+            return []
+        job = JOBS[self.main_job.currentText()]
+        pools = bridge_candidates(
+            self.bridge_store, job,
+            GearSources(accessible=False, porter=True, transferable=False),
+        )
+        result = []
+        accessible_names = {item_name(item) for item in self.items_for_slot(slot)}
+        for source_item in pools.get(slot, ()):
+            if item_name(source_item) == "Empty" or item_name(source_item) in accessible_names:
+                continue
+            item = copy.deepcopy(source_item)
+            item["Porter Only"] = True
+            result.append(item)
+        return result
 
     def _refresh_locked_gear_options(self):
         for slot, locked_name in self.locked_gear.items():
@@ -6404,7 +9504,10 @@ class MainWindow(QMainWindow):
                     self.candidates[slot].add(fallback if fallback in valid else next(iter(valid), "Empty"))
             self._update_candidate_button(slot)
         self._refresh_locked_gear_options()
-        self.statusBar().showMessage("Removed optimizer candidates under item level 119 where metadata was available.", 5000)
+        self.statusBar().showMessage(
+            "Deselected candidates below item level 119 in head, body, hands, legs, and feet.",
+            5000,
+        )
 
     def _shared_gear_changed(self, enabled: bool):
         self._refresh_shared_gear()
@@ -6439,7 +9542,7 @@ class MainWindow(QMainWindow):
                 if not item.get("Eligible") or not item.get("Transferable", False):
                     continue
                 name = item_name(item)
-                if name in known or _blacklist_matches(item, self.gear_blacklist):
+                if name in known:
                     continue
                 shared = copy.deepcopy(item)
                 shared["Shared Only"] = True
@@ -6556,6 +9659,10 @@ class MainWindow(QMainWindow):
         dialog = CandidatePicker(
             slot, self.optimizer_items_for_slot(slot), self.candidates[slot], self.icons,
             self.locked_gear.get(slot, ""), self,
+            blacklisted_items=self.blacklisted_optimizer_items_for_slot(slot),
+        )
+        dialog.blacklist_requested.connect(
+            lambda name: self.set_optimizer_item_blacklisted(name, True)
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.candidates[slot] = dialog.selected_names
@@ -6570,7 +9677,21 @@ class MainWindow(QMainWindow):
 
     def _update_candidate_button(self, slot: str):
         button = self.candidate_buttons[slot]
-        button.setText(f"{len(self.candidates[slot])} selected")
+        locked_name = str(self.locked_gear.get(slot) or "")
+        button.setProperty("locked", bool(locked_name))
+        button.setText(
+            f"LOCKED · {locked_name}" if locked_name
+            else f"{len(self.candidates[slot])} selected"
+        )
+        if hasattr(self, "candidate_cards"):
+            card = self.candidate_cards[slot]
+            label = self.candidate_slot_labels[slot]
+            card.setProperty("locked", bool(locked_name))
+            label.setProperty("locked", bool(locked_name))
+            label.setText(f"{slot.upper()} · LOCKED" if locked_name else slot.upper())
+            for widget in (card, label, button):
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
         if hasattr(self, "candidate_detail_labels"):
             player_item = self.quick_set.items.get(slot, gear.Empty)
             button.setIcon(self.icons.icon(player_item))
@@ -6581,8 +9702,8 @@ class MainWindow(QMainWindow):
                 detail, Qt.TextElideMode.ElideRight, width
             ))
             tooltip = item_tooltip(player_item)
-            if self.locked_gear.get(slot):
-                tooltip += f"\nLocked: {self.locked_gear[slot]}"
+            if locked_name:
+                tooltip += f"\nLOCKED: {locked_name}"
             detail_label.setToolTip(tooltip)
             button.setToolTip("Choose optimizer candidates for this slot.\n" + tooltip)
 
@@ -6594,6 +9715,15 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, "candidate_buttons"):
             QTimer.singleShot(0, self._refresh_candidate_buttons)
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is getattr(self, "optimizer_status_dialog", None)
+            and event.type() == QEvent.Type.Resize
+            and hasattr(self, "_optimizer_run_cards")
+        ):
+            QTimer.singleShot(0, self._reflow_optimizer_run_cards)
+        return super().eventFilter(watched, event)
 
     def choose_bridge_root(self):
         initial = self.settings.value("ashita_root", "", str)
@@ -6646,6 +9776,16 @@ class MainWindow(QMainWindow):
             self.best_player = None
             self.best_tp_player = None
             self.best_ws_player = None
+            self._profile_builder_result = None
+            self._profile_builder_optimizer_active = None
+            self._profile_builder_optimizer_queue = []
+            self._profile_builder_optimizer_total = 0
+            self._profile_builder_optimizer_completed_count = 0
+            self._profile_builder_optimizer_batch_state = ""
+            if hasattr(self, "profile_builder_table"):
+                self._clear_profile_builder_results()
+                self.profile_builder_catalog_summary.setText("Create starting sets to populate the catalog.")
+                self.profile_builder_status.setText("No starting sets created for this refreshed profile.")
             self._last_completed_optimizer_action = ""
             self.icons.set_bridge_icon_dir(path.parent / "icons32")
             self.icons.set_bridge_icon_dirs(
@@ -6673,7 +9813,7 @@ class MainWindow(QMainWindow):
             self.refresh_results_history()
             self._refresh_favorite_character_button()
             self._refresh_weapon_favorites()
-            self._refresh_build_dashboard()
+            self.refresh_gear_readiness()
             self.statusBar().showMessage(f"Loaded {label}", 5000)
         except Exception as error:
             QMessageBox.critical(self, "Character bridge", str(error))
@@ -6724,7 +9864,7 @@ class MainWindow(QMainWindow):
         if not storage_key:
             return
         state = {
-            "version": 1,
+            "version": 2,
             "player": {
                 "main_job": self.main_job.currentText(),
                 "sub_job": self.sub_job.currentText(),
@@ -6754,6 +9894,8 @@ class MainWindow(QMainWindow):
                 "substat_stats": [combo.currentText() for combo in self.substat_combos],
                 "pdt": self.pdt.value(), "mdt": self.mdt.value(), "dt": self.dt.value(),
                 "combined_defense_both": self.combined_defense_both.isChecked(),
+                "quality": self.optimizer_quality.currentText(),
+                "passes": self.optimizer_passes.value(),
                 "restarts": self.restarts.value(), "workers": self.workers.value(),
                 "parallel_mode": self.parallel_mode.currentText(), "seed": self.seed.text(),
                 "prune_candidates": self.prune_candidates.isChecked(),
@@ -6788,6 +9930,7 @@ class MainWindow(QMainWindow):
             return
         if not isinstance(state, dict):
             return
+        legacy_search_names = int(state.get("version", 1) or 1) < 2
         player = state.get("player") if isinstance(state.get("player"), dict) else {}
         self._set_combo_value(self.main_job, player.get("main_job"), self.main_job.currentText())
         self._set_combo_value(self.sub_job, player.get("sub_job"), self.sub_job.currentText())
@@ -6835,13 +9978,21 @@ class MainWindow(QMainWindow):
             ))
         except (TypeError, ValueError):
             pass
-        self._set_combo_value(self.tradeoff_depth, optimizer.get("tradeoff_depth"), "Fast")
+        saved_tradeoff = optimizer.get("tradeoff_depth")
+        if legacy_search_names and saved_tradeoff == "Deep":
+            saved_tradeoff = "Standard"
+        self._set_combo_value(self.tradeoff_depth, saved_tradeoff, "Fast")
         saved_substats = optimizer.get("substat_stats")
         if isinstance(saved_substats, list):
             for combo, value in zip(self.substat_combos, saved_substats):
                 self._set_combo_value(combo, value, "None")
         self._set_combo_value(self.parallel_mode, optimizer.get("parallel_mode"), self.parallel_mode.currentText())
-        for control, key in ((self.pdt, "pdt"), (self.mdt, "mdt"), (self.dt, "dt"), (self.restarts, "restarts"), (self.workers, "workers")):
+        saved_quality = _normalized_search_quality(
+            optimizer.get("quality", "Fast"), legacy_deep=legacy_search_names
+        )
+        self.optimizer_quality.setCurrentText(saved_quality)
+        self._apply_optimizer_quality(saved_quality)
+        for control, key in ((self.pdt, "pdt"), (self.mdt, "mdt"), (self.dt, "dt"), (self.restarts, "restarts"), (self.optimizer_passes, "passes"), (self.workers, "workers")):
             try:
                 control.setValue(int(optimizer.get(key, control.value())))
             except (TypeError, ValueError):
@@ -6885,7 +10036,10 @@ class MainWindow(QMainWindow):
         self.profile_source_porter.setChecked(bool(report.get("builder_porter", True)))
         self.profile_source_transferable.setChecked(bool(report.get("builder_transferable", False)))
         self._set_combo_value(self.profile_builder_buff, report.get("builder_buff"), self.profile_builder_buff.currentText())
-        self._set_combo_value(self.profile_builder_depth, report.get("builder_depth"), "Fast")
+        builder_depth = _normalized_search_quality(
+            report.get("builder_depth", "Fast"), legacy_deep=legacy_search_names
+        )
+        self._set_combo_value(self.profile_builder_depth, builder_depth, "Fast")
         try:
             self.profile_builder_tp.setValue(int(report.get("builder_tp", self.profile_builder_tp.value())))
         except (TypeError, ValueError):
@@ -6915,14 +10069,29 @@ class MainWindow(QMainWindow):
                 self.tabs.setCurrentIndex(0)
 
     def closeEvent(self, event):
-        running_threads = [
+        if (
+            hasattr(self, "lac_editor")
+            and self.lac_editor.document().isModified()
+            and not self._confirm_lac_editor_transition()
+        ):
+            event.ignore()
+            return
+        thread_candidates = [
             thread for thread in (
                 self.optimizer_thread, self.overnight_thread,
                 getattr(self, "simulation_thread", None),
                 getattr(self, "plot_thread", None),
+                getattr(self, "quick_distribution_thread", None),
             )
-            if thread is not None and thread.isRunning()
         ]
+        thread_candidates.extend(getattr(self, "_quick_distribution_threads", ()))
+        running_threads = []
+        seen_threads = set()
+        for thread in thread_candidates:
+            if thread is None or id(thread) in seen_threads or not thread.isRunning():
+                continue
+            seen_threads.add(id(thread))
+            running_threads.append(thread)
         for thread in running_threads:
             request_stop = getattr(thread, "request_stop", None)
             if request_stop is not None:
@@ -7079,6 +10248,21 @@ class MainWindow(QMainWindow):
         enemy = _report_enemy(context["enemy"], context["debuffs"])
         return player, enemy, buffs, abilities
 
+    def _reference_enemy_cases(self, enabled: bool = True) -> list[tuple[str, object]]:
+        """Build the Profile Builder reference enemies with the active debuffs."""
+        if not enabled:
+            return []
+        context = self._combat_context()
+        current_name = self.enemy_combo.currentText().strip()
+        cases = []
+        for name in _reference_enemy_names(current_name, True):
+            if name == current_name:
+                continue
+            preset = enemies.preset_enemies.get(name)
+            if preset is not None:
+                cases.append((name, _report_enemy(dict(preset), context["debuffs"])))
+        return cases
+
     def _cache_lookup(self, kind: str, request: dict) -> tuple[str | None, dict | None]:
         """Return a saved deterministic result only while caching is enabled."""
         if not self.cache_enabled:
@@ -7095,6 +10279,26 @@ class MainWindow(QMainWindow):
         ):
             self._refresh_cache_status()
 
+    def _saved_work_choice(self) -> str:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Previous calculation available")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setText("Matching optimizer work is already saved.")
+        dialog.setInformativeText(
+            "Reuse it immediately, or explore fresh independent search paths?"
+        )
+        reuse = dialog.addButton("Reuse saved work", QMessageBox.ButtonRole.AcceptRole)
+        fresh = dialog.addButton("Explore fresh paths", QMessageBox.ButtonRole.ActionRole)
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(reuse)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is reuse:
+            return "reuse"
+        if clicked is fresh:
+            return "fresh"
+        return "cancel"
+
     @staticmethod
     def _cache_age_text(created_at: float) -> str:
         return MainWindow._format_duration(max(0, time.time() - created_at)) + " ago"
@@ -7108,11 +10312,88 @@ class MainWindow(QMainWindow):
 
     def _optimizer_cache_request(self, mode: str, args: tuple, kwargs: dict) -> dict:
         """Fingerprint only the effective post-filter/post-prune engine inputs."""
+        semantic_kwargs = dict(kwargs)
+        if semantic_kwargs.get("parallel_mode", "search_runs") != "single_run":
+            semantic_kwargs.pop("workers", None)
         return {
             "operation": mode,
             "engine_args": args,
-            "engine_kwargs": kwargs,
+            "engine_kwargs": semantic_kwargs,
         }
+
+    @staticmethod
+    def _restart_cache_request(args: tuple, kwargs: dict, index: int, seed: int,
+                               warm_starting_gearset: dict | None = None) -> dict:
+        semantic_kwargs = {
+            key: value for key, value in kwargs.items()
+            if key not in {
+                "workers", "restarts", "seed", "return_details", "return_top_results",
+                "cached_restarts", "restart_callback", "progress_callback",
+                "progress_queue", "stop_event", "warm_starting_gearset",
+            }
+        }
+        return {
+            "operation": "optimizer-restart",
+            "engine_args": args,
+            "engine_kwargs": semantic_kwargs,
+            "index": int(index),
+            "seed": int(seed),
+            "warm_start": _gearset_payload(warm_starting_gearset) if warm_starting_gearset else None,
+        }
+
+    @staticmethod
+    def _serialize_restart_result(result: dict, warm_start: bool = False) -> dict:
+        saved = _serialize_top_results([result])[0]
+        saved["warm_start"] = bool(warm_start)
+        saved.pop("log", None)
+        return saved
+
+    @staticmethod
+    def _restore_restart_result(payload: dict, context: dict) -> dict:
+        restored = _restore_top_results([payload], context)[0]
+        restored.setdefault("log", "")
+        return restored
+
+    @staticmethod
+    def _item_cache_identity(item: dict) -> str:
+        return canonical_json(item if isinstance(item, dict) else gear.Empty)
+
+    def _validated_shared_optimizer_start(self, check_gear: dict, starting_gearset: dict) -> dict | None:
+        """Return one fully legal saved winner; partial or approximate sets are rejected."""
+        candidate_lookup = {
+            slot: {
+                self._item_cache_identity(item): item
+                for item in check_gear.get(slot, ())
+                if isinstance(item, dict)
+            }
+            for slot in SLOTS
+        }
+        expected_weapons = {
+            slot: self._item_cache_identity(starting_gearset.get(slot, gear.Empty))
+            for slot in WEAPON_SLOTS
+        }
+        records = self.result_history.list("", include_all_characters=True)
+        for record in records:
+            if record.get("kind") != "optimizer" or record.get("stale") or record.get("corrupt"):
+                continue
+            saved = ((record.get("payload") or {}).get("gearsets") or {}).get("single")
+            if not isinstance(saved, dict):
+                continue
+            resolved = {}
+            valid = True
+            for slot in SLOTS:
+                identity = self._item_cache_identity(saved.get(slot, gear.Empty))
+                if slot in WEAPON_SLOTS and identity != expected_weapons[slot]:
+                    valid = False
+                    break
+                item = candidate_lookup.get(slot, {}).get(identity)
+                if item is None:
+                    valid = False
+                    break
+                resolved[slot] = item
+            if valid:
+                return resolved
+        return None
 
     @staticmethod
     def _optimizer_cache_summary(mode: str, args: tuple, kwargs: dict) -> dict:
@@ -7275,6 +10556,7 @@ class MainWindow(QMainWindow):
                 self._quick_lookup_cache.move_to_end(cache_key)
                 saved = cached
                 self.result_label.setText(str(saved["text"]))
+                self._render_quick_result_graph(action, saved.get("output"))
                 self._render_quick_stats(player, enemy)
                 self._last_quick_result = {
                     "action": action, "output": _json_value(saved.get("output")),
@@ -7283,6 +10565,10 @@ class MainWindow(QMainWindow):
                         action=action, ws_name=self.ws_combo.currentText(), tp=self.tp_value.value(),
                     ),
                 }
+                if action == "ws":
+                    self._start_quick_ws_distribution(player, enemy)
+                elif action == "attack":
+                    self._start_quick_dps_comparison(player, enemy)
                 self.statusBar().showMessage("Quick Look restored from this session's cache", 4000)
                 return
             started_at = time.monotonic()
@@ -7292,6 +10578,7 @@ class MainWindow(QMainWindow):
                 spell_name=spell_name, spell_type=spell_type,
             )
             self.result_label.setText(text)
+            self._render_quick_result_graph(action, output)
             self._render_quick_stats(player, enemy)
             self._last_quick_result = {
                 "action": action, "output": _json_value(output), "text": text,
@@ -7300,12 +10587,157 @@ class MainWindow(QMainWindow):
                     action=action, ws_name=self.ws_combo.currentText(), tp=self.tp_value.value(),
                 ),
             }
+            if action == "ws":
+                self._start_quick_ws_distribution(player, enemy)
+            elif action == "attack":
+                self._start_quick_dps_comparison(player, enemy)
             self._quick_lookup_cache[cache_key] = {"text": text, "output": output}
             self._quick_lookup_cache.move_to_end(cache_key)
             while len(self._quick_lookup_cache) > self._quick_lookup_cache_limit:
                 self._quick_lookup_cache.popitem(last=False)
         except Exception as error:
             QMessageBox.critical(self, "Evaluation failed", str(error))
+
+    def _quick_reference_toggle(self, enabled: bool):
+        """Rebuild the active Quick Look graph when reference comparison changes."""
+        action = str((self._last_quick_result or {}).get("action") or "")
+        if action not in {"attack", "ws"}:
+            return
+        try:
+            player, enemy, _buffs, _abilities = self._context()
+            if action == "attack":
+                self._start_quick_dps_comparison(player, enemy)
+            else:
+                self._start_quick_ws_distribution(player, enemy)
+        except Exception as error:
+            self.statusBar().showMessage(f"Reference graph update failed: {error}", 5000)
+
+    def _start_quick_dps_comparison(self, player, enemy):
+        """Run the two-hour cycle for Quick Look's active and reference enemies."""
+        if self._last_quick_result is not None:
+            self._last_quick_result.pop("dps_summary", None)
+        previous = getattr(self, "quick_dps_thread", None)
+        if previous is not None and previous.isRunning():
+            previous.request_stop()
+        ws_name = self.ws_combo.currentText().strip()
+        if not ws_name or ws_name == "None":
+            self._render_quick_result_graph("attack", self._last_quick_result.get("output") if self._last_quick_result else None)
+            return
+        thread = SimulationThread(
+            player, player, enemy, self.tp_value.value(), ws_name, self._ws_type(),
+            self._simulation_seed(),
+            reference_enemies=self._reference_enemy_cases(
+                self.quick_reference_checkbox.isChecked()
+            ),
+            parent=self,
+        )
+        self.quick_dps_thread = thread
+        thread.completed.connect(
+            lambda summary, worker=thread: self._quick_dps_comparison_done(worker, summary)
+        )
+        thread.failed.connect(
+            lambda message, worker=thread: self._quick_dps_comparison_failed(worker, message)
+        )
+        thread.stopped.connect(
+            lambda message, worker=thread: self._quick_dps_comparison_failed(worker, message)
+        )
+        self.statusBar().showMessage("Building two-hour DPS comparison graph...", 4000)
+        self._render_quick_result_graph(
+            "attack", self._last_quick_result.get("output") if self._last_quick_result else None
+        )
+        thread.start()
+
+    def _quick_dps_comparison_done(self, worker, summary: dict):
+        if worker is not getattr(self, "quick_dps_thread", None):
+            return
+        if not self._render_dps_comparison_graph(
+            self.quick_result_figure, self.quick_result_canvas, summary,
+            self.enemy_combo.currentText(), title="Two-hour DPS comparison",
+        ):
+            self._quick_dps_comparison_failed(worker, "The DPS comparison returned no valid series.")
+            return
+        if self._last_quick_result is not None:
+            self._last_quick_result["dps_summary"] = _json_value(summary)
+        self.statusBar().showMessage("Two-hour DPS comparison graph updated", 5000)
+
+    def _quick_dps_comparison_failed(self, worker, message: str):
+        if worker is not getattr(self, "quick_dps_thread", None):
+            return
+        self._render_quick_result_graph(
+            "attack", self._last_quick_result.get("output") if self._last_quick_result else None
+        )
+        self.statusBar().showMessage(f"DPS comparison failed: {message}", 5000)
+
+    def _start_quick_ws_distribution(self, player, enemy):
+        """Replace the deterministic WS bars with the requested 20k sample graph."""
+        previous = getattr(self, "quick_distribution_thread", None)
+        if previous is not None and previous.isRunning():
+            previous.request_stop()
+        ws_name = self.ws_combo.currentText().strip()
+        if not ws_name or ws_name == "None":
+            return
+        seed = self._simulation_seed()
+        thread = PlotThread(
+            player, enemy, ws_name, self.tp_value.value(), self._ws_type(),
+            samples=20000, seed=seed,
+            reference_enemies=self._reference_enemy_cases(
+                self.quick_reference_checkbox.isChecked()
+            ), parent=self,
+        )
+        self.quick_distribution_thread = thread
+        self._quick_distribution_threads.append(thread)
+        thread.finished.connect(
+            lambda worker=thread: self._discard_quick_distribution_thread(worker)
+        )
+        thread.completed.connect(
+            lambda distribution, worker=thread: self._quick_ws_distribution_done(worker, distribution)
+        )
+        thread.failed.connect(
+            lambda message, worker=thread: self._quick_ws_distribution_failed(worker, message)
+        )
+        thread.stopped.connect(
+            lambda _message, worker=thread: self._quick_ws_distribution_stopped(worker)
+        )
+        self.result_label.setText(
+            f"Sampling 20,000 {ws_name} results for the damage distribution..."
+        )
+        thread.start()
+
+    def _discard_quick_distribution_thread(self, worker: PlotThread):
+        try:
+            self._quick_distribution_threads.remove(worker)
+        except ValueError:
+            pass
+
+    def _quick_ws_distribution_done(self, worker: PlotThread, distribution: dict):
+        if worker is not self.quick_distribution_thread:
+            return
+        if not self._render_ws_distribution_graph(
+            self.quick_result_figure, self.quick_result_canvas, distribution,
+            ws_name=worker.ws_name,
+        ):
+            self._quick_ws_distribution_failed(worker, "The sampled histogram was invalid.")
+            return
+        self.result_label.setText(
+            f"20,000 samples - mean {float(distribution['mean']):,.0f} - "
+            f"median {float(distribution['median']):,.0f} - "
+            f"90% range {float(distribution['p05']):,.0f}-{float(distribution['p95']):,.0f}"
+        )
+        if self._last_quick_result is not None:
+            self._last_quick_result["seed"] = worker.seed
+            self._last_quick_result["distribution"] = _json_value(distribution)
+        self.statusBar().showMessage("20,000-sample WS distribution completed", 5000)
+
+    def _quick_ws_distribution_failed(self, worker: PlotThread, message: str):
+        if worker is not self.quick_distribution_thread:
+            return
+        self.result_label.setText(f"WS distribution failed: {message}")
+        self._render_quick_result_graph("", None)
+        self.statusBar().showMessage("WS distribution failed", 5000)
+
+    def _quick_ws_distribution_stopped(self, worker: PlotThread):
+        if worker is self.quick_distribution_thread:
+            self._render_quick_result_graph("", None)
 
     def save_quick_result(self):
         """Persist the last inline evaluation only when the user asks."""
@@ -7314,11 +10746,22 @@ class MainWindow(QMainWindow):
             return
         saved = self._last_quick_result
         action = str(saved.get("action") or "quick")
+        dps_summary = saved.get("dps_summary") or {}
         self._add_history(
             "quick-look", f"Quick Look · {action}", {
-                "seed": None,
+                "seed": saved.get("seed"),
                 "scenario": saved.get("scenario") or {},
-                "metrics": {"output": saved.get("output"), "text": saved.get("text", "")},
+                "metrics": {
+                    "output": saved.get("output"), "text": saved.get("text", ""),
+                    **{
+                        key: dps_summary.get(key)
+                        for key in ("total_dps", "tp_dps", "ws_dps")
+                        if key in dps_summary
+                    },
+                },
+                "dps_series": dps_summary.get("dps_series") or {},
+                "reference_summaries": dps_summary.get("reference_summaries") or {},
+                "distribution": saved.get("distribution") or {},
                 "gearsets": {"single": saved.get("gearset") or {}},
             },
         )
@@ -7335,15 +10778,20 @@ class MainWindow(QMainWindow):
                 self.quick_set.items,
             )
             self._apply_locked_gear(check_gear)
+            action_label = self.optimize_action.currentText()
+            warm_cache_mode = action_label == WARM_CACHE_ACTION
+            ranking_mode = action_label in {"Rank weapon-type WS", WARM_CACHE_ACTION}
+            # Ranking deliberately fixes the currently equipped weapon layer;
+            # it does not require that layer to appear in the accessible armor
+            # picker (for example a profile-owned or Porter-resolved weapon).
+            if ranking_mode:
+                empty_weapon_slots = []
             if empty_weapon_slots:
                 labels = ", ".join(slot.upper() for slot in empty_weapon_slots)
                 raise ValueError(
                     f"No optimizer candidates are selected for {labels}. "
                     "Select a weapon or explicitly select Empty; the current Quick Look weapon will not be added automatically."
             )
-            action_label = self.optimize_action.currentText()
-            warm_cache_mode = action_label == WARM_CACHE_ACTION
-            ranking_mode = action_label in {"Rank weapon-type WS", WARM_CACHE_ACTION}
             substat_mode = action_label in {"Tradeoff optimization", "Sub-stat optimization"}
             if warm_cache_mode and not self.cache_enabled:
                 raise ValueError("Enable simulation caching from File before running Warm cache.")
@@ -7367,16 +10815,9 @@ class MainWindow(QMainWindow):
             if self.prune_candidates.isChecked():
                 check_gear, pruned_count = wsdist.prune_dominated_candidates(check_gear)
             seed_text = self.seed.text().strip()
-            seed = int(seed_text) if seed_text else None
-            if warm_cache_mode and seed is None:
-                seed = secrets.randbits(31)
-                self.seed.setText(str(seed))
-                cache_seed_note = f"Warm cache generated optimizer seed {seed}."
-            else:
-                cache_seed_note = (
-                    "Caching skipped: Optimizer seed is blank. Enter a numeric seed to save and reuse this result."
-                    if self.cache_enabled and seed is None else ""
-                )
+            seed = int(seed_text) if seed_text else secrets.randbits(31)
+            self.seed.setText(str(seed))
+            cache_seed_note = ""
             action_type = {
                 "Weapon skill": "weapon skill", "Attack round": "attack round",
                 "Spell": "spell cast",
@@ -7440,7 +10881,9 @@ class MainWindow(QMainWindow):
                     "restarts": self.restarts.value(), "workers": self.workers.value(),
                     "seed": seed, "return_details": True, "return_top_results": True,
                     "dt_requirement": dt_requirement, "parallel_mode": parallel_mode,
-                    "search_mode": self.tradeoff_depth.currentText().lower(),
+                    "search_mode": (
+                        "fast" if self.optimizer_quality.currentText() == "Fast" else "deep"
+                    ),
                 }
             else:
                 args = common + (
@@ -7457,14 +10900,15 @@ class MainWindow(QMainWindow):
                     "ws_starting_gearset": dict(self.ws_set.items),
                     "parallel_mode": parallel_mode,
                 }
+            kwargs["n_iter"] = self.optimizer_passes.value()
             profile_builder_active = bool(getattr(self, "_profile_builder_optimizer_active", None))
             profile_builder_search_note = ""
             if profile_builder_active and not ranking_mode:
                 depth = self.profile_builder_depth.currentText()
-                passes, restarts = (4, 1) if depth == "Fast" else (10, 3)
+                passes, restarts, _shared = _search_quality_settings(depth)
                 kwargs.update({"n_iter": passes, "restarts": restarts})
                 profile_builder_search_note = (
-                    f"Profile Builder {depth} depth: {restarts} seeded run(s) × {passes} passes."
+                    f"Profile Builder {depth}: {restarts} search run(s) × {passes} passes."
                 )
             cache_kind = "ws-ranking" if ranking_mode else "optimizer"
             cache_context = self._optimizer_cache_context(args)
@@ -7472,12 +10916,23 @@ class MainWindow(QMainWindow):
                 cache_kind, args, kwargs,
             )
             cache_key, cached = (None, None)
-            # Blank seeds deliberately retain their current randomized-search behavior.
-            if seed is not None:
-                cache_key, cached = self._cache_lookup(cache_kind, cache_request)
+            cache_key, cached = self._cache_lookup(cache_kind, cache_request)
+            fresh_search = False
+            if cached is not None and not profile_builder_active:
+                saved_choice = self._saved_work_choice()
+                if saved_choice == "cancel":
+                    return
+                if saved_choice == "fresh":
+                    fresh_search = True
+                    seed = secrets.randbits(31)
+                    self.seed.setText(str(seed))
+                    kwargs["seed"] = seed
+                    cache_request = self._optimizer_cache_request(cache_kind, args, kwargs)
+                    cache_key = self.simulation_cache.key_for(cache_kind, cache_request)
+                    cached = None
             self._active_optimizer_cache = None
             if cached is not None:
-                self.optimizer_log.clear()
+                self._clear_optimizer_log()
                 self._optimizer_run_state = {}
                 self._optimizer_started_at = None
                 self._initialize_optimizer_run_cards(1)
@@ -7496,8 +10951,85 @@ class MainWindow(QMainWindow):
                     f"saved runtime {self._format_duration(cached['runtime_seconds'])})."
                 )
                 self.optimizer_activity.setText("Restored from cache")
+                self._set_optimizer_run_ui(
+                    "restored", "Result restored from the simulation cache.", 100.0
+                )
                 self.statusBar().showMessage("Optimizer result restored from cache", 6000)
                 return
+            restart_cache_eligible = bool(
+                self.cache_enabled and not ranking_mode and not substat_mode
+                and action_type != "combined tp/ws" and parallel_mode == "search_runs"
+            )
+            if restart_cache_eligible:
+                quality = (
+                    self.profile_builder_depth.currentText()
+                    if profile_builder_active else self.optimizer_quality.currentText()
+                )
+                if quality in SEARCH_QUALITY:
+                    _passes, restart_count, allow_shared = _search_quality_settings(quality)
+                else:
+                    restart_count = int(kwargs["restarts"])
+                    allow_shared = False
+                warm_start = None
+                if allow_shared and not fresh_search:
+                    warm_start = self._validated_shared_optimizer_start(check_gear, args[11])
+                restart_seeds = [
+                    int(value) for value in np.random.SeedSequence(seed).generate_state(restart_count)
+                ]
+                cached_restarts = []
+                restart_requests = {}
+                for index, restart_seed in enumerate(restart_seeds, start=1):
+                    is_warm = bool(warm_start is not None and index == restart_count)
+                    request = self._restart_cache_request(
+                        args, kwargs, index, restart_seed, warm_start if is_warm else None
+                    )
+                    restart_requests[index] = (request, is_warm)
+                    restart_key = self.simulation_cache.key_for("optimizer-restart", request)
+                    saved_restart = self.simulation_cache.get(restart_key, "optimizer-restart")
+                    if saved_restart is not None:
+                        cached_restarts.append(
+                            self._restore_restart_result(saved_restart["payload"], cache_context)
+                        )
+                if cached_restarts and not profile_builder_active and not fresh_search:
+                    saved_choice = self._saved_work_choice()
+                    if saved_choice == "cancel":
+                        return
+                    if saved_choice == "fresh":
+                        fresh_search = True
+                        seed = secrets.randbits(31)
+                        self.seed.setText(str(seed))
+                        kwargs["seed"] = seed
+                        cached_restarts = []
+                        warm_start = None
+                        restart_seeds = [
+                            int(value) for value in np.random.SeedSequence(seed).generate_state(restart_count)
+                        ]
+                        restart_requests = {
+                            index: (
+                                self._restart_cache_request(args, kwargs, index, restart_seed), False
+                            )
+                            for index, restart_seed in enumerate(restart_seeds, start=1)
+                        }
+                        cache_request = self._optimizer_cache_request(cache_kind, args, kwargs)
+                        cache_key = self.simulation_cache.key_for(cache_kind, cache_request)
+
+                def store_restart(result, warm_used=False):
+                    request, expected_warm = restart_requests[int(result["index"])]
+                    if bool(warm_used) != bool(expected_warm):
+                        return
+                    restart_key = self.simulation_cache.key_for("optimizer-restart", request)
+                    self.simulation_cache.put(
+                        restart_key, "optimizer-restart",
+                        self._serialize_restart_result(result, bool(warm_used)), 0.0,
+                        request_summary={
+                            "mode": "optimizer restart", "job": f"{args[0]}/{args[1]}",
+                            "index": int(result["index"]), "quality": quality,
+                        },
+                    )
+
+                kwargs["cached_restarts"] = cached_restarts
+                kwargs["restart_callback"] = store_restart
+                kwargs["warm_starting_gearset"] = warm_start
             if cache_key is not None:
                 self._active_optimizer_cache = {
                     "kind": cache_kind, "key": cache_key, "context": cache_context,
@@ -7507,16 +11039,23 @@ class MainWindow(QMainWindow):
             checks = wsdist.estimate_candidate_checks(
                 check_gear, JOBS[self.main_job.currentText()], optimizer_ws_type
             )
-            self.optimizer_log.clear()
+            self._clear_optimizer_log()
             self.optimizer_top_results = []
             self._optimizer_run_state = {}
             self._optimizer_started_at = time.monotonic()
+            batch_started = getattr(self, "_profile_builder_optimizer_batch_started_at", None)
+            if profile_builder_active and batch_started:
+                self._optimizer_eta_started_at = float(batch_started)
+            else:
+                self._optimizer_eta_started_at = self._optimizer_started_at
+                self._optimizer_progress_samples = []
             run_count = 1 if ranking_mode or kwargs["parallel_mode"] == "single_run" else kwargs["restarts"]
             self._initialize_optimizer_run_cards(run_count)
             self.show_optimizer_status()
             self._optimizer_status_timer.start()
-            self.show_top_sets_button.setEnabled(False)
-            self.optimizer_progress_value.setText("Approx. progress: 0.0%")
+            self._set_optimizer_header_eta(status="calculating...")
+            self._set_optimizer_gear_results_enabled(False)
+            self.optimizer_progress_value.setText("Overall progress: 0.0% · 100.0% remaining")
             self.optimizer_eta_value.setText("Estimated time remaining: calculating…")
             self.optimizer_best_value.setText("Best metric: —")
             self.optimizer_phase_value.setText("Current phase: starting")
@@ -7524,6 +11063,10 @@ class MainWindow(QMainWindow):
                 f"Starting optimizer · ~{checks:,} candidates per pass"
             )
             self.optimizer_activity.setText("Starting…")
+            self._set_optimizer_run_ui(
+                "starting",
+                f"{action_label} · preparing approximately {checks:,} candidates per pass.",
+            )
             if cache_seed_note:
                 self._append_optimizer_log(cache_seed_note)
             if profile_builder_search_note:
@@ -7557,6 +11100,10 @@ class MainWindow(QMainWindow):
             self.optimizer_thread.stopped.connect(self._optimizer_stopped)
             self.optimizer_thread.start()
         except Exception as error:
+            if self._dashboard_ws_ranking_active:
+                self._dashboard_ws_ranking_active = False
+                self.dashboard_ws_status.setText(f"WS ranking could not start: {error}")
+                self._refresh_build_dashboard()
             QMessageBox.critical(self, "Optimizer", str(error))
 
     def _build_overnight_tasks(self, scenario_names: list[str] | None = None) -> list[dict]:
@@ -7714,19 +11261,25 @@ class MainWindow(QMainWindow):
             return
         self.settings.setValue("overnight_simulations/hours", hours)
         self.settings.setValue("overnight_simulations/enemies", scenario_names)
-        self.optimizer_log.clear()
+        self._clear_optimizer_log()
         self._optimizer_run_state = {}
         self._optimizer_started_at = time.monotonic()
+        self._optimizer_eta_started_at = self._optimizer_started_at
+        self._optimizer_progress_samples = []
         self._optimizer_action_in_progress = "Overnight simulations"
         self._initialize_optimizer_run_cards(1)
         self.show_optimizer_status()
         self._optimizer_status_timer.start()
+        self._set_optimizer_header_eta(status="calculating...")
         self._append_optimizer_log(
             f"Starting overnight cache queue: {len(tasks):,} deterministic tasks across "
             f"{len(scenario_names)} enemy scenario(s); "
             f"time budget {hours:g} hour(s)."
         )
         self.optimizer_activity.setText("Warming cache")
+        self._set_optimizer_run_ui(
+            "warming", f"Cache simulation running · 0/{len(tasks):,} tasks processed.", 0.0
+        )
         self.optimize_button.setEnabled(False)
         self.overnight_button.setEnabled(False)
         self.stop_overnight_button.setEnabled(True)
@@ -7754,6 +11307,11 @@ class MainWindow(QMainWindow):
             ),
         })
         self.optimizer_activity.setText("Warming cache")
+        self._set_optimizer_run_ui(
+            "warming",
+            f"Cache simulation running · {processed:,}/{planned:,} tasks processed.",
+            fraction * 100,
+        )
         self._refresh_optimizer_status()
         self._append_optimizer_log(
             f"Cache queue {processed:,}/{planned:,}: stored {summary.get('stored', 0):,}, "
@@ -7766,6 +11324,14 @@ class MainWindow(QMainWindow):
         self.overnight_button.setEnabled(True)
         self.stop_overnight_button.setEnabled(False)
         self.optimizer_activity.setText(label)
+        state = {"Completed": "completed", "Failed": "failed", "Stopped": "stopped"}.get(
+            label, "idle"
+        )
+        self._set_optimizer_run_ui(
+            state,
+            f"Cache simulation {label.casefold()}.",
+            100.0 if state == "completed" else None,
+        )
         self._refresh_cache_status()
 
     def _overnight_done(self, summary: dict):
@@ -7779,10 +11345,12 @@ class MainWindow(QMainWindow):
             f"elapsed {self._format_duration(summary.get('elapsed', 0))}."
         )
         self._finish_overnight_ui("Completed")
-        self.optimizer_progress_value.setText("Approx. progress: 100.0%")
+        self._set_optimizer_header_eta(status="complete")
+        self.optimizer_progress_value.setText("Overall progress: 100.0% · 0.0% remaining")
         self.optimizer_eta_value.setText("Estimated time remaining: complete")
         self.optimizer_phase_value.setText("Current phase: finished")
         self.statusBar().showMessage("Overnight cache queue completed", 6000)
+        self._schedule_optimizer_status_close()
 
     def _overnight_failed(self, message: str):
         for state in self._optimizer_run_state.values():
@@ -7808,27 +11376,52 @@ class MainWindow(QMainWindow):
             self.overnight_thread.request_stop()
             self.stop_overnight_button.setEnabled(False)
             self.optimizer_activity.setText("Stopping...")
+            self._set_optimizer_run_ui(
+                "stopping", "Stop requested · finishing the current cache task."
+            )
             self._append_optimizer_log("Stop requested; finishing the current cache task...")
 
     def _append_optimizer_log(self, message: str):
         """Append a readable, color-coded optimizer status line."""
-        match = re.search(r"Search run (\d+)", message)
-        lowered = message.casefold()
-        if match:
-            color = OPTIMIZER_RUN_COLORS[(int(match.group(1)) - 1) % len(OPTIMIZER_RUN_COLORS)]
-            if "failed" in lowered or "error" in lowered:
-                color = "#b42318"
+        self._optimizer_log_messages.append(str(message))
+        # Keep the live window responsive during large profile-builder runs.
+        if len(self._optimizer_log_messages) > 2000:
+            del self._optimizer_log_messages[:-2000]
+        self._render_optimizer_log()
+
+    def _clear_optimizer_log(self):
+        self._optimizer_log_messages.clear()
+        if hasattr(self, "optimizer_log"):
+            self.optimizer_log.clear()
+
+    def _render_optimizer_log(self, *_args):
+        """Render the searchable live log while preserving run colors."""
+        if not hasattr(self, "optimizer_log"):
+            return
+        query = self.optimizer_log_filter.text().strip().casefold() if hasattr(self, "optimizer_log_filter") else ""
+        lines = []
+        for message in self._optimizer_log_messages:
+            if query and query not in message.casefold():
+                continue
+            match = re.search(r"Search run (\d+)", message)
+            lowered = message.casefold()
+            if match:
+                color = OPTIMIZER_RUN_COLORS[(int(match.group(1)) - 1) % len(OPTIMIZER_RUN_COLORS)]
+                if "failed" in lowered or "error" in lowered:
+                    color = "#c58d91"
+                elif "stopped" in lowered or "stop requested" in lowered:
+                    color = "#d6ad68"
+            elif "failed" in lowered or "error" in lowered:
+                color = "#c58d91"
             elif "stopped" in lowered or "stop requested" in lowered:
-                color = "#9a6700"
-        elif "failed" in lowered or "error" in lowered:
-            color = "#b42318"
-        elif "stopped" in lowered or "stop requested" in lowered:
-            color = "#9a6700"
-        elif "completed" in lowered or "selected search run" in lowered:
-            color = "#137333"
-        else:
-            color = "#344054"
-        self.optimizer_log.append(f"<span style='color:{color}'>{escape(message)}</span>")
+                color = "#d6ad68"
+            elif "completed" in lowered or "selected search run" in lowered:
+                color = "#b7c5ab"
+            else:
+                color = "#d0ccd6"
+            lines.append(f"<span style='color:{color}'>{escape(message)}</span>")
+        self.optimizer_log.setHtml("<br>".join(lines))
+        self.optimizer_log.verticalScrollBar().setValue(self.optimizer_log.verticalScrollBar().maximum())
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -7858,52 +11451,80 @@ class MainWindow(QMainWindow):
             }
             self._optimizer_run_state[index] = state
             card = QFrame()
+            card.setObjectName("optimizerRunCard")
             card.setFrameShape(QFrame.Shape.StyledPanel)
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
             card.setStyleSheet(
-                "QFrame { border: 1px solid #c7d0d9; border-radius: 4px; "
-                "background: #f8fafc; }"
+                "QFrame#optimizerRunCard { border: 1px solid #85818f; border-radius: 3px; "
+                "background: #35353d; }"
             )
             grid = QGridLayout(card)
-            grid.setContentsMargins(10, 8, 10, 8)
-            grid.setHorizontalSpacing(12)
-            grid.setVerticalSpacing(7)
+            grid.setContentsMargins(6, 5, 6, 5)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(4)
             title = QLabel(f"Search run {index}/{run_count}")
             title.setStyleSheet(
-                f"font-weight: 700; color: {OPTIMIZER_RUN_COLORS[(index - 1) % len(OPTIMIZER_RUN_COLORS)]};"
+                f"font-size: 10pt; font-weight: 700; color: {OPTIMIZER_RUN_COLORS[(index - 1) % len(OPTIMIZER_RUN_COLORS)]};"
             )
             phase = QLabel("Queued")
-            elapsed = QLabel("Elapsed: 0s")
-            last = QLabel("Last upgrade: none yet")
+            phase.setWordWrap(True)
             detail = QLabel("Waiting for a worker update.")
-            results = QLabel("Current results: waiting for a valid set.")
-            detail.setStyleSheet("color: #475467;")
-            results.setStyleSheet("color: #344054;")
-            for label in (phase, elapsed, last, detail, results):
+            detail.setWordWrap(True)
+            detail.setMaximumHeight(32)
+            result_panel = QFrame()
+            result_panel.setObjectName("optimizerCurrentResult")
+            result_layout = QVBoxLayout(result_panel)
+            result_layout.setContentsMargins(6, 3, 6, 4)
+            result_layout.setSpacing(1)
+            results = QLabel(_optimizer_current_result_lines(None))
+            results.setObjectName("optimizerCurrentResultValues")
+            results.setWordWrap(True)
+            result_layout.addWidget(results)
+            detail.setStyleSheet("color: #dedbe2;")
+            for label in (phase, detail, results):
                 label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             grid.addWidget(title, 0, 0)
             grid.addWidget(phase, 0, 1)
-            grid.addWidget(elapsed, 1, 0)
-            grid.addWidget(last, 1, 1)
-            grid.addWidget(detail, 2, 0, 1, 2)
-            grid.addWidget(results, 3, 0, 1, 2)
-            self.optimizer_runs_layout.addWidget(card, (index - 1) // 2, (index - 1) % 2)
+            grid.addWidget(detail, 1, 0, 1, 2)
+            grid.addWidget(result_panel, 2, 0, 1, 2)
             self._optimizer_run_cards[index] = {
-                "card": card, "title": title, "phase": phase, "elapsed": elapsed,
-                "last": last, "detail": detail, "results": results,
+                "card": card, "title": title, "phase": phase, "detail": detail,
+                "results": results, "result_panel": result_panel,
             }
+        self._reflow_optimizer_run_cards()
+
+    def _reflow_optimizer_run_cards(self):
+        """Lay worker cards out at the current status-window breakpoint."""
+        if not hasattr(self, "optimizer_runs_layout"):
+            return
+        while self.optimizer_runs_layout.count():
+            self.optimizer_runs_layout.takeAt(0)
+        cards = [
+            value["card"] for _index, value in sorted(self._optimizer_run_cards.items())
+        ]
+        count = len(cards)
+        if not count:
+            return
+        width = self.optimizer_runs_box.contentsRect().width()
+        # Three columns fit comfortably in the normal 960px status dialog and
+        # reduce Deep's twelve cards to four rows.  Fall back to two/one on
+        # narrow windows so the card text remains readable.
+        columns = min(count, 3 if width >= 900 else 2 if width >= 620 else 1)
+        for column in range(3):
+            self.optimizer_runs_layout.setColumnStretch(column, 1 if column < columns else 0)
+        for index, card in enumerate(cards):
+            row, column = divmod(index, columns)
+            final_lone_card = index == count - 1 and column == 0 and count % columns == 1
+            span = columns if final_lone_card else 1
+            self.optimizer_runs_layout.addWidget(card, row, column, 1, span)
 
     def _refresh_optimizer_run_cards(self):
-        now = time.monotonic()
         for index, card in self._optimizer_run_cards.items():
             state = self._optimizer_run_state.get(index)
             if not state:
                 continue
             phase = str(state.get("phase", "queued")).replace("_", " ").title()
-            elapsed = now - state.get("started_at", self._optimizer_started_at or now)
             card["phase"].setText(f"State: {phase}")
-            card["elapsed"].setText(f"Elapsed: {self._format_duration(elapsed)}")
-            improvement = state.get("improvement") or "none yet"
-            card["last"].setText(f"Last upgrade: {improvement}")
             details = []
             if state.get("iteration") and state.get("iterations"):
                 details.append(f"Pass {state['iteration']}/{state['iterations']}")
@@ -7912,20 +11533,18 @@ class MainWindow(QMainWindow):
             if state.get("best") is not None:
                 details.append(f"Best: {state['best']:,.4f}")
             card["detail"].setText("  ·  ".join(details) or "Waiting for a worker update.")
-            card["results"].setText(
-                str(state.get("results") or "Current results: waiting for a valid set.")
-            )
+            card["results"].setText(_optimizer_current_result_lines(state.get("results")))
             if state.get("phase") == "completed":
-                color, background = "#137333", "#f1faf3"
+                color, background = "#c5d0bd", "#414941"
             elif state.get("phase") in {"stopping", "stopped"}:
-                color, background = "#9a6700", "#fff8e7"
+                color, background = "#e6c983", "#4a4435"
             elif state.get("phase") == "failed":
-                color, background = "#b42318", "#fff5f4"
+                color, background = "#e1b1b1", "#4b373a"
             else:
                 color = OPTIMIZER_RUN_COLORS[(index - 1) % len(OPTIMIZER_RUN_COLORS)]
-                background = "#f8fafc"
+                background = "#35353d"
             card["card"].setStyleSheet(
-                "QFrame { border: 1px solid #c7d0d9; border-radius: 4px; "
+                "QFrame#optimizerRunCard { border: 1px solid #85818f; border-radius: 3px; "
                 f"background: {background}; }}"
             )
             card["title"].setStyleSheet(f"font-weight: 700; color: {color};")
@@ -7943,9 +11562,31 @@ class MainWindow(QMainWindow):
             else min(0.98, float(state.get("fraction", 0.0)))
             for state in states
         ]
-        progress = sum(fractions) / max(1, len(fractions))
-        self.optimizer_progress_value.setText(f"Approx. progress: {progress * 100:.1f}%")
-        elapsed = time.monotonic() - (self._optimizer_started_at or time.monotonic())
+        search_progress = sum(fractions) / max(1, len(fractions))
+        batch_total = int(getattr(self, "_profile_builder_optimizer_total", 0) or 0)
+        batch_completed = int(
+            getattr(self, "_profile_builder_optimizer_completed_count", 0) or 0
+        )
+        batch_running = (
+            str(getattr(self, "_profile_builder_optimizer_batch_state", "")) == "running"
+            and batch_total > 0
+        )
+        progress = (
+            min(1.0, (batch_completed + search_progress) / batch_total)
+            if batch_running else search_progress
+        )
+        self.optimizer_progress_value.setText(
+            f"Overall progress: {progress * 100:.1f}% · {(1 - progress) * 100:.1f}% remaining"
+        )
+        eta_started = self._optimizer_eta_started_at or self._optimizer_started_at
+        elapsed = time.monotonic() - (eta_started or time.monotonic())
+        if (
+            not self._optimizer_progress_samples
+            or elapsed - self._optimizer_progress_samples[-1][0] >= 1.0
+            or progress >= 1.0
+        ):
+            self._optimizer_progress_samples.append((elapsed, progress))
+            self._optimizer_progress_samples = self._optimizer_progress_samples[-120:]
         ranking_states = [state for state in states if state.get("ranking_total")]
         ranking_state = ranking_states[0] if ranking_states else None
         ranking_done = int(ranking_state.get("ranking_completed", 0)) if ranking_state else 0
@@ -7958,13 +11599,21 @@ class MainWindow(QMainWindow):
             self.optimizer_eta_value.setText(
                 f"Estimated time remaining: {self._format_duration(remaining)}"
             )
-        elif progress > 0.001 and elapsed > 1:
-            remaining = elapsed * (1 - progress) / progress
+            self._set_optimizer_header_eta(remaining)
+        else:
+            remaining = _remaining_time_estimate(
+                self._optimizer_progress_samples, elapsed=elapsed, progress=progress,
+            )
+        if not ranking_state and remaining is not None:
             self.optimizer_eta_value.setText(
                 f"Estimated time remaining: {self._format_duration(remaining)}"
             )
-        else:
+            self._set_optimizer_header_eta(remaining)
+        elif not ranking_state:
             self.optimizer_eta_value.setText("Estimated time remaining: calculating…")
+            self._set_optimizer_header_eta(status="calculating…")
+        elif ranking_state:
+            self._set_optimizer_header_eta(status="calculating…")
         best_values = [state.get("best") for state in states if state.get("best") is not None]
         if best_values:
             best_state = max(
@@ -7986,6 +11635,18 @@ class MainWindow(QMainWindow):
             if tested is not None and planned:
                 phase = f"{phase} · {tested:,}/{planned:,} tested"
             self.optimizer_phase_value.setText(f"Current phase: {run_label} · {phase}")
+        optimizer_running = bool(self.optimizer_thread and self.optimizer_thread.isRunning())
+        overnight_running = bool(self.overnight_thread and self.overnight_thread.isRunning())
+        if optimizer_running or overnight_running:
+            stopping = any(
+                state.get("phase") in {"stopping", "stopped"} for state in states
+            )
+            ui_state = "stopping" if stopping else "warming" if overnight_running else "running"
+            self._set_optimizer_run_ui(
+                ui_state,
+                self.optimizer_phase_value.text().removeprefix("Current phase: "),
+                progress * 100,
+            )
 
     def _update_optimizer_run_state(self, message: str):
         ranking = re.search(r"WS ranking (\d+)/(\d+):\s*(.+)", message, re.I)
@@ -8112,14 +11773,20 @@ class MainWindow(QMainWindow):
         self.optimize_button.setEnabled(True)
         self.stop_optimizer_button.setEnabled(False)
         self.equip_best_button.setEnabled(False)
-        self.show_top_sets_button.setEnabled(False)
+        self._set_optimizer_gear_results_enabled(False)
         self.optimizer_activity.setText("Completed")
-        self.optimizer_progress_value.setText("Approx. progress: 100.0%")
+        self._set_optimizer_run_ui(
+            "completed", f"Weapon-skill ranking complete · {success_count} results.", 100.0
+        )
+        self.optimizer_progress_value.setText("Overall progress: 100.0% · 0.0% remaining")
         self.optimizer_eta_value.setText("Estimated time remaining: complete")
         self.optimizer_best_value.setText("Best metric: see three-column ranking")
         self.optimizer_phase_value.setText("Current phase: finished")
         self.ws_ranking_dialog = WeaponSkillRankingDialog(result, self.icons, self)
         self.ws_ranking_dialog.show()
+        if self._dashboard_ws_ranking_active:
+            self._dashboard_ws_ranking_active = False
+            self._apply_dashboard_ws_ranking(result)
         try:
             saved = self._serialize_optimizer_payload(result, ranking=True)
             first_entry = next(
@@ -8147,6 +11814,7 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self._append_optimizer_log(f"Ranking history save skipped: {error}")
         self.statusBar().showMessage("Weapon-skill ranking completed", 5000)
+        self._schedule_optimizer_status_close()
 
     def _optimizer_done(self, result):
         self._optimizer_status_timer.stop()
@@ -8168,15 +11836,18 @@ class MainWindow(QMainWindow):
         self._last_completed_optimizer_action = self._optimizer_action_in_progress
         self._last_substat_summary = substat_summary or []
         self.optimizer_top_results = list(self.optimizer_top_results or [])
-        self._append_optimizer_log(
-            f"Completed · seed {winning_seed}"
-        )
+        self._append_optimizer_log("Completed · reproducibility data saved internally")
         self.optimize_button.setEnabled(True)
         self.stop_optimizer_button.setEnabled(False)
         self.equip_best_button.setEnabled(True)
-        self.show_top_sets_button.setEnabled(bool(self.optimizer_top_results))
+        self._set_optimizer_gear_results_enabled(bool(self.optimizer_top_results))
+        if self.optimizer_top_results:
+            QTimer.singleShot(0, self.show_top_sets)
         self.optimizer_activity.setText("Completed")
-        self.optimizer_progress_value.setText("Approx. progress: 100.0%")
+        self._set_optimizer_run_ui(
+            "completed", "Optimization complete · results are ready to review.", 100.0
+        )
+        self.optimizer_progress_value.setText("Overall progress: 100.0% · 0.0% remaining")
         self.optimizer_eta_value.setText("Estimated time remaining: complete")
         action_type = {
             "Weapon skill": "weapon skill", "Attack round": "attack round",
@@ -8213,6 +11884,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Optimizer completed", 5000)
         self._save_optimizer_history(result, float(metric), winning_seed, result_summary)
         self._profile_builder_optimizer_completed(metric)
+        self._schedule_optimizer_status_close()
 
     def _save_optimizer_history(self, result, metric: float, seed, summary_text: str):
         """Store a compact optimizer result without retaining live player objects."""
@@ -8253,6 +11925,10 @@ class MainWindow(QMainWindow):
         self._optimizer_status_timer.stop()
         self._active_optimizer_cache = None
         self._ranking_skill_in_progress = None
+        if self._dashboard_ws_ranking_active:
+            self._dashboard_ws_ranking_active = False
+            self.dashboard_ws_status.setText(f"WS ranking failed: {message}")
+            QTimer.singleShot(0, self._refresh_build_dashboard)
         for state in self._optimizer_run_state.values():
             if state.get("phase") not in {"completed", "stopped"}:
                 state["phase"] = "failed"
@@ -8261,6 +11937,7 @@ class MainWindow(QMainWindow):
         self.optimize_button.setEnabled(True)
         self.stop_optimizer_button.setEnabled(False)
         self.optimizer_activity.setText("Failed")
+        self._set_optimizer_run_ui("failed", f"Optimization failed · {message}")
         self.optimizer_eta_value.setText("Estimated time remaining: unavailable")
         self._cancel_profile_builder_optimizer_queue("optimizer failed")
         QMessageBox.critical(self, "Optimizer failed", message)
@@ -8269,6 +11946,10 @@ class MainWindow(QMainWindow):
         self._optimizer_status_timer.stop()
         self._active_optimizer_cache = None
         self._ranking_skill_in_progress = None
+        if self._dashboard_ws_ranking_active:
+            self._dashboard_ws_ranking_active = False
+            self.dashboard_ws_status.setText("WS ranking stopped before consolidation.")
+            QTimer.singleShot(0, self._refresh_build_dashboard)
         for state in self._optimizer_run_state.values():
             if state.get("phase") != "completed":
                 state["phase"] = "stopped"
@@ -8282,8 +11963,9 @@ class MainWindow(QMainWindow):
         self._append_optimizer_log(f"Stopped: {message}")
         self.optimize_button.setEnabled(True)
         self.stop_optimizer_button.setEnabled(False)
-        self.show_top_sets_button.setEnabled(bool(self.optimizer_top_results))
+        self._set_optimizer_gear_results_enabled(bool(self.optimizer_top_results))
         self.optimizer_activity.setText("Stopped")
+        self._set_optimizer_run_ui("stopped", "Optimization stopped by request.")
         self.optimizer_eta_value.setText("Estimated time remaining: stopped")
         self.optimizer_phase_value.setText("Current phase: stopped")
         self.statusBar().showMessage("Optimizer stopped", 5000)
@@ -8294,6 +11976,9 @@ class MainWindow(QMainWindow):
             self.optimizer_thread.request_stop()
             self.stop_optimizer_button.setEnabled(False)
             self.optimizer_activity.setText("Stopping...")
+            self._set_optimizer_run_ui(
+                "stopping", "Stop requested · finishing the current calculation."
+            )
             for state in self._optimizer_run_state.values():
                 if state.get("phase") not in {"completed", "failed"}:
                     state["phase"] = "stopping"
@@ -8305,7 +11990,7 @@ class MainWindow(QMainWindow):
         if ranking:
             current, total = int(ranking.group(1)), int(ranking.group(2))
             self.optimizer_progress_value.setText(
-                f"Approx. progress: {(current - 1) / max(1, total) * 100:.1f}%"
+                f"Overall progress: {(current - 1) / max(1, total) * 100:.1f}%"
             )
             self.optimizer_phase_value.setText(
                 f"Current phase: {ranking.group(3)}"
@@ -8315,6 +12000,7 @@ class MainWindow(QMainWindow):
             self._append_optimizer_log(message)
         if "started" in message.lower():
             self.optimizer_activity.setText("Running")
+            self._set_optimizer_run_ui("running", message)
 
     def show_top_sets(self):
         if not self.optimizer_top_results:
@@ -8322,20 +12008,31 @@ class MainWindow(QMainWindow):
         self.top_sets_dialog = TopSetsDialog(self.optimizer_top_results, self.icons, self)
         self.top_sets_dialog.show()
 
+    def _set_optimizer_gear_results_enabled(self, enabled: bool):
+        """Keep both Show Gear entry points synchronized."""
+        self.show_top_sets_button.setEnabled(bool(enabled))
+        if hasattr(self, "show_results_button"):
+            self.show_results_button.setEnabled(bool(enabled))
+
     def load_optimizer_result(self, index: int, destination: str):
         """Load a selected best result into Quick Look or TP/WS editors."""
         if not 0 <= index < len(self.optimizer_top_results):
             return
         result = self.optimizer_top_results[index]
-        tp_player = result.get("tp_player")
-        ws_player = result.get("ws_player")
-        if tp_player is None or ws_player is None:
-            player = result.get("player")
-            tp_player = player
-            ws_player = player
+        tp_player, ws_player = _optimizer_result_players(result)
         if tp_player is None or ws_player is None:
             return
-        if destination == "tpws":
+        if destination == "tp":
+            self.tp_set.set_gearset(tp_player.gearset)
+            self.workspace_mode.setCurrentText("TP â†’ WS Cycle")
+            self._select_tab("Gear Workspace")
+            self.statusBar().showMessage("Loaded selected result into TP set", 5000)
+        elif destination == "ws":
+            self.ws_set.set_gearset(ws_player.gearset)
+            self.workspace_mode.setCurrentText("TP â†’ WS Cycle")
+            self._select_tab("Gear Workspace")
+            self.statusBar().showMessage("Loaded selected result into WS set", 5000)
+        elif destination == "tpws":
             self.tp_set.set_gearset(tp_player.gearset)
             self.ws_set.set_gearset(ws_player.gearset)
             self.workspace_mode.setCurrentText("TP → WS Cycle")
@@ -8394,12 +12091,16 @@ class MainWindow(QMainWindow):
                 raise ValueError("Select a weapon skill before running a two-hour cycle.")
             seed = self._simulation_seed()
             self._running_simulation_seed = seed
-            self.plot_status.setText(
-                f"Running two-hour DPS simulation · seed {seed} · {ws_name} at {self.tp_value.value():,} TP..."
+            reference_enemies = self._reference_enemy_cases(
+                self.cycle_reference_checkbox.isChecked()
             )
+            self.plot_status.setText(
+                f"Running two-hour DPS simulation · {ws_name} at {self.tp_value.value():,} TP..."
+            )
+            self._render_cycle_graph_placeholder("Running the two-hour DPS simulation...")
             self.simulation_thread = SimulationThread(
                 tp_player, ws_player, enemy, self.tp_value.value(), ws_name,
-                self._ws_type(), seed, parent=self,
+                self._ws_type(), seed, reference_enemies=reference_enemies, parent=self,
             )
             self.simulation_thread.completed.connect(self._simulation_done)
             self.simulation_thread.failed.connect(self._simulation_failed)
@@ -8424,9 +12125,13 @@ class MainWindow(QMainWindow):
                 f"Sampling 20,000 weapon skills at {self.tp_value.value():,} TP "
                 f"+ {tp_bonus:,.0f} TP Bonus = {effective_tp:,.0f} effective TP..."
             )
+            self._render_cycle_graph_placeholder("Sampling 20,000 weapon-skill results...")
             self.plot_thread = PlotThread(
                 player, enemy, ws_name, self.tp_value.value(), self._ws_type(),
-                seed=self._simulation_seed(), parent=self,
+                seed=self._simulation_seed(),
+                reference_enemies=self._reference_enemy_cases(
+                    self.cycle_reference_checkbox.isChecked()
+                ), parent=self,
             )
             self.plot_thread.completed.connect(self._plot_distribution_done)
             self.plot_thread.failed.connect(self._plot_distribution_failed)
@@ -8449,26 +12154,31 @@ class MainWindow(QMainWindow):
                     tp=self.tp_value.value(), seed=seed,
                 ),
                 "metrics": _json_value({
-                    key: value for key, value in summary.items() if key != "dps_series"
+                    key: value for key, value in summary.items()
+                    if key not in {"dps_series", "reference_summaries"}
                 }),
                 "dps_series": _json_value(summary.get("dps_series") or {}),
+                "reference_summaries": _json_value(summary.get("reference_summaries") or {}),
                 "gearsets": self._history_gearsets(tp=self.tp_set.items, ws=self.ws_set.items),
                 "plot": {
                     "tp_player": self._history_player_snapshot(self.simulation_thread.player_tp),
                     "ws_player": self._history_player_snapshot(self.simulation_thread.player_ws),
                 },
             }
+            if _dps_series_chart_data(summary) is None:
+                raise ValueError("Simulation returned no valid DPS convergence series.")
+            self._render_cycle_dps_graph(summary)
             self._add_history(
                 "cycle", f"{self.ws_combo.currentText()} cycle · {self.tp_value.value():,} TP", payload
             )
             self.plot_status.setText(
-                f"Completed and saved · seed {seed} · total {summary['total_dps']:,.1f} DPS. Opening Results..."
+                f"Completed and saved · total {summary['total_dps']:,.1f} DPS."
             )
             self.simulate_button.setEnabled(True)
             self.cancel_simulation_button.setEnabled(False)
-            self._select_tab("Results")
-            self.view_history_graphs()
-            self.statusBar().showMessage("Two-hour simulation completed and saved to Results", 6000)
+            self.statusBar().showMessage(
+                "Two-hour DPS graph updated; result also saved to Results", 6000
+            )
         except Exception as error:
             self._simulation_failed(str(error))
 
@@ -8512,13 +12222,21 @@ class MainWindow(QMainWindow):
                 "gearsets": self._history_gearsets(ws=self.plot_thread.player.gearset),
                 "plot": {"ws_player": self._history_player_snapshot(self.plot_thread.player)},
             }
-            self._add_history(
-                "distribution", f"{self.plot_thread.ws_name} distribution · seed {seed}", payload
+            if _ws_distribution_chart_data(distribution) is None:
+                raise ValueError("Weapon-skill distribution returned an invalid histogram.")
+            self._render_ws_distribution_graph(
+                self.cycle_result_figure, self.cycle_result_canvas, distribution,
+                ws_name=self.plot_thread.ws_name,
             )
-            self.plot_status.setText("Weapon-skill distribution complete and saved to Results.")
-            self._select_tab("Results")
-            self.view_history_graphs()
-            self.statusBar().showMessage("Weapon-skill distribution completed and saved to Results", 6000)
+            self._add_history(
+                "distribution", f"{self.plot_thread.ws_name} distribution", payload
+            )
+            self.plot_status.setText(
+                "20,000-sample weapon-skill distribution complete and saved to Results."
+            )
+            self.statusBar().showMessage(
+                "WS distribution graph updated; result also saved to Results", 6000
+            )
         except Exception as error:
             self._plot_distribution_failed(str(error))
 

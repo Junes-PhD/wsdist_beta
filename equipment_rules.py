@@ -8,7 +8,9 @@ optimizer (or vice versa).
 
 from __future__ import annotations
 
-from gear import Empty
+import re
+
+from gear import Empty, all_gear
 
 
 ONE_HANDED_SKILLS = frozenset(("Axe", "Club", "Dagger", "Sword", "Katana"))
@@ -21,6 +23,32 @@ PROJECTILE_FOR_RANGED = {
     "Crossbow": "Bolt",
 }
 PROJECTILE_TYPES = frozenset(PROJECTILE_FOR_RANGED.values())
+STEELFLASH_BLADEBORN_PAIR = frozenset(("steelflash earring", "bladeborn earring"))
+# REMA weapons with a Dynamis-Divergence R15 augment expose the augmented
+# weapon in the catalog for the main hand.  In the off hand the game applies
+# only the underlying weapon's base stats; the R15 damage/stat augment does
+# not carry over.  Keep this normalization here so Quick Look, the optimizer,
+# and profile generation all evaluate the same equipment.
+_REMA_R15_BASE_BY_NAME = {
+    name: item for name, item in all_gear.items()
+    if str(item.get("Name2") or "") == str(item.get("Name") or "")
+    and item.get("Type") == "Weapon"
+}
+_DIVERGENCE_SUB_BY_NAME_PATH = {
+    (str(item.get("Name") or ""), str(item.get("Augment Path") or "").upper()): item
+    for item in all_gear.values()
+    if item.get("Dynamis Divergence")
+    and str(item.get("Name2") or "").lower().endswith("(sub)")
+}
+# Sortie JSE earrings are all right-ear-only.  Keep the list here so the
+# picker, profile builder, and optimizer apply the same restriction even when
+# an imported bridge record does not carry an explicit side flag.
+SORTIE_JSE_EARRING_PREFIXES = frozenset((
+    "Hattori", "Heathen's", "Lethargy", "Ebers", "Wicce", "Peltast's",
+    "Boii", "Bhikku", "Skulker's", "Chevalier's", "Nukumi", "Fili",
+    "Amini", "Kasuga", "Beckoner's", "Hashishin", "Chasseur's", "Karagoz",
+    "Maculele", "Arbatel", "Azimuth", "Erilaz",
+))
 
 
 def _item_type(item: dict | None) -> str:
@@ -35,12 +63,63 @@ def _is_empty(item: dict | None) -> bool:
     return not item or str(item.get("Name") or "Empty") == "Empty"
 
 
+def is_right_ear_only(item: dict | None) -> bool:
+    """Return whether an earring's modeled effect requires the right ear."""
+    item = item or {}
+    if bool(item.get("Right Ear Only") or item.get("right_ear_only")):
+        return True
+    text = " ".join(str(item.get(key) or "") for key in ("Name", "Name2"))
+    normalized = re.sub(r"[^a-z0-9]", "", text.casefold())
+    return "earring" in normalized and any(
+        normalized.startswith(re.sub(r"[^a-z0-9]", "", prefix.casefold()))
+        for prefix in SORTIE_JSE_EARRING_PREFIXES
+    )
+
+
+def apply_ear_slot_rules(gearset: dict) -> dict[str, str]:
+    """Place right-ear-only earrings in ``ear2`` (the right ear slot)."""
+    gearset.setdefault("ear1", Empty)
+    gearset.setdefault("ear2", Empty)
+    if not is_right_ear_only(gearset["ear1"]):
+        return {}
+    gearset["ear1"], gearset["ear2"] = gearset["ear2"], gearset["ear1"]
+    return {
+        "ear1": "right-ear-only earring moved to the right ear",
+        "ear2": "right-ear-only earring",
+    }
+
+
 def _tp_bonus(item: dict | None) -> float:
     """Return an item's modeled TP Bonus without letting metadata raise."""
     try:
         return float((item or {}).get("TP Bonus", 0) or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def has_conditional_set_effect(item: dict | None) -> bool:
+    """Return whether an item participates in a modeled cross-slot effect."""
+    name = str((item or {}).get("Name") or (item or {}).get("Name2") or "").casefold()
+    return name in STEELFLASH_BLADEBORN_PAIR or bool(
+        (item or {}).get("Conditional Effects") or (item or {}).get("conditional_effects")
+    )
+
+
+def conditional_gear_bonuses(gearset: dict) -> dict[str, float]:
+    """Return bonuses that exist only when their complete equipment set is worn.
+
+    Steelflash and Bladeborn retain their individual Accuracy/Attack and Store
+    TP values.  Their Double Attack +7 is a single two-ear set bonus, not a
+    stat supplied independently by either earring.
+    """
+    ear_names = {
+        str((gearset.get(slot) or {}).get("Name")
+            or (gearset.get(slot) or {}).get("Name2") or "").casefold()
+        for slot in ("ear1", "ear2")
+    }
+    if STEELFLASH_BLADEBORN_PAIR <= ear_names:
+        return {"DA": 7.0}
+    return {}
 
 
 def _can_dual_wield(main_job: str, sub_job: str, master_level: int) -> bool:
@@ -78,6 +157,33 @@ def apply_weapon_slot_rules(gearset: dict, main_job: str = "", sub_job: str = ""
     for slot in ("main", "sub", "ranged", "ammo"):
         gearset.setdefault(slot, Empty)
     changed: dict[str, str] = {}
+
+    # Dynamis-Divergence R15 REMA augments are main-hand-only.  The catalog
+    # deliberately keeps the augmented item for main-hand optimization, but
+    # an augmented REMA in ``sub`` must be reduced to its base weapon before
+    # any compatibility or stat aggregation occurs.  Rank-based Odyssey
+    # weapons are excluded by requiring the legacy R15 label and a matching
+    # unaugmented catalog entry.
+    sub_item = gearset.get("sub") or Empty
+    sub_name2 = str(sub_item.get("Name2") or "")
+    divergence_base = _DIVERGENCE_SUB_BY_NAME_PATH.get((
+        str(sub_item.get("Name") or ""),
+        str(sub_item.get("Augment Path") or "").upper(),
+    ))
+    if divergence_base is not None and not sub_name2.lower().endswith("(sub)"):
+        gearset["sub"] = dict(divergence_base)
+        sub_item = gearset["sub"]
+        sub_name2 = str(sub_item.get("Name2") or "")
+        changed["sub"] = "Dynamis-Divergence path augments apply only in main hand"
+    if (
+        _item_type(sub_item) == "Weapon"
+        and not sub_item.get("Rank")
+        and re.search(r"\sR15$", sub_name2, re.IGNORECASE)
+    ):
+        base_item = _REMA_R15_BASE_BY_NAME.get(str(sub_item.get("Name") or ""))
+        if base_item is not None:
+            gearset["sub"] = dict(base_item)
+            changed["sub"] = "Dynamis-Divergence R15 augment applies only in main hand"
 
     def clear(slot: str, reason: str):
         if not _is_empty(gearset.get(slot)):
