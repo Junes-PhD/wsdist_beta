@@ -4842,29 +4842,42 @@ class MainWindow(QMainWindow):
         figure.set_facecolor("#17142e")
         axis = figure.add_subplot(111)
         self._style_quick_chart_axis(axis)
-        colors = ("#fff0a8", "#72c7e8", "#d99bea", "#9de2a8")
-        series = [(str(current_name or "Current enemy"), primary)]
+        colors = ("#fff0a8", "#72c7e8", "#d99bea", "#9de2a8", "#f2a36f")
+        current_label = str(current_name or "Current enemy")
+        series = []
+        for key, label, color in (
+            ("tp", "TP DPS", colors[1]),
+            ("ws", "WS DPS", colors[2]),
+            ("total", "Combined DPS", colors[0]),
+        ):
+            if key in primary:
+                series.append((f"{current_label} · {label}", primary[key], color, "-", 2.3))
         for name, reference in (summary.get("reference_summaries") or {}).items():
             chart = _dps_series_chart_data(reference)
-            if chart is not None:
-                series.append((str(name), chart))
-        for index, (name, chart) in enumerate(series):
-            times, values = chart["total"]
+            if chart is not None and "total" in chart:
+                color = colors[(len(series) + 1) % len(colors)]
+                series.append((f"{name} · Combined DPS", chart["total"], color, "--", 1.35))
+        for name, chart, color, linestyle, linewidth in series:
+            times, values = chart
             axis.plot(
-                times, values, color=colors[index % len(colors)],
-                linewidth=2.4 if index == 0 else 1.5,
+                times, values, color=color, linestyle=linestyle,
+                linewidth=linewidth,
                 label=f"{name} · {float(values[-1]):,.1f} DPS",
             )
+        for line, (name, _chart, _color, _linestyle, _linewidth) in zip(axis.lines, series):
+            line.set_label(f"{name} ({float(line.get_ydata()[-1]):,.1f} DPS)")
         axis.set_xlim(0.0, 7200.0)
-        axis.set_title(title, loc="left", fontsize=10, fontweight="bold", color="#fffaff")
-        axis.set_xlabel("Elapsed time (seconds)", fontsize=8, color="#d0ccd6")
-        axis.set_ylabel("DPS", fontsize=8, color="#d0ccd6")
+        if "two-hour" in str(title).lower():
+            title = "Two-hour TP, WS, and combined DPS"
+        axis.set_title(title, loc="left", fontsize=10, fontweight="bold", color="#fffaff", pad=8)
+        axis.set_xlabel("Elapsed simulation time (seconds)", fontsize=8, color="#d0ccd6")
+        axis.set_ylabel("Damage per second (DPS)", fontsize=8, color="#d0ccd6")
         axis.grid(True, color="#302d4a", linewidth=0.8, alpha=0.8)
         handles, labels = axis.get_legend_handles_labels()
         if handles:
             figure.legend(
                 handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.01),
-                ncol=1, fontsize=6.5, facecolor="#17142e", edgecolor="#57536f",
+                ncol=2, fontsize=6.1, facecolor="#17142e", edgecolor="#57536f",
                 labelcolor="#fffaff", framealpha=0.96,
             )
         figure.subplots_adjust(left=0.13, right=0.97, bottom=0.31, top=0.84)
@@ -4987,16 +5000,16 @@ class MainWindow(QMainWindow):
             )
         axis.axvspan(chart["p05"], chart["p95"], color="#e6c983", alpha=0.13,
                     label=f"90% range {chart['p05']:,.0f}-{chart['p95']:,.0f}")
-        axis.set_title(f"{ws_name} - {chart['samples']:,}-sample damage distribution",
+        axis.set_title(f"{ws_name} · {chart['samples']:,} weapon-skill samples",
                        loc="left", fontsize=9, fontweight="bold", color="#fffaff", pad=9)
         axis.set_xlabel("Weapon-skill damage", fontsize=8, color="#d0ccd6")
-        axis.set_ylabel("Sample share", fontsize=8, color="#d0ccd6")
+        axis.set_ylabel("Probability", fontsize=8, color="#d0ccd6")
         axis.grid(True, axis="y", color="#302d4a", linewidth=0.8, alpha=0.8)
         handles, labels = axis.get_legend_handles_labels()
         if handles:
             figure.legend(
                 handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.01),
-                ncol=1, fontsize=6.2, facecolor="#17142e", edgecolor="#57536f",
+                ncol=2, fontsize=6.0, facecolor="#17142e", edgecolor="#57536f",
                 labelcolor="#fffaff", framealpha=0.96,
             )
         figure.subplots_adjust(left=0.13, right=0.97, bottom=0.35, top=0.84)
@@ -5213,20 +5226,21 @@ class MainWindow(QMainWindow):
             "The normal Results view embeds plots. This option is retained for compatibility with saved settings."
         )
         self.plot_dps_checkbox.setVisible(False)
-        self.simulate_button = QPushButton("Run two-hour DPS simulation")
-        self.simulate_button.setText("Run 2-hour DPS")
+        self.simulate_button = QPushButton("Simulate TP")
         self.simulate_button.setObjectName("cycleRunAction")
-        self.simulate_button.setMinimumHeight(30)
+        self.simulate_button.setMinimumHeight(26)
+        self.simulate_button.setMaximumHeight(30)
         self.simulate_button.clicked.connect(self.run_simulation)
         self.cancel_simulation_button = QPushButton("Stop")
         self.cancel_simulation_button.setObjectName("cycleStopAction")
-        self.cancel_simulation_button.setMinimumHeight(30)
+        self.cancel_simulation_button.setMinimumHeight(26)
         self.cancel_simulation_button.setEnabled(False)
+        self.cancel_simulation_button.setVisible(False)
         self.cancel_simulation_button.clicked.connect(self.stop_simulation)
-        distribution = QPushButton("Generate WS damage graph")
-        distribution.setText("WS damage graph")
+        distribution = QPushButton("Simulate WS")
         distribution.setObjectName("cycleSecondaryAction")
-        distribution.setMinimumHeight(30)
+        distribution.setMinimumHeight(26)
+        distribution.setMaximumHeight(30)
         distribution.setToolTip("Sample the default 20,000 weapon skills and save the compact histogram to Results.")
         distribution.clicked.connect(self.plot_ws_distribution)
         copy_tp_ws = QPushButton("Copy TP → WS")
@@ -5235,14 +5249,10 @@ class MainWindow(QMainWindow):
         swap.clicked.connect(self.swap_tp_ws_sets)
         copy_tp_ws.setObjectName("cycleSecondaryAction")
         swap.setObjectName("cycleSecondaryAction")
-        controls.addWidget(self.simulate_button, 0, 0, 1, 2)
-        controls.addWidget(self.cancel_simulation_button, 0, 2)
-        controls.addWidget(distribution, 1, 0)
-        controls.addWidget(copy_tp_ws, 1, 1)
-        controls.addWidget(swap, 1, 2)
+        tp_layout.addWidget(self.simulate_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        ws_layout.addWidget(distribution, 0, Qt.AlignmentFlag.AlignHCenter)
         for column in range(3):
             controls.setColumnStretch(column, 1)
-        right_layout.addWidget(actions_box)
         status_box = QGroupBox("Cycle status")
         status_box.setObjectName("cycleStatusPanel")
         status_layout = QVBoxLayout(status_box)
@@ -5260,8 +5270,11 @@ class MainWindow(QMainWindow):
         self.plot_status = QLabel("Ready · choose a WS and run a reproducible cycle.")
         self.plot_status.setObjectName("cycleStatus")
         self.plot_status.setWordWrap(True)
-        status_layout.addWidget(self.plot_status)
-        right_layout.addWidget(status_box)
+        self.plot_status.setVisible(False)
+        status_box.setVisible(False)
+        right_layout.addWidget(self.cycle_reference_checkbox, 0, Qt.AlignmentFlag.AlignLeft)
+        self.cycle_reference_checkbox.setParent(right_column)
+        self.cycle_reference_checkbox.setVisible(True)
         self.cycle_result_figure = None
         self.cycle_result_canvas = None
         graph_panel = QFrame()
