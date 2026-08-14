@@ -3326,6 +3326,8 @@ class MainWindow(QMainWindow):
         self.quick_distribution_thread: PlotThread | None = None
         self._quick_distribution_threads: list[PlotThread] = []
         self._last_quick_result: dict | None = None
+        self._last_cycle_dps_summary: dict | None = None
+        self._last_cycle_distribution: dict | None = None
         self._history_selected_id: int | None = None
         self._workspace_generated_set_name = ""
         self._dashboard_ws_ranking_active = False
@@ -3342,6 +3344,7 @@ class MainWindow(QMainWindow):
         self._optimizer_started_at: float | None = None
         self._optimizer_eta_started_at: float | None = None
         self._optimizer_progress_samples: list[tuple[float, float]] = []
+        self._optimizer_tradeoff_eta: dict | None = None
         self._optimizer_status_timer = QTimer(self)
         self._optimizer_status_timer.setInterval(1000)
         self._optimizer_status_timer.timeout.connect(self._refresh_optimizer_status)
@@ -4831,10 +4834,16 @@ class MainWindow(QMainWindow):
 
     def _render_dps_comparison_graph(self, figure, canvas, summary: dict,
                                      current_name: str = "Current enemy",
-                                     *, title: str = "Two-hour DPS comparison") -> bool:
+                                     *, title: str = "Two-hour DPS comparison",
+                                     reference_details: bool = False) -> bool:
         """Plot the active enemy and optional Profile Builder reference tiers."""
         if figure is None or canvas is None or not isinstance(summary, dict):
             return False
+        if canvas is getattr(self, "cycle_result_canvas", None):
+            reference_details = bool(
+                getattr(self, "cycle_reference_details_checkbox", None)
+                and self.cycle_reference_details_checkbox.isChecked()
+            )
         primary = _dps_series_chart_data(summary)
         if primary is None:
             return False
@@ -4843,6 +4852,7 @@ class MainWindow(QMainWindow):
         axis = figure.add_subplot(111)
         self._style_quick_chart_axis(axis)
         colors = ("#fff0a8", "#72c7e8", "#d99bea", "#9de2a8", "#f2a36f")
+        reference_colors = ("#9de2a8", "#f2a36f", "#bba7ff")
         current_label = str(current_name or "Current enemy")
         series = []
         for key, label, color in (
@@ -4852,11 +4862,26 @@ class MainWindow(QMainWindow):
         ):
             if key in primary:
                 series.append((f"{current_label} · {label}", primary[key], color, "-", 2.3))
-        for name, reference in (summary.get("reference_summaries") or {}).items():
+        for index, (name, reference) in enumerate(
+            (summary.get("reference_summaries") or {}).items()
+        ):
             chart = _dps_series_chart_data(reference)
             if chart is not None and "total" in chart:
-                color = colors[(len(series) + 1) % len(colors)]
+                color = reference_colors[index % len(reference_colors)]
                 series.append((f"{name} · Combined DPS", chart["total"], color, "--", 1.35))
+        if reference_details:
+            for index, (name, reference) in enumerate(
+                (summary.get("reference_summaries") or {}).items()
+            ):
+                chart = _dps_series_chart_data(reference)
+                if chart is None:
+                    continue
+                color = reference_colors[index % len(reference_colors)]
+                for key, label, linestyle in (
+                    ("tp", "TP DPS", ":"), ("ws", "WS DPS", "-."),
+                ):
+                    if key in chart:
+                        series.append((f"{name} · {label}", chart[key], color, linestyle, 1.0))
         for name, chart, color, linestyle, linewidth in series:
             times, values = chart
             axis.plot(
@@ -4875,12 +4900,19 @@ class MainWindow(QMainWindow):
         axis.grid(True, color="#302d4a", linewidth=0.8, alpha=0.8)
         handles, labels = axis.get_legend_handles_labels()
         if handles:
+            columns = 3 if len(handles) > 6 else 2
+            rows = math.ceil(len(handles) / columns)
             figure.legend(
                 handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.01),
-                ncol=2, fontsize=6.1, facecolor="#17142e", edgecolor="#57536f",
+                ncol=columns, fontsize=5.5 if len(handles) > 6 else 6.1,
+                facecolor="#17142e", edgecolor="#57536f",
                 labelcolor="#fffaff", framealpha=0.96,
             )
-        figure.subplots_adjust(left=0.13, right=0.97, bottom=0.31, top=0.84)
+        else:
+            rows = 0
+        figure.subplots_adjust(
+            left=0.13, right=0.97, bottom=min(0.46, 0.23 + rows * 0.04), top=0.84
+        )
         canvas.draw_idle()
         return True
 
@@ -4934,6 +4966,7 @@ class MainWindow(QMainWindow):
             self._render_dps_comparison_graph(
                 figure, canvas, dps_summary, self.enemy_combo.currentText(),
                 title="Two-hour DPS comparison",
+                reference_details=self.quick_reference_details_checkbox.isChecked(),
             )
             return
         else:
@@ -4966,10 +4999,16 @@ class MainWindow(QMainWindow):
         canvas.draw_idle()
 
     def _render_ws_distribution_graph(self, figure, canvas, distribution: dict,
-                                      *, ws_name: str = "Weapon skill") -> bool:
+                                      *, ws_name: str = "Weapon skill",
+                                      reference_details: bool = False) -> bool:
         chart = _ws_distribution_chart_data(distribution)
         if figure is None or canvas is None or chart is None:
             return False
+        if canvas is getattr(self, "cycle_result_canvas", None):
+            reference_details = bool(
+                getattr(self, "cycle_reference_details_checkbox", None)
+                and self.cycle_reference_details_checkbox.isChecked()
+            )
         figure.clear()
         figure.set_facecolor("#17142e")
         axis = figure.add_subplot(111)
@@ -4993,8 +5032,18 @@ class MainWindow(QMainWindow):
             reference_chart = _ws_distribution_chart_data(reference)
             if reference_chart is None:
                 continue
+            color = reference_colors[index % len(reference_colors)]
+            if reference_details:
+                reference_density = reference_chart["counts"] / max(
+                    1.0, float(np.sum(reference_chart["counts"]))
+                )
+                axis.stairs(
+                    reference_density, reference_chart["edges"], color=color,
+                    linewidth=1.2, linestyle="--", alpha=0.92,
+                    label=f"{name} distribution",
+                )
             axis.axvline(
-                reference_chart["mean"], color=reference_colors[index % len(reference_colors)],
+                reference_chart["mean"], color=color,
                 linewidth=1.4, linestyle="--",
                 label=f"{name} mean {reference_chart['mean']:,.0f}",
             )
@@ -5007,12 +5056,19 @@ class MainWindow(QMainWindow):
         axis.grid(True, axis="y", color="#302d4a", linewidth=0.8, alpha=0.8)
         handles, labels = axis.get_legend_handles_labels()
         if handles:
+            columns = 3 if len(handles) > 6 else 2
+            rows = math.ceil(len(handles) / columns)
             figure.legend(
                 handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.01),
-                ncol=2, fontsize=6.0, facecolor="#17142e", edgecolor="#57536f",
+                ncol=columns, fontsize=5.5 if len(handles) > 6 else 6.0,
+                facecolor="#17142e", edgecolor="#57536f",
                 labelcolor="#fffaff", framealpha=0.96,
             )
-        figure.subplots_adjust(left=0.13, right=0.97, bottom=0.35, top=0.84)
+        else:
+            rows = 0
+        figure.subplots_adjust(
+            left=0.13, right=0.97, bottom=min(0.48, 0.27 + rows * 0.04), top=0.84
+        )
         canvas.draw_idle()
         return True
 
@@ -5026,6 +5082,17 @@ class MainWindow(QMainWindow):
             figure, canvas, summary, self.enemy_combo.currentText(),
             title="TP → WS two-hour DPS comparison",
         )
+
+    def _cycle_reference_details_toggle(self, _enabled: bool):
+        """Redraw the retained cycle graph with the requested reference detail."""
+        if self._last_cycle_dps_summary:
+            self._render_cycle_dps_graph(self._last_cycle_dps_summary)
+        elif self._last_cycle_distribution:
+            self._render_ws_distribution_graph(
+                self.cycle_result_figure, self.cycle_result_canvas,
+                self._last_cycle_distribution, ws_name=self.ws_combo.currentText(),
+                reference_details=self.cycle_reference_details_checkbox.isChecked(),
+            )
 
     def _quick_tab(self) -> QWidget:
         tab = QWidget()
@@ -5090,7 +5157,25 @@ class MainWindow(QMainWindow):
             "Include Apex Toad, Apex Knight Lugcrawler, and Apex Archaic Cogs in DPS and WS graphs."
         )
         self.quick_reference_checkbox.toggled.connect(self._quick_reference_toggle)
-        result_layout.addWidget(self.quick_reference_checkbox)
+        self.quick_reference_details_checkbox = QCheckBox("More reference info")
+        self.quick_reference_details_checkbox.setObjectName("referenceEnemyToggle")
+        self.quick_reference_details_checkbox.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
+        )
+        self.quick_reference_details_checkbox.setChecked(False)
+        self.quick_reference_details_checkbox.setToolTip(
+            "Show TP and WS DPS for each reference enemy, plus their full WS distributions."
+        )
+        self.quick_reference_details_checkbox.toggled.connect(
+            self._quick_reference_details_toggle
+        )
+        quick_reference_controls = QHBoxLayout()
+        quick_reference_controls.setContentsMargins(0, 0, 0, 0)
+        quick_reference_controls.setSpacing(10)
+        quick_reference_controls.addWidget(self.quick_reference_checkbox)
+        quick_reference_controls.addWidget(self.quick_reference_details_checkbox)
+        quick_reference_controls.addStretch(1)
+        result_layout.addLayout(quick_reference_controls)
         self.quick_result_figure = None
         self.quick_result_canvas = None
         if FigureCanvas is not None and Figure is not None:
@@ -5266,15 +5351,29 @@ class MainWindow(QMainWindow):
         self.cycle_reference_checkbox.setToolTip(
             "Include the three Profile Builder reference enemies in the 2-hour and WS graphs."
         )
-        status_layout.addWidget(self.cycle_reference_checkbox)
+        self.cycle_reference_details_checkbox = QCheckBox("More reference info")
+        self.cycle_reference_details_checkbox.setObjectName("referenceEnemyToggle")
+        self.cycle_reference_details_checkbox.setSizePolicy(
+            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
+        )
+        self.cycle_reference_details_checkbox.setChecked(False)
+        self.cycle_reference_details_checkbox.setToolTip(
+            "Show TP and WS DPS for each reference enemy, plus their full WS distributions."
+        )
+        self.cycle_reference_details_checkbox.toggled.connect(
+            self._cycle_reference_details_toggle
+        )
+        self.cycle_reference_checkbox.toggled.connect(
+            self.cycle_reference_details_checkbox.setEnabled
+        )
+        self.cycle_reference_details_checkbox.setEnabled(
+            self.cycle_reference_checkbox.isChecked()
+        )
         self.plot_status = QLabel("Ready · choose a WS and run a reproducible cycle.")
         self.plot_status.setObjectName("cycleStatus")
         self.plot_status.setWordWrap(True)
         self.plot_status.setVisible(False)
         status_box.setVisible(False)
-        right_layout.addWidget(self.cycle_reference_checkbox, 0, Qt.AlignmentFlag.AlignLeft)
-        self.cycle_reference_checkbox.setParent(right_column)
-        self.cycle_reference_checkbox.setVisible(True)
         self.cycle_result_figure = None
         self.cycle_result_canvas = None
         graph_panel = QFrame()
@@ -5284,7 +5383,13 @@ class MainWindow(QMainWindow):
         graph_layout.setContentsMargins(7, 7, 7, 7)
         graph_title = QLabel("Simulation graph")
         graph_title.setObjectName("sectionTitle")
-        graph_layout.addWidget(graph_title)
+        graph_header = QHBoxLayout()
+        graph_header.setContentsMargins(0, 0, 0, 0)
+        graph_header.setSpacing(8)
+        graph_header.addWidget(graph_title, 1)
+        graph_header.addWidget(self.cycle_reference_checkbox)
+        graph_header.addWidget(self.cycle_reference_details_checkbox)
+        graph_layout.addLayout(graph_header)
         if FigureCanvas is not None and Figure is not None:
             self.cycle_result_figure = Figure(figsize=(8.0, 4.5), dpi=100)
             self.cycle_result_canvas = FigureCanvas(self.cycle_result_figure)
@@ -6185,6 +6290,7 @@ class MainWindow(QMainWindow):
         form.addRow("Ranking weapon type", self.ranking_weapon_type)
         form.addRow("Sub-stat damage action", self.substat_base_action)
         form.addRow("Max damage loss from best", self.substat_loss_percent)
+        form.addRow("Tradeoff search depth", self.tradeoff_depth)
         self.tradeoff_depth.setVisible(False)
         for index, combo in enumerate(self.substat_combos, start=1):
             form.addRow(f"Secondary stat priority {index}", combo)
@@ -10613,6 +10719,7 @@ class MainWindow(QMainWindow):
 
     def _quick_reference_toggle(self, enabled: bool):
         """Rebuild the active Quick Look graph when reference comparison changes."""
+        self.quick_reference_details_checkbox.setEnabled(bool(enabled))
         action = str((self._last_quick_result or {}).get("action") or "")
         if action not in {"attack", "ws"}:
             return
@@ -10624,6 +10731,24 @@ class MainWindow(QMainWindow):
                 self._start_quick_ws_distribution(player, enemy)
         except Exception as error:
             self.statusBar().showMessage(f"Reference graph update failed: {error}", 5000)
+
+    def _quick_reference_details_toggle(self, _enabled: bool):
+        """Redraw saved Quick Look reference data without repeating a simulation."""
+        saved = self._last_quick_result or {}
+        action = str(saved.get("action") or "")
+        if action == "attack" and saved.get("dps_summary"):
+            self._render_dps_comparison_graph(
+                self.quick_result_figure, self.quick_result_canvas,
+                saved["dps_summary"], self.enemy_combo.currentText(),
+                title="Two-hour DPS comparison",
+                reference_details=self.quick_reference_details_checkbox.isChecked(),
+            )
+        elif action == "ws" and saved.get("distribution"):
+            self._render_ws_distribution_graph(
+                self.quick_result_figure, self.quick_result_canvas,
+                saved["distribution"], ws_name=self.ws_combo.currentText(),
+                reference_details=self.quick_reference_details_checkbox.isChecked(),
+            )
 
     def _start_quick_dps_comparison(self, player, enemy):
         """Run the two-hour cycle for Quick Look's active and reference enemies."""
@@ -10666,6 +10791,7 @@ class MainWindow(QMainWindow):
         if not self._render_dps_comparison_graph(
             self.quick_result_figure, self.quick_result_canvas, summary,
             self.enemy_combo.currentText(), title="Two-hour DPS comparison",
+            reference_details=self.quick_reference_details_checkbox.isChecked(),
         ):
             self._quick_dps_comparison_failed(worker, "The DPS comparison returned no valid series.")
             return
@@ -10728,6 +10854,7 @@ class MainWindow(QMainWindow):
         if not self._render_ws_distribution_graph(
             self.quick_result_figure, self.quick_result_canvas, distribution,
             ws_name=worker.ws_name,
+            reference_details=self.quick_reference_details_checkbox.isChecked(),
         ):
             self._quick_ws_distribution_failed(worker, "The sampled histogram was invalid.")
             return
@@ -11055,6 +11182,7 @@ class MainWindow(QMainWindow):
             self._clear_optimizer_log()
             self.optimizer_top_results = []
             self._optimizer_run_state = {}
+            self._optimizer_tradeoff_eta = None
             self._optimizer_started_at = time.monotonic()
             batch_started = getattr(self, "_profile_builder_optimizer_batch_started_at", None)
             if profile_builder_active and batch_started:
@@ -11294,6 +11422,10 @@ class MainWindow(QMainWindow):
             "warming", f"Cache simulation running · 0/{len(tasks):,} tasks processed.", 0.0
         )
         self.optimize_button.setEnabled(False)
+        # The shared optimizer control bar is also the primary stop control
+        # while the cache-precompute queue is running.  Keep it wired to the
+        # overnight worker instead of leaving the visible Stop button inert.
+        self.stop_optimizer_button.setEnabled(True)
         self.overnight_button.setEnabled(False)
         self.stop_overnight_button.setEnabled(True)
         self.overnight_thread = OvernightSimulationThread(
@@ -11334,6 +11466,7 @@ class MainWindow(QMainWindow):
     def _finish_overnight_ui(self, label: str):
         self._optimizer_status_timer.stop()
         self.optimize_button.setEnabled(True)
+        self.stop_optimizer_button.setEnabled(False)
         self.overnight_button.setEnabled(True)
         self.stop_overnight_button.setEnabled(False)
         self.optimizer_activity.setText(label)
@@ -11387,6 +11520,7 @@ class MainWindow(QMainWindow):
     def stop_overnight_simulations(self):
         if self.overnight_thread and self.overnight_thread.isRunning():
             self.overnight_thread.request_stop()
+            self.stop_optimizer_button.setEnabled(False)
             self.stop_overnight_button.setEnabled(False)
             self.optimizer_activity.setText("Stopping...")
             self._set_optimizer_run_ui(
@@ -11576,6 +11710,23 @@ class MainWindow(QMainWindow):
             for state in states
         ]
         search_progress = sum(fractions) / max(1, len(fractions))
+        tradeoff_eta = getattr(self, "_optimizer_tradeoff_eta", None)
+        if tradeoff_eta and int(tradeoff_eta.get("total", 0)) > 0:
+            total_work = max(1, int(tradeoff_eta["total"]))
+            completed_work = max(0, int(tradeoff_eta.get("completed", 0)))
+            phase_fraction = 0.0
+            if tradeoff_eta.get("active"):
+                if tradeoff_eta.get("phase") == "baseline":
+                    phase_fraction = search_progress
+                else:
+                    phase_fraction = min(
+                        1.0,
+                        float(self._optimizer_run_state.get(1, {}).get("fraction", 0.0)),
+                    )
+            phase_weight = max(0, int(tradeoff_eta.get("phase_weight", 0)))
+            search_progress = min(
+                1.0, (completed_work + phase_fraction * phase_weight) / total_work
+            )
         batch_total = int(getattr(self, "_profile_builder_optimizer_total", 0) or 0)
         batch_completed = int(
             getattr(self, "_profile_builder_optimizer_completed_count", 0) or 0
@@ -11662,6 +11813,58 @@ class MainWindow(QMainWindow):
             )
 
     def _update_optimizer_run_state(self, message: str):
+        tradeoff_plan = re.search(
+            r"Tradeoff ETA plan: baseline=(\d+); targeted=(\d+); total=(\d+)\.",
+            message,
+            re.I,
+        )
+        if tradeoff_plan:
+            baseline, _targeted, total = map(int, tradeoff_plan.groups())
+            self._optimizer_tradeoff_eta = {
+                "total": max(1, total), "completed": 0,
+                "phase": "baseline", "phase_weight": max(1, baseline),
+                "active": True,
+            }
+            self._optimizer_progress_samples = []
+            self._refresh_optimizer_status()
+            return
+        tradeoff_phase = re.search(
+            r"Tradeoff ETA phase: (.+?); completed=(\d+)/(\d+)\.",
+            message,
+            re.I,
+        )
+        if tradeoff_phase:
+            target, completed, total = tradeoff_phase.groups()
+            self._optimizer_tradeoff_eta = {
+                "total": max(1, int(total)), "completed": int(completed),
+                "phase": str(target), "phase_weight": 1, "active": True,
+            }
+            # Each constrained frontier path is a fresh one-run search.  The
+            # baseline's completed card must not make this phase look done.
+            state = self._optimizer_run_state.get(1)
+            if state is not None:
+                state.pop("iteration", None)
+                state.pop("iterations", None)
+                state.pop("tested", None)
+                state.pop("planned", None)
+                state["fraction"] = 0.0
+                state["phase"] = f"tradeoff {target}"
+                state["updated"] = time.monotonic()
+            self._refresh_optimizer_status()
+            return
+        tradeoff_progress = re.search(
+            r"Tradeoff ETA progress: (\d+)/(\d+)\.", message, re.I,
+        )
+        if tradeoff_progress:
+            completed, total = map(int, tradeoff_progress.groups())
+            tracker = self._optimizer_tradeoff_eta or {}
+            tracker.update({
+                "total": max(1, total), "completed": min(total, completed),
+                "active": False, "phase_weight": 0,
+            })
+            self._optimizer_tradeoff_eta = tracker
+            self._refresh_optimizer_status()
+            return
         ranking = re.search(r"WS ranking (\d+)/(\d+):\s*(.+)", message, re.I)
         if ranking:
             current, total = map(int, ranking.groups()[:2])
@@ -11997,6 +12200,8 @@ class MainWindow(QMainWindow):
                     state["phase"] = "stopping"
             self._refresh_optimizer_status()
             self._append_optimizer_log("Stop requested; finishing the current calculation...")
+        elif self.overnight_thread and self.overnight_thread.isRunning():
+            self.stop_overnight_simulations()
 
     def _optimizer_progress(self, message: str):
         ranking = re.search(r"WS ranking (\d+)/(\d+):\s*(.+)", message)
@@ -12180,6 +12385,8 @@ class MainWindow(QMainWindow):
             }
             if _dps_series_chart_data(summary) is None:
                 raise ValueError("Simulation returned no valid DPS convergence series.")
+            self._last_cycle_dps_summary = summary
+            self._last_cycle_distribution = None
             self._render_cycle_dps_graph(summary)
             self._add_history(
                 "cycle", f"{self.ws_combo.currentText()} cycle · {self.tp_value.value():,} TP", payload
@@ -12237,6 +12444,8 @@ class MainWindow(QMainWindow):
             }
             if _ws_distribution_chart_data(distribution) is None:
                 raise ValueError("Weapon-skill distribution returned an invalid histogram.")
+            self._last_cycle_distribution = distribution
+            self._last_cycle_dps_summary = None
             self._render_ws_distribution_graph(
                 self.cycle_result_figure, self.cycle_result_canvas, distribution,
                 ws_name=self.plot_thread.ws_name,

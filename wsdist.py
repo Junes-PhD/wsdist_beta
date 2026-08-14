@@ -541,12 +541,38 @@ def _substat_constraints_met(player, constraints):
     )
 
 
+def _canonical_gearset_key(gearset, item_key):
+    """Return a comparison key that ignores ear/ring position labels.
+
+    Ear and ring positions are interchangeable for set comparison.  Keep the
+    actual item identities (including augments/bridge keys), but canonicalize
+    each pair as an ordered two-item tuple so ``EAR1=A, EAR2=B`` and
+    ``EAR1=B, EAR2=A`` deduplicate to the same displayed set.  This affects
+    identity/deduplication only; the modeled gearset itself is never mutated.
+    """
+    paired_slots = (("ear1", "ear2"), ("ring1", "ring2"))
+    paired_by_slot = {slot: pair for pair in paired_slots for slot in pair}
+    result = []
+    for slot in sorted(gearset):
+        pair = paired_by_slot.get(slot)
+        if pair is not None:
+            if slot != pair[0]:
+                continue
+            values = tuple(sorted(
+                item_key(gearset.get(pair_slot) or {}) for pair_slot in pair
+            ))
+            result.append((pair, values))
+            continue
+        result.append((slot, item_key(gearset.get(slot) or {})))
+    return tuple(result)
+
+
 def _gearset_identity(player):
     """Stable identity for a displayed optimizer result."""
     modeled = _substat_player(player)
-    return tuple(
-        (slot, str(item.get("Bridge Key") or item.get("Name2") or item.get("Name") or "Empty"))
-        for slot, item in sorted(modeled.gearset.items())
+    return _canonical_gearset_key(
+        modeled.gearset,
+        lambda item: str(item.get("Bridge Key") or item.get("Name2") or item.get("Name") or "Empty"),
     )
 
 
@@ -1581,16 +1607,16 @@ def _rank_optimizer_results(results, limit=OPTIMIZER_RESULT_LIMIT):
 
 
 def _gearset_key(player):
-    return tuple(
-        (slot, str(item.get("Name2") or item.get("Name") or "Empty"))
-        for slot, item in sorted(player.gearset.items())
+    return _canonical_gearset_key(
+        player.gearset,
+        lambda item: str(item.get("Name2") or item.get("Name") or "Empty"),
     )
 
 
 def _gearset_mapping_key(gearset):
-    return tuple(
-        (slot, str(item.get("Name2") or item.get("Name") or "Empty"))
-        for slot, item in sorted(gearset.items())
+    return _canonical_gearset_key(
+        gearset,
+        lambda item: str(item.get("Name2") or item.get("Name") or "Empty"),
     )
 
 
@@ -2154,7 +2180,21 @@ def optimize_tradeoffs(main_job, sub_job, master_level, buffs, abilities, enemy,
     ]
     if not specs:
         raise ValueError("Select at least one secondary stat to optimize.")
+    loss_bands = [max(0.0, min(100.0, float(substat_specs[0].get("loss_percent", 15.0))))]
+    if str(search_mode).lower() == "deep" and loss_bands[0] > 0:
+        loss_bands = sorted({round(loss_bands[0] * step / 4.0, 8) for step in range(1, 5)})
+    targets = [spec["target"] for spec in specs]
+    targeted_paths = len(loss_bands) * len(targets)
+    total_work_units = max(1, int(restarts) + targeted_paths)
     if progress_callback is not None:
+        # The baseline uses ``restarts`` independent paths; each constrained
+        # frontier search uses one.  This explicit plan lets the GUI estimate
+        # ETA from comparable work units instead of mistaking a completed
+        # baseline for the entire tradeoff run.
+        progress_callback(
+            f"Tradeoff ETA plan: baseline={int(restarts)}; targeted={targeted_paths}; "
+            f"total={total_work_units}."
+        )
         progress_callback("Tradeoff optimization: finding the primary baseline...")
     baseline = optimize_set(
         main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
@@ -2167,8 +2207,7 @@ def optimize_tradeoffs(main_job, sub_job, master_level, buffs, abilities, enemy,
         stop_event=stop_event,
     )
     baseline_player, baseline_output, baseline_metric, baseline_seed, baseline_results = baseline
-    max_loss = max(0.0, min(100.0, float(substat_specs[0].get("loss_percent", 15.0))))
-    targets = [spec["target"] for spec in specs]
+    max_loss = loss_bands[-1]
 
     def stat_values(player):
         modeled = _substat_player(player)
@@ -2186,9 +2225,10 @@ def optimize_tradeoffs(main_job, sub_job, master_level, buffs, abilities, enemy,
         "metric": float(baseline_metric), "seed": baseline_seed,
         "substats": stat_values(baseline_player), "kind": "primary",
     })
-    loss_bands = [max_loss]
-    if str(search_mode).lower() == "deep" and max_loss > 0:
-        loss_bands = sorted({round(max_loss * step / 4.0, 8) for step in range(1, 5)})
+    if progress_callback is not None:
+        progress_callback(
+            f"Tradeoff ETA progress: {int(restarts)}/{total_work_units}."
+        )
 
     phase_number = 0
     for loss in loss_bands:
@@ -2198,6 +2238,10 @@ def optimize_tradeoffs(main_job, sub_job, master_level, buffs, abilities, enemy,
             if _stop_requested(stop_event):
                 raise OptimizerStopped("Optimizer stopped by user.")
             if progress_callback is not None:
+                completed_units = int(restarts) + phase_number - 1
+                progress_callback(
+                    f"Tradeoff ETA phase: {target}; completed={completed_units}/{total_work_units}."
+                )
                 progress_callback(
                     f"Tradeoff optimization: exploring {target} at {loss:.2f}% primary loss "
                     f"({phase_number}/{len(loss_bands) * len(targets)})..."
@@ -2218,12 +2262,20 @@ def optimize_tradeoffs(main_job, sub_job, master_level, buffs, abilities, enemy,
                 preserve_starting_gearset=True, substat_spec=phase,
             )
             if float(metric) + 1e-12 < damage_floor:
+                if progress_callback is not None:
+                    progress_callback(
+                        f"Tradeoff ETA progress: {int(restarts) + phase_number}/{total_work_units}."
+                    )
                 continue
             records.append({
                 "player": player, "output": output, "metric": float(metric),
                 "seed": phase_seed, "substats": stat_values(player),
                 "kind": "extreme", "target": target, "loss_band": loss,
             })
+            if progress_callback is not None:
+                progress_callback(
+                    f"Tradeoff ETA progress: {int(restarts) + phase_number}/{total_work_units}."
+                )
 
     frontier = pareto_frontier(records, targets, limit=40)
     if not frontier:
