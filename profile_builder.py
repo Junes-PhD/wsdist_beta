@@ -19,7 +19,7 @@ from equipment_rules import (
     apply_ear_slot_rules, conditional_gear_bonuses, has_conditional_set_effect,
     is_right_ear_only,
 )
-from wsdist_bridge import _gear_record
+from wsdist_bridge import _gear_record, _with_curated_model, _with_ffxiah_model, _exact_rank_augment
 
 
 ARMOR_SLOTS = (
@@ -273,7 +273,7 @@ def profile_recipes(job: str, existing_names: Iterable[str]) -> list[ProfileReci
 
 
 def bridge_candidates(store, job: str, sources: GearSources) -> dict[str, list[dict]]:
-    """Build an owned-only pool from raw bridge data, including Porter on demand."""
+    """Build an owned-only pool, including movable storage on demand."""
     # Ammo is set-specific stat gear for melee jobs, not merely a fixed weapon
     # overlay. Keep it in generated and optimized sets instead of silently
     # publishing an empty ammo slot.
@@ -282,14 +282,24 @@ def bridge_candidates(store, job: str, sources: GearSources) -> dict[str, list[d
     for raw in store.data.get("items", []):
         locations = raw.get("locations") or []
         accessible = int(raw.get("accessible_count") or 0) > 0
-        porter = any(
-            str(row.get("source", "")).casefold().replace("_", " ") == "porter slip"
-            or str(row.get("container", "")).casefold() == "porter slip"
+        stored = any(
+            str(row.get("source", "")).casefold().replace("_", " ") in {
+                "porter slip", "storage", "locker", "safe", "satchel", "sack", "case"
+            }
+            or str(row.get("container", "")).casefold() in {
+                "porter slip", "storage", "locker", "safe", "satchel", "sack", "case"
+            }
+            or (row.get("available") is False and str(row.get("source", "")).casefold() != "transferable")
             for row in locations
         )
         transferable = bool(raw.get("transferable"))
-        allowed = ((sources.accessible and accessible) or (sources.porter and porter)
+        allowed = ((sources.accessible and accessible) or (sources.porter and stored)
                    or (sources.transferable and transferable))
+        # Apply the same reviewed models used by BridgeStore before rejecting
+        # a storage-only record.  This matters for items whose raw export has
+        # no decoded stats but whose ID has a curated model (for example
+        # Eminent Bullet).
+        raw = _exact_rank_augment(_with_ffxiah_model(_with_curated_model(raw)))
         # Base stats are sufficient for a conservative profile recipe even
         # when GearSetBuilder reports an unmodeled specialized augment. The
         # bridge record carries a warning; records with no stats remain out.

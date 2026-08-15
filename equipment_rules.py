@@ -145,6 +145,16 @@ def ranged_attack_ready(gearset: dict) -> bool:
     return _item_type(gearset.get("ammo")) == PROJECTILE_FOR_RANGED.get(ranged_type)
 
 
+def ranged_pair_compatible(gearset: dict) -> bool:
+    """Return true for an empty ranged layer or a correctly paired projectile."""
+    ranged_type = _item_type(gearset.get("ranged"))
+    if ranged_type in PROJECTILE_FOR_RANGED:
+        return ranged_attack_ready(gearset)
+    if ranged_type == "Instrument":
+        return _is_empty(gearset.get("ammo"))
+    return True
+
+
 def apply_weapon_slot_rules(gearset: dict, main_job: str = "", sub_job: str = "",
                             master_level: int = 0) -> dict[str, str]:
     """Clear mutually exclusive weapon-slot items and return changed-slot reasons.

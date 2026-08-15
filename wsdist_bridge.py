@@ -54,7 +54,188 @@ SKILL_NAMES = {
     6: "Great Axe", 7: "Scythe", 8: "Polearm", 9: "Katana", 10: "Great Katana",
     11: "Club", 12: "Staff", 13: "Archery", 14: "Marksmanship", 15: "Throwing",
 }
+
+# These imports can carry a rank without an explicit path in older bridge
+# files. REMA/Ergon and Oboro JSE weapons have the single Path A augment;
+# JSE necks and Unity accessories likewise have one path. Divergence weapons
+# are *not* included because their missing path is genuinely ambiguous (A/B/C).
+SINGLE_PATH_A_WEAPONS = {
+    # REMA / Ergon (including ranged and instrument weapons represented by
+    # the bridge as weapons rather than armor).
+    "Aeneas", "Aettir", "Almace", "Amanomurakumo", "Annihilator",
+    "Apocalypse", "Armageddon", "Bravura", "Burtgang", "Caladbolg",
+    "Carnwenhan", "Chango", "Claustrum", "Conqueror", "Death Penalty",
+    "Epeolatry", "Excalibur", "Fail-Not", "Fomalhaut", "Gandiva", "Gastraphetes",
+    "Godhands", "Gungnir", "Guttler", "Heishi", "Hvergelmir", "Idris",
+    "Kenkonken", "Kikoku", "Kogarasumaru", "Laevateinn", "Liberator",
+    "Mandau", "Masamune", "Mjollnir", "Murgleis", "Nagi", "Nirvana",
+    "Ragnarok", "Redemption", "Rhongomiant", "Ryunohige", "Sandung",
+    "Sequence", "Spharai", "Terpsichore", "Tizona",
+    "Tupsimati", "Twashtar", "Ukonvasara", "Vajra", "Verethragna",
+    "Yagrush", "Yoichinoyumi",
+    # Oboro JSE weapons.
+    "Areadbhar", "Arktoi", "Coeus", "Cronus", "Deathlocke", "Dunna",
+    "Egeking", "Gridarvor", "Kaladanda", "Kurikaranotachi", "Lionsquall",
+    "Mimesis", "Minos", "Nyepel", "Ohtas", "Polyhymnia", "Priwen",
+    "Shigi", "Sindri", "Terpander",
+}
 BASE_PARAMETERS = ("STR", "DEX", "VIT", "AGI", "INT", "MND", "CHR")
+
+# Exact character observations from augment_report.md.  These are rank deltas,
+# not full item totals: apply them only when a bridge export has not supplied a
+# separate rank payload of its own.  Keep paths explicit, including armor's
+# legitimate Path D, so one path can never fall through to a neighbouring one.
+EXACT_RANK_AUGMENTS = {
+    ("abyssal beads +1", "A", 1): {"STR": 1, "Store TP": 1, "PDL": 1},
+    ("coiste bodhar", "A", 1): {"Attack": 1},
+    ("coiste bodhar", "A", 3): {"Attack": 3},
+    ("loxotic mace +1", "A", 5): {"DMG": 13},
+    ("loxotic mace +1", "A", 11): {
+        "DMG": 25, "Accuracy": 24, "Magic Accuracy": 24,
+        "Weapon Skill Damage": 2,
+    },
+    ("samurai's nodowa +2", "A", 6): {
+        "STR": 6, "Store TP": 2, "PDL": 2,
+    },
+    ("schere earring", "A", 1): {"Accuracy": 1},
+    ("schere earring", "A", 2): {"Accuracy": 2},
+    ("warrior's bead necklace +2", "A", 12): {
+        "HP": 37, "STR": 7, "DEX": 7, "DA": 4,
+    },
+    ("argute stole +1", "A", 5): {
+        "INT": 3, "MND": 3, "Magic Damage": 5,
+    },
+    ("assassin's gorget +1", "A", 1): {"DEX": 1, "AGI": 1, "Evasion": 1, "TA": 1},
+    ("bard's charm +1", "A", 8): {
+        "DEX": 8, "CHR": 8, "Store TP": 2, "PDL": 3,
+    },
+    ("cleric's torque +1", "A", 3): {"INT": 2, "MND": 2, "Fast Cast": 1},
+    ("dragoon collar +1", "A", 1): {"STR": 1, "VIT": 1, "PDL": 1},
+    ("mirage stole +1", "A", 3): {
+        "STR": 3, "DEX": 3, "Store TP": 1, "Crit Rate": 1,
+    },
+    ("kikoku", "A", 2): {"DMG": 1},
+    ("crocea mors", "C", 17): {
+        "DMG": 5, "Elemental WS Damage%": 60, "EnSpell Damage%": 340,
+    },
+    ("akademos", "A", 15): {"MP": 80, "INT": 20, "Magic Attack": 20},
+    ("bagua charm +1", "A", 1): {"MP": 1},
+    ("cabal. sword", "C", 9): {"HP": 90, "Cure Potency": 9, "Refresh": 1},
+    ("bihu knife", "C", 3): {"DA": 1},
+    ("coiste bodhar", "A", 6): {"Attack": 6},
+    ("dgn. collar +1", "A", 1): {"STR": 1, "VIT": 1, "PDL": 1, "Pet: DT": -1},
+    ("emet harness +1", "A", 1): {"Evasion": 2},
+    ("eschite greaves", "A", 15): {"HP": 80, "Enmity": 7, "PDT": -4},
+    ("futhark torque +2", "A", 16): {"HP": 33, "STR": 10, "MND": 10, "DT": -5},
+    ("hippo. socks +1", "A", 15): {"Resist Bind": 45, "Evasion": 20, "All Attributes": 10},
+    ("kgt. beads +1", "A", 12): {"HP": 24, "VIT": 7, "MND": 7, "DT": -4},
+    ("kali", "A", 15): {"DMG": 15, "CHR": 15, "Magic Accuracy": 15},
+    ("lathi", "A", 15): {"MP": 80, "INT": 20, "Magic Attack": 20},
+    ("nibiru harp", "D", 15): {"Magic Evasion": 20, "PDT": -3, "MDT": -3},
+    ("queller rod", "B", 15): {"MND": 15, "Magic Accuracy": 15},
+    ("ryuo sune-ate +1", "C", 15): {"HP": 65, "Store TP": 5, "Subtle Blow": 8},
+    ("ryuo tekko +1", "D", 15): {"DEX": 12, "Accuracy": 25, "DA": 4},
+    ("sailfi belt +1", "A", 15): {"STR": 15, "DA": 5},
+    ("tatena. haidate +1", "A", 15): {
+        "Accuracy": 60, "STR": 10, "DEX": 10, "VIT": 10, "AGI": 10,
+        "INT": 10, "MND": 10, "CHR": 10, "TA": 3,
+    },
+    ("vanya hood", "D", 15): {"MP": 50, "Fast Cast": 10, "Gear Haste": 2},
+    # Remaining reviewed Kroot observations.  These are rank additions and
+    # are applied only when the imported record did not decode them already.
+    ("adhemar bonnet +1", "A", 15): {"DEX": 12, "AGI": 12, "Accuracy": 20},
+    ("adhemar bonnet +1", "B", 15): {"STR": 12, "DEX": 12, "Attack": 20},
+    ("adhemar jacket +1", "A", 15): {"DEX": 12, "AGI": 12, "Accuracy": 20},
+    ("adhemar jacket +1", "B", 15): {"STR": 12, "DEX": 12, "Attack": 20},
+    ("adhemar wrist. +1", "A", 15): {"DEX": 12, "AGI": 12, "Accuracy": 20},
+    ("carmine cuisses +1", "D", 15): {"Accuracy": 20, "Attack": 12, "Dual Wield": 6},
+    ("carmine greaves +1", "B", 15): {"Accuracy": 12, "DEX": 12, "MND": 20},
+    ("comm. charm +1", "A", 1): {"STR": 1, "AGI": 1, "Magic Damage": 1, "Magic Attack": 1},
+    ("ichigohitofuri", "A", 15): {"DMG": 30, "STR": 20, "Attack": 20},
+    ("kaykaus cuffs +1", "A", 15): {"MP": 80, "MND": 12, "Magic Accuracy": 20},
+    ("lugra earring +1", "A", 1): {"Defense": 1},
+    ("lustr. harness +1", "A", 15): {"Attack": 20, "STR": 8, "DA": 3},
+    ("lustr. subligar +1", "A", 15): {"Attack": 20, "STR": 8, "DA": 3},
+    ("lustra. leggings +1", "D", 15): {"HP": 65, "STR": 15, "DEX": 15},
+    ("mnk. nodowa +1", "A", 8): {"DEX": 4, "MND": 4, "Kick Attacks": 8, "PDL": 3},
+    ("montante +1", "A", 15): {"DMG": 20, "Accuracy": 40, "Magic Accuracy": 40, "HP": 100},
+    ("priwen", "A", 15): {"HP": 50, "Magic Evasion": 50, "DT": -3},
+    ("refined grip +1", "A", 15): {"Defense": 20, "Parrying Skill": 10},
+    ("ninja nodowa +1", "A", 9): {"DEX": 5, "AGI": 5, "Daken": 9, "PDL": 3},
+    ("psycloth lappas", "D", 15): {"MP": 80, "Magic Accuracy": 15, "Fast Cast": 7},
+    ("pursuer's beret", "A", 11): {"AGI": 8, "Rapid Shot": 8, "Subtle Blow": 5},
+    ("pursuer's cuffs", "A", 15): {"AGI": 10, "Rapid Shot": 10, "Subtle Blow": 7},
+    ("pursuer's gaiters", "D", 15): {"Ranged Accuracy": 10, "Rapid Shot": 10, "Recycle": 15},
+    ("rawhide vest", "D", 15): {"HP": 50, "Subtle Blow": 7, "TA": 2},
+    ("seeth. bomblet +1", "A", 1): {"STR": 1},
+    ("smn. collar +1", "A", 1): {"MP": 1, "All Attributes": 1, "Blood Pact Damage": 1},
+    ("vanya cuffs", "B", 15): {"Healing Magic Skill": 20, "Fast Cast": 7, "MDT": -3},
+    ("vanya slops", "C", 15): {"MND": 10, "SIRD": 15, "Conserve MP": 6},
+    ("warder's charm +1", "A", 1): {"Skillchain Damage": 1},
+    ("aettir", "A", 15): {"Accuracy": 70, "Magic Evasion": 50, "Weapon Skill Damage": 10},
+    ("sagitta", "A", 23): {"Chance of Double Damage": 46, "Store TP": 23, "DMG": 11},
+    ("warrior's bead necklace +1", "A", 8): {"HP": 21, "STR": 4, "DEX": 4, "DA": 2},
+    ("samurai's nodowa +1", "A", 1): {"STR": 1, "Store TP": 1, "PDL": 1},
+    ("tatena. gote +1", "A", 15): {"Accuracy": 40, "All Attributes": 10, "TA": 4},
+    ("tatena. sune. +1", "A", 15): {"Accuracy": 60, "All Attributes": 10, "TA": 3},
+    ("souv. cuirass +1", "C", 15): {"HP": 105, "Enmity": 9, "Potency of Cure Effect Received": 15},
+    ("souv. diechlings +1", "C", 15): {"HP": 105, "Enmity": 9, "Potency of Cure Effect Received": 15},
+    ("souv. hands ch. +1", "D", 15): {"HP": 65, "Shield Skill": 15, "PDT": -4},
+    ("souv. schaller +1", "C", 15): {"HP": 105, "Enmity": 9, "Potency of Cure Effect Received": 15},
+    ("souveran schuhs +1", "C", 15): {"HP": 105, "Enmity": 9, "Potency of Cure Effect Received": 15},
+}
+
+# GearSetBuilder keeps the game client's abbreviated display names for several
+# JSE necks.  The report uses their expanded names where that is clearer, so
+# canonicalize only these known spellings before looking up an exact delta.
+EXACT_RANK_AUGMENT_NAME_ALIASES = {
+    "asn. gorget +1": "assassin's gorget +1",
+    "bard's charm +1": "bard's charm +1",
+    "clr. torque +1": "cleric's torque +1",
+    "dgn. collar +1": "dragoon collar +1",
+    "mir. stole +1": "mirage stole +1",
+    "sam. nodowa +2": "samurai's nodowa +2",
+    "war. beads +2": "warrior's bead necklace +2",
+    "comm. charm +1": "comm. charm +1",
+    "seeth. bomblet +1": "seething bomblet +1",
+    "war. beads +1": "warrior's bead necklace +1",
+    "souv. handsch. +1": "souv. hands ch. +1",
+}
+
+
+def _exact_rank_augment(record: dict) -> dict:
+    """Attach a reviewed character-observed rank delta when the scan lacks one."""
+    if record.get("augment_rank_stats") or record.get("augment_rank_stats_in_total"):
+        return record
+    try:
+        rank = int(record.get("augment_rank") or 0)
+    except (TypeError, ValueError):
+        return record
+    path = _normalize_augment_path(record.get("augment_path"))
+    if not path:
+        path = _inferred_single_path(record, _slot_names(int(record.get("slots_mask") or 0)))
+    name = str(record.get("name") or "").casefold()
+    name = EXACT_RANK_AUGMENT_NAME_ALIASES.get(name, name)
+    key = (name, path, rank)
+    delta = EXACT_RANK_AUGMENTS.get(key)
+    if not delta:
+        return record
+    # Character notes sometimes use the game's compact "All Attributes"
+    # label. Expand it into the simulator's individual stat fields so the
+    # copied value is not merely visible metadata.
+    delta = deepcopy(delta)
+    all_attributes = delta.pop("All Attributes", None)
+    if all_attributes is not None:
+        for parameter in BASE_PARAMETERS:
+            delta.setdefault(parameter, all_attributes)
+    enriched = deepcopy(record)
+    enriched["augment_rank_stats"] = deepcopy(delta)
+    enriched["augment_rank_stats_in_total"] = False
+    enriched["model_warning"] = "; ".join(filter(None, (
+        str(enriched.get("model_warning") or ""),
+        "Exact rank delta from augment audit",
+    )))
+    return enriched
 
 
 def hoxne_stat_bonus(mastery_rank: int) -> int:
@@ -190,10 +371,43 @@ def _model_name(record: dict) -> str:
 
 
 def _normalize_augment_path(value: object) -> str:
-    """Return the stable A/B/C path token exported by GearSetBuilder."""
+    """Return the stable A/B/C/D path token exported by GearSetBuilder."""
     text = str(value or "").strip().upper()
-    match = re.search(r"(?:PATH\s*)?([ABC])$", text)
+    match = re.search(r"(?:PATH\s*)?([ABCD])$", text)
     return match.group(1) if match else text
+
+
+def _inferred_single_path(record: dict, slots: list[str]) -> str:
+    """Infer Path A only for equipment whose game system has one path."""
+    rank = record.get("augment_rank")
+    try:
+        if int(rank or 0) <= 0:
+            return ""
+    except (TypeError, ValueError):
+        if rank in (None, ""):
+            return ""
+    if _normalize_augment_path(record.get("augment_path")):
+        return ""
+    name = str(record.get("name") or "").strip()
+    if name in SINGLE_PATH_A_WEAPONS:
+        return "A"
+    augment_type = str(record.get("augment_type") or "").strip().casefold()
+    if augment_type == "dynamis" and any(str(slot).casefold() == "neck" for slot in slots):
+        return "A"
+    if augment_type == "dynamis" and not any(
+        str(slot).casefold() in {"main", "sub", "ranged"} for slot in slots
+    ):
+        # Divergence accessories and armor have one path.  Weapons are left
+        # unresolved because their omitted path may be A, B, or C.  Use the
+        # normalized slot list here instead of the inferred item type: imported
+        # records often omit skill metadata even when the item is a weapon.
+        return "A"
+    if augment_type in {"unity", "unity accessory", "unity accessories"} and not any(
+        str(slot).casefold() in {"main", "sub", "ranged"} for slot in slots
+    ):
+        # Unity +1 accessories are rank-15, single-path Odyssey augments.
+        return "A"
+    return ""
 
 
 def _builtin_augment_path(item: dict) -> str:
@@ -202,8 +416,19 @@ def _builtin_augment_path(item: dict) -> str:
     if explicit:
         return explicit
     label = str(item.get("Name2") or "").upper()
-    match = re.search(r"(?:\bR\d+|\bPATH\s*|\s)([ABC])(?:\s*\(SUB\))?$", label)
+    match = re.search(r"(?:\bR\d+|\+\d+|\bPATH\s*|\s)([ABCD])(?:\s*\(SUB\))?$", label)
     return match.group(1) if match else ""
+
+
+def _builtin_augment_rank(item: dict) -> int | None:
+    """Read a built-in rank, including older rows that encode it only in Name2."""
+    try:
+        if item.get("Rank") not in (None, ""):
+            return int(item["Rank"])
+    except (TypeError, ValueError):
+        pass
+    match = re.search(r"\bR(\d+)\b", str(item.get("Name2") or ""), re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 def _accessible_count(record: dict) -> int:
@@ -224,6 +449,15 @@ def _gear_record(record: dict, *, eligible: bool = True, hoxne_mastery_rank: int
     stats = (deepcopy(BASE_ITEM_MODELS[item_id])
              if item_id in BASE_ITEM_MODELS and _record_is_unaugmented(record)
              else _copy_stats(record))
+    separate_rank_stats = record.get("augment_rank_stats")
+    rank_stats_in_total = bool(record.get("augment_rank_stats_in_total"))
+    if isinstance(separate_rank_stats, dict) and separate_rank_stats and not rank_stats_in_total:
+        # Some bridge producers provide the rank delta separately from the
+        # displayed item total. Apply it once so calculations and hover text
+        # agree; scanner-produced totals explicitly set the flag above.
+        for key, value in separate_rank_stats.items():
+            if isinstance(value, (int, float)):
+                stats[str(key)] = stats.get(str(key), 0) + value
     _canonicalize_item_stats(item_id, stats)
     result = deepcopy(stats)
     name = str(record.get("name") or "Unknown")
@@ -253,10 +487,19 @@ def _gear_record(record: dict, *, eligible: bool = True, hoxne_mastery_rank: int
         "Augments": deepcopy(record.get("augments") or []),
     })
     augment_path = _normalize_augment_path(record.get("augment_path"))
+    if not augment_path:
+        augment_path = _inferred_single_path(record, slots)
     if augment_path:
         result["Augment Path"] = augment_path
     if record.get("augment_rank") not in (None, ""):
         result["Rank"] = int(record["augment_rank"])
+    rank_stats = separate_rank_stats
+    if isinstance(rank_stats, dict) and rank_stats:
+        # Keep the separate contribution visible to the GUI and export tools.
+        # The scanner may also mark these values as already included in stats;
+        # this metadata is never added a second time by the bridge.
+        result["Rank Stats"] = deepcopy(rank_stats)
+        result["Rank Stats In Total"] = rank_stats_in_total
     if unknown_augments:
         result["Model Warning"] = "Unmodeled scan effect: " + ", ".join(unknown_augments)
         result["Unknown Augments"] = list(unknown_augments)
@@ -321,7 +564,11 @@ def _with_curated_model(record: dict) -> dict:
     """Fill an incomplete record from a reviewed, source-attributed model."""
     item_id = int(record.get("item_id") or 0)
     model = CURATED_ITEM_MODELS.get(item_id)
-    if not model or record.get("model_complete") or record.get("stats"):
+    # Some GearSetBuilder exports mark an item model complete while emitting
+    # an empty stats array (common for older ammo/storage records). A reviewed
+    # ID model should still fill that hole; non-empty exported stats remain
+    # authoritative and are never overwritten.
+    if not model or record.get("stats"):
         return record
     enriched = deepcopy(record)
     enriched["stats"] = deepcopy(model["stats"])
@@ -350,7 +597,8 @@ def _with_builtin_model(record: dict, item: dict) -> dict:
     # character-scoped bridge is authoritative for the base/current variant;
     # never overlay a max-rank row onto it.  This also repairs older bridge
     # files that were published before the base table was added.
-    if item_id in BASE_ITEM_MODELS and record.get("model_complete"):
+    if (item_id in BASE_ITEM_MODELS and record.get("model_complete")
+            and record.get("augment_rank") in (None, "", 0)):
         return item
     name = str(record.get("name") or "").lower()
     candidates = [value for value in gear_pyfile.all_gear.values()
@@ -365,13 +613,23 @@ def _with_builtin_model(record: dict, item: dict) -> dict:
         candidates = main_hand or candidates
     rank = record.get("augment_rank")
     if rank is not None:
-        ranked = [value for value in candidates if int(value.get("Rank", -1) or -1) == int(rank)]
+        ranked = [
+            value for value in candidates
+            if _builtin_augment_rank(value) == int(rank)
+        ]
         if len(ranked) == 1:
             candidates = ranked
         elif ranked:
             augment_text = " ".join(str(value).lower() for value in record.get("augments") or [])
             named = [value for value in ranked if augment_text and augment_text in str(value.get("Name2", "")).lower()]
             candidates = named if len(named) == 1 else []
+        elif path and int(rank) == 15 and len(candidates) == 1:
+            # Several older fixed-path armor rows encode their path but not
+            # their R15 cap in Name2.  A path-specific R15 import may use the
+            # sole matching row; intermediate ranks must never inherit it.
+            pass
+        else:
+            candidates = []
     else:
         exact = [value for value in candidates if str(value.get("Name2") or "").lower() == name]
         candidates = exact or candidates
@@ -484,7 +742,9 @@ class BridgeStore:
         self.catalog = {}
         self.by_slot = {slot: [] for slot in SLOTS}
         for record in self.data.get("items", []):
-            record = _with_unverified_warning(_with_curated_model(record))
+            record = _exact_rank_augment(
+                _with_unverified_warning(_with_curated_model(record))
+            )
             record = _with_ffxiah_model(record)
             item = _with_builtin_model(
                 record, _gear_record(record, hoxne_mastery_rank=self.hoxne_mastery_rank)
@@ -526,7 +786,9 @@ class BridgeStore:
                 continue
             if sorted(map(str, record.get("augments") or [])) != sorted(map(str, item.get("augments") or [])):
                 continue
-            record = _with_unverified_warning(_with_curated_model(record))
+            record = _exact_rank_augment(
+                _with_unverified_warning(_with_curated_model(record))
+            )
             record = _with_ffxiah_model(record)
             return _with_builtin_model(
                 record,

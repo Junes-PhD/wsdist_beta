@@ -202,7 +202,10 @@ def serialize_set(name: str, equipment: dict[str, dict]) -> str:
         literal = serialize_item(equipment.get(slot))
         if literal:
             lines.append(f"    {SLOT_MAP[slot]} = {literal},")
-    lines.append("}")
+    # Keep the closing table brace aligned with the fields.  This makes
+    # generated sets match the surrounding LAC profile indentation and keeps
+    # the writer's trailing comma visually attached to the set.
+    lines.append("    }")
     return "\n".join(lines)
 
 

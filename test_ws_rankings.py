@@ -104,6 +104,88 @@ class WeaponSkillRankingTests(unittest.TestCase):
             for rows in result["rankings"].values()
         ))
 
+    def test_final_winner_is_recalculated_before_ranking(self):
+        players = {
+            "Combo": SimpleNamespace(gearset={}, stats={"winner": "Combo"}),
+            "Howling Fist": SimpleNamespace(gearset={}, stats={"winner": "Howling Fist"}),
+        }
+
+        def fake_optimize(*args, **kwargs):
+            name = args[6]
+            # Deliberately stale and reversed worker outputs.
+            stale = 9000 if name == "Combo" else 1000
+            return players[name], [stale, 0], stale, 1
+
+        def fake_average(player, _enemy, _name, _tp, _type, _metric):
+            verified = 1000 if player.stats["winner"] == "Combo" else 2000
+            return verified, [verified, 0, 1]
+
+        with patch.object(wsdist, "optimize_set", side_effect=fake_optimize), \
+                patch.object(wsdist, "average_ws", side_effect=fake_average), \
+                patch.object(wsdist, "weapon_skill_display_details", return_value={}):
+            result = wsdist.rank_weapon_skills(
+                "mnk", "war", 50, {}, {}, object(),
+                ["Combo", "Howling Fist"], "melee", {}, {}, 199, 199,
+                tp_values=(1000,),
+            )
+
+        rows = result["rankings"][1000]
+        self.assertEqual([row["ws_name"] for row in rows], ["Howling Fist", "Combo"])
+        self.assertEqual([row["damage"] for row in rows], [2000, 1000])
+
+    def test_shared_ws_groups_obey_damage_loss_percentage(self):
+        player_a = SimpleNamespace(name="A")
+        player_b = SimpleNamespace(name="B")
+        player_c = SimpleNamespace(name="C")
+        rows = [
+            {"ws_name": "A", "tp": 1000, "damage": 1000.0, "player": player_a},
+            {"ws_name": "B", "tp": 1000, "damage": 1000.0, "player": player_b},
+            {"ws_name": "C", "tp": 1000, "damage": 1000.0, "player": player_c},
+        ]
+        shared_damage = {
+            ("A", "A"): 1000, ("A", "B"): 985, ("A", "C"): 900,
+            ("B", "A"): 970, ("B", "B"): 1000, ("B", "C"): 800,
+            ("C", "A"): 700, ("C", "B"): 700, ("C", "C"): 1000,
+        }
+
+        def fake_average(player, _enemy, ws_name, *_args):
+            damage = shared_damage[(player.name, ws_name)]
+            return damage, [damage, 0, 1]
+
+        with patch.object(wsdist, "average_ws", side_effect=fake_average):
+            groups = wsdist._group_ranked_weapon_skills(rows, object(), "melee", 2.0)
+
+        self.assertEqual(groups[0]["representative"], "A")
+        self.assertEqual(groups[0]["members"], ["A", "B"])
+        self.assertAlmostEqual(rows[1]["group_loss_percent"], 1.5)
+        self.assertEqual(groups[1]["members"], ["C"])
+
+    def test_ws_display_details_come_from_modeled_formula(self):
+        player = SimpleNamespace(
+            stats={
+                "STR": 200, "DEX": 150, "VIT": 180, "AGI": 140,
+                "INT": 120, "MND": 130, "CHR": 110, "TP Bonus": 0,
+            },
+            gearset={
+                "main": {"Name": "Epeolatry", "Skill Type": "Great Sword"},
+                "sub": {"Name": "Empty", "Type": "None"},
+            },
+            abilities={},
+        )
+        enemy = SimpleNamespace(stats={
+            "Base Defense": 1000, "Defense": 1000, "VIT": 200,
+            "AGI": 200, "INT": 200, "MND": 200,
+        })
+
+        details = wsdist.weapon_skill_display_details(
+            player, enemy, "Resolution", 2000, "melee"
+        )
+
+        self.assertEqual(details["wsc_modifiers"], [{"stat": "STR", "percent": 85.0}])
+        self.assertEqual(details["ftp_first"], 1.5)
+        self.assertEqual(details["ftp_additional"], 1.5)
+        self.assertEqual(details["hits"], 5)
+
     def test_stop_is_checked_between_ranked_weapon_skills(self):
         stopped = threading.Event()
         stopped.set()

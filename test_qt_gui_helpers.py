@@ -18,7 +18,7 @@ from qt_gui_main import (
     _optimizer_current_result_lines, _optimizer_result_players, _remaining_time_estimate,
     _normalized_search_quality, _reference_enemy_names, _search_quality_settings,
     _run_overnight_cache_task, _ws_distribution_chart_data,
-    magic_damage_spell_choices, weapon_skill_choices,
+    item_tooltip, magic_damage_spell_choices, weapon_skill_choices,
 )
 from simulation_cache import SimulationCache
 from profile_builder import (
@@ -30,6 +30,20 @@ from wsdist import obvious_blacklist_suggestions, universal_blacklist_suggestion
 
 
 class ProfileReportHelperTests(unittest.TestCase):
+    def test_ranked_item_tooltip_explains_missing_or_decoded_contribution(self):
+        missing = item_tooltip({"Name": "Epeolatry", "Rank": 10})
+        self.assertIn("Progression: Rank 10", missing)
+        self.assertIn("Rank contribution: not separately decoded", missing)
+
+        decoded = item_tooltip({
+            "Name": "Test weapon", "Rank": 10, "Augment Path": "B",
+            "Rank Stats": {"DMG": 5}, "Rank Stats In Total": True,
+            "Augments": ["Attack+20"],
+        })
+        self.assertIn("Progression: Rank 10 · Path B", decoded)
+        self.assertIn("Rank contribution (included in totals): DMG +5", decoded)
+        self.assertIn("Fixed augments: Attack+20", decoded)
+
     def test_reference_enemy_graph_labels_keep_active_enemy_first(self):
         self.assertEqual(
             _reference_enemy_names("Custom target"),
@@ -239,6 +253,21 @@ class ProfileReportHelperTests(unittest.TestCase):
             Store(), "war", GearSources(accessible=False, porter=True, transferable=False),
         )
         self.assertIn("Porter Helm", [item.get("Name") for item in candidates["head"]])
+
+    def test_bridge_candidates_accepts_movable_storage_source(self):
+        class Store:
+            hoxne_mastery_rank = 5
+            data = {"items": [{
+                "key": "safe|ammo", "item_id": 2, "name": "Stored Bullet",
+                "slots_mask": 1 << 3, "jobs_mask": 1 << 17,
+                "accessible_count": 0, "total_count": 99,
+                "stats": {"DMG": 10, "Delay": 240}, "model_complete": True,
+                "locations": [{"source": "storage", "container": "Safe", "available": False}],
+            }]}
+        candidates = bridge_candidates(
+            Store(), "cor", GearSources(accessible=False, porter=True, transferable=False),
+        )
+        self.assertIn("Stored Bullet", [item.get("Name") for item in candidates["ammo"]])
 
     def test_magic_damage_choices_are_scoped_to_formula(self):
         self.assertIn("Fire VI", magic_damage_spell_choices("Elemental Magic"))

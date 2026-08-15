@@ -12,9 +12,11 @@ from lac_profile import (
 )
 from wsdist_bridge import (
     BridgeStore, _gear_record, _with_builtin_model, _with_curated_model,
-    _with_unverified_warning, hoxne_stat_bonus,
+    _with_unverified_warning, _exact_rank_augment, _builtin_augment_path,
+    hoxne_stat_bonus,
 )
 from gear import Bifrost_Ring
+from weapon_bonus import get_weapon_bonus
 
 
 class BridgeTests(unittest.TestCase):
@@ -24,6 +26,31 @@ class BridgeTests(unittest.TestCase):
 
         model = _with_curated_model({"item_id": 11640, "stats": [], "model_complete": False})
         self.assertEqual(model["stats"], {"HP": -70, "MP": 70})
+
+    def test_krooti_beck_earring_augment_is_loaded_from_curated_model(self):
+        model = _with_curated_model({
+            "item_id": 25506,
+            "name": "Beck. Earring +2",
+            "stats": [],
+            "model_complete": False,
+        })
+        self.assertEqual(model["stats"], {
+            "Pet: Accuracy": 16,
+            "Pet: Ranged Accuracy": 16,
+            "Pet: Magic Accuracy": 16,
+            "DT": -6,
+            "Pet: Store TP": 6,
+        })
+        self.assertEqual(model["stat_source"], "curated")
+
+    def test_eminent_bullet_model_has_ranged_damage_stats(self):
+        model = _with_curated_model({
+            "item_id": 21331,
+            "name": "Eminent Bullet",
+            "stats": [],
+            "model_complete": False,
+        })
+        self.assertEqual(model["stats"], {"DMG": 238, "Delay": 240})
 
     def test_rostam_uses_explicit_divergence_path_identity(self):
         expected = {
@@ -126,6 +153,137 @@ class BridgeTests(unittest.TestCase):
         base = _gear_record(common)
         self.assertFalse(base["Augmented"])
         self.assertTrue(base["Transferable"])
+
+    def test_bridge_preserves_separate_rank_stats_for_hover(self):
+        item = _gear_record({
+            "item_id": 21685, "name": "Epeolatry", "slots_mask": 1,
+            "jobs_mask": 1 << 20, "accessible_count": 1,
+            "model_complete": True, "augment_rank": 10,
+            "augment_rank_stats": {"DMG": 26, "Accuracy": 20},
+            "augment_rank_stats_in_total": True,
+            "stats": {"DMG": 331, "Accuracy": 20},
+        })
+        self.assertEqual(item["Rank"], 10)
+        self.assertEqual(item["Rank Stats"], {"DMG": 26, "Accuracy": 20})
+        self.assertTrue(item["Rank Stats In Total"])
+
+        separate = _gear_record({
+            "item_id": 21685, "name": "Epeolatry", "slots_mask": 1,
+            "jobs_mask": 1 << 20, "accessible_count": 1,
+            "model_complete": True, "augment_rank": 10,
+            "augment_rank_stats": {"DMG": 26},
+            "stats": {"DMG": 305},
+        })
+        self.assertEqual(separate["DMG"], 331)
+        self.assertFalse(separate["Rank Stats In Total"])
+
+    def test_single_path_rank_imports_default_to_path_a(self):
+        epeolatry = _gear_record({
+            "item_id": 21685, "name": "Epeolatry", "slots_mask": 1,
+            "jobs_mask": 1 << 20, "accessible_count": 1,
+            "model_complete": True, "augment_type": "Dynamis",
+            "augment_rank": 10, "stats": {"DMG": 305},
+        })
+        self.assertEqual(epeolatry["Augment Path"], "A")
+
+        crocea = _gear_record({
+            "item_id": 21686, "name": "Crocea Mors", "slots_mask": 1,
+            "jobs_mask": 1 << 11, "accessible_count": 1,
+            "model_complete": True, "augment_type": "Dynamis",
+            "augment_rank": 17, "stats": {"DMG": 180},
+        })
+        self.assertNotIn("Augment Path", crocea)
+
+        oboro = _gear_record({
+            "item_id": 30001, "name": "Minos", "slots_mask": 1,
+            "jobs_mask": 1 << 1, "accessible_count": 1,
+            "model_complete": True, "augment_type": "Oboro",
+            "augment_rank": 15, "stats": {"DMG": 274},
+        })
+        self.assertEqual(oboro["Augment Path"], "A")
+
+        unity = _gear_record({
+            "item_id": 30002, "name": "Acuity Belt +1", "slots_mask": 1 << 10,
+            "jobs_mask": 1 << 5, "accessible_count": 1,
+            "model_complete": True, "augment_type": "Unity accessory",
+            "augment_rank": 15, "stats": {"Magic Accuracy": 15},
+        })
+        self.assertEqual(unity["Augment Path"], "A")
+
+    def test_epeolatry_r10_uses_supplied_rank_package(self):
+        record = {
+            "item_id": 21685, "name": "Epeolatry", "slots_mask": 1,
+            "jobs_mask": 1 << 20, "accessible_count": 1,
+            "model_complete": True, "augment_type": "Dynamis",
+            "augment_rank": 10,
+            "stats": {"DMG": 305, "Delay": 489, "Magic Damage": 186,
+                      "Great Sword Skill": 269, "Magic Accuracy Skill": 242,
+                      "PDT": -25},
+            "lac": {"Name": "Epeolatry", "AugRank": 10},
+        }
+        item = _with_builtin_model(record, _gear_record(record))
+        self.assertEqual(item["DMG"], 329)
+        self.assertEqual(item["Accuracy"], 19)
+        self.assertEqual(item["Magic Accuracy"], 19)
+        self.assertAlmostEqual(
+            get_weapon_bonus(item["Name2"], "Empty", "Dimidiation"), 0.10,
+        )
+
+    def test_rank_path_d_resolves_the_correct_fixed_path_model(self):
+        record = {
+            "item_id": 999, "name": "Ryuo Tekko +1", "slots_mask": 1 << 6,
+            "jobs_mask": 1 << 12, "accessible_count": 1, "model_complete": True,
+            "augment_path": "D", "augment_rank": 15, "stats": {},
+        }
+        item = _with_builtin_model(record, _gear_record(record))
+        self.assertEqual(item["Augment Path"], "D")
+        self.assertEqual(item["DA"], 4)
+        self.assertEqual(item["Accuracy"], 58)
+
+        # Some older catalog rows keep the path glued to an upgraded name.
+        compact = {
+            "Name": "Carmine Cuisses +1", "Name2": "Carmine Cuisses +1D",
+            "Accuracy": 55, "Attack": 47, "Dual Wield": 6,
+        }
+        self.assertEqual(_builtin_augment_path(compact), "D")
+
+    def test_malware_and_kroot_exact_rank_observations_apply_once(self):
+        coiste_record = _exact_rank_augment({
+            "item_id": 0, "name": "Coiste Bodhar", "slots_mask": 1 << 3,
+            "jobs_mask": 1 << 12, "accessible_count": 1, "model_complete": True,
+            "augment_path": "A", "augment_rank": 3,
+            "stats": {"DA": 3, "Store TP": 3},
+        })
+        coiste = _gear_record(coiste_record)
+        self.assertEqual(coiste["Attack"], 3)
+        self.assertEqual(coiste["Rank Stats"], {"Attack": 3})
+
+        crocea_record = _exact_rank_augment({
+            "item_id": 21686, "name": "Crocea Mors", "slots_mask": 1,
+            "jobs_mask": 1 << 5, "accessible_count": 1, "model_complete": True,
+            "augment_path": "C", "augment_rank": 17,
+            "stats": {"DMG": 180},
+        })
+        crocea = _gear_record(crocea_record)
+        self.assertEqual(crocea["DMG"], 185)
+        self.assertEqual(crocea["Elemental WS Damage%"], 60)
+        self.assertEqual(crocea["EnSpell Damage%"], 340)
+        self.assertAlmostEqual(get_weapon_bonus("Kikoku [path=A; rank=2]", "", "Blade: Metsu"), 0.02)
+
+        # The bridge uses abbreviated client labels for some JSE equipment.
+        nodowa = _gear_record(_exact_rank_augment({
+            "item_id": 0, "name": "Sam. Nodowa +2", "slots_mask": 1 << 9,
+            "jobs_mask": 1 << 12, "accessible_count": 1, "model_complete": True,
+            "augment_path": "A", "augment_rank": 6, "stats": {},
+        }))
+        self.assertEqual(nodowa["Rank Stats"], {"STR": 6, "Store TP": 2, "PDL": 2})
+
+        ryuo = _gear_record(_exact_rank_augment({
+            "item_id": 0, "name": "Ryuo Sune-Ate +1", "slots_mask": 1 << 8,
+            "jobs_mask": 1 << 12, "accessible_count": 1, "model_complete": True,
+            "augment_path": "C", "augment_rank": 15, "stats": {},
+        }))
+        self.assertEqual(ryuo["Rank Stats"], {"HP": 65, "Store TP": 5, "Subtle Blow": 8})
 
     def test_bridge_preserves_resource_item_level_for_candidate_filters(self):
         item = _gear_record({

@@ -92,6 +92,31 @@ CURATED_ITEM_MODELS = {
         "stats": {"Healing Magic Skill": 15, "Fast Cast": -10, "Cure Potency": 5, "Cursna": 20},
         "source": "https://www.bg-wiki.com/ffxi/Menelaus%27s_Ring",
     },
+    # GearSetBuilder's 2026-08-14 Krooti export decoded this augmented
+    # earring even though the bundled item archive still reports it as
+    # missing.  Keep the pet fields separate from player-facing accuracy and
+    # DT so the optimizer cannot accidentally treat them as player stats.
+    25506: {
+        "stats": {
+            "Pet: Accuracy": 16,
+            "Pet: Ranged Accuracy": 16,
+            "Pet: Magic Accuracy": 16,
+            "DT": -6,
+            "Pet: Store TP": 6,
+        },
+        "source": "GearSetBuilder Krooti export 2026-08-14",
+        "effects": (
+            "Augments: Pet: Accuracy+16, Pet: Ranged Accuracy+16, "
+            "Pet: Magic Accuracy+16, Damage taken -6%, Pet: Store TP+6.",
+        ),
+    },
+    # BG-Wiki's ammo table lists Eminent Bullet as item level 117, DMG 238,
+    # delay 240, for RNG/COR.  Krooti's copy is stored on another character,
+    # so this model is used when the all-character optimizer pool is enabled.
+    21331: {
+        "stats": {"DMG": 238, "Delay": 240},
+        "source": "https://www.bg-wiki.com/ffxi/Category:Ammo",
+    },
 }
 
 # These records are intentionally not made eligible merely to silence a
@@ -99,4 +124,16 @@ CURATED_ITEM_MODELS = {
 # publishes all displayed fields.
 UNVERIFIED_ITEM_MODELS = {
     21543: "Ryofu Uchiwa is a July 2026 item whose public listing still has unknown stats.",
+    26347: "Era. Bul. Pouch is present in Krooti's export, but its base stat record is missing.",
+    15501: "Light Gorget is present in Krooti's export, but its elemental WS modifier is not decoded.",
+    15498: "Soil Gorget is present in Krooti's export, but its elemental WS modifier is not decoded.",
+    18242: "Wyvern Feed is present in Krooti's export, but its pet/base stat record is missing.",
+    2725: "Argute Bracers -1 is present in Krooti's export, but its base stat record is missing.",
+    2674: "Ptn. Dastanas -1 is present in Krooti's export, but its base stat record is missing.",
+    3705: "Far East Hearth is a furnishing with no combat stat record in the export.",
+    3670: "Net and Lure is a furnishing with no combat stat record in the export.",
+    26169: "Reraise Ring is present in Krooti's export, but its base stat record is missing.",
+    26167: "Sneak Ring is present in Krooti's export, but its base stat record is missing.",
+    11655: "Noddy Ring is present in Krooti's export, but its base stat record is missing.",
+    11654: "Puffin Ring is present in Krooti's export, but its base stat record is missing.",
 }

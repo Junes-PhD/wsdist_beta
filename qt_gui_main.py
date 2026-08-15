@@ -30,7 +30,7 @@ import numpy as np
 from PyQt6.QtCore import QEvent, QRect, QSettings, QSize, Qt, QStandardPaths, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPixmap,
-    QSyntaxHighlighter, QTextCharFormat, QTextFormat,
+    QSyntaxHighlighter, QTextCharFormat, QTextFormat, QTextCursor,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
@@ -59,8 +59,12 @@ import wsdist
 from equipment_rules import is_right_ear_only
 from simulation_cache import SimulationCache, canonical_json, source_fingerprint
 from result_history import ResultHistory
-from wsdist_bridge import BridgeStore, bridge_hash
+from wsdist_bridge import (
+    BridgeStore, bridge_hash, EXACT_RANK_AUGMENTS,
+    EXACT_RANK_AUGMENT_NAME_ALIASES,
+)
 from lac_profile import (
+    parse_set_entries, write_set,
     prepare_managed_update, prepare_profile_builder_update, write_managed_sets,
     write_profile_builder_sets, write_profile_source,
     write_reload_request,
@@ -362,7 +366,8 @@ ITEM_LEVEL_FILTER_SLOTS = ("head", "body", "hands", "legs", "feet")
 SUBSTAT_OPTIONS = (
     "None", "Magic Evasion", "Evasion", "Defense", "Magic Defense",
     "Subtle Blow", "Counter", "Store TP", "Accuracy", "Magic Accuracy",
-    "Attack", "Magic Attack", "HP", "MP", "Enmity",
+ "Attack", "Magic Attack", "HP", "MP", "Total PDT", "Total MDT",
+ "Plus Enmity", "Minus Enmity", "Enmity",
 )
 WARM_CACHE_ACTION = "Warm cache - WS ranking (1k/2k/3k TP)"
 OPTIMIZER_STATE_LABELS = {
@@ -753,10 +758,19 @@ def _ranking_weapon_types(gearset: dict[str, dict]) -> list[str]:
 
 
 def _lock_ranking_weapon_slots(check_gear: dict[str, list[dict]],
-                               selected_gear: dict[str, dict]) -> dict[str, list[dict]]:
-    """Freeze the current weapon setup so every ranked WS is comparable."""
+                               selected_gear: dict[str, dict],
+                               locked_slots: set[str] | None = None) -> dict[str, list[dict]]:
+    """Freeze only the Optimizer-locked weapon slots for WS ranking.
+
+    Unlocked weapon slots remain legitimate optimizer candidates; this keeps
+    ranking comparisons faithful to the Optimizer tab instead of silently
+    replacing every weapon choice with the Quick Set.
+    """
     locked = {slot: list(items) for slot, items in check_gear.items()}
-    for slot in WEAPON_SLOTS:
+    slots_to_lock = WEAPON_SLOTS if locked_slots is None else locked_slots
+    for slot in slots_to_lock:
+        if slot not in WEAPON_SLOTS:
+            continue
         locked[slot] = [selected_gear.get(slot, gear.Empty)]
     return locked
 
@@ -879,9 +893,52 @@ def item_tooltip(item: dict) -> str:
         "Shared Only", "Shared Characters", "Aspirational Only", "Model Warning",
         "Unknown Augments", "Item ID", "Accessible Count", "Total Count",
         "Model Complete", "Item Level", "ItemLevel", "Rank", "Rare", "Exclusive",
-        "Transferable", "Porter Only", "LAC", "Augments", "Resource Flags",
+        "Transferable", "Porter Only", "LAC", "Augments", "Rank Stats",
+        "Rank Stats In Total", "Resource Flags",
     }
     lines = [str(item.get("Name") or item_name(item))]
+    rank = item.get("Rank")
+    augment_path = item.get("Augment Path")
+    # Static curated rows often encode progression only in Name2 (for
+    # example ``Carmine Cuisses +1D`` or ``... R15``). Keep that identity in
+    # the hover card even when the row came from the local gear catalog.
+    name2 = str(item.get("Name2") or "")
+    if rank in (None, ""):
+        rank_match = re.search(r"\bR(\d+)\b", name2, re.IGNORECASE)
+        if rank_match:
+            rank = int(rank_match.group(1))
+    if not augment_path:
+        path_match = re.search(r"(?:PATH\s*|\+\d+\s*)([ABCD])(?:\s|$)", name2, re.IGNORECASE)
+        if path_match:
+            augment_path = path_match.group(1).upper()
+    if rank not in (None, "") or augment_path:
+        progression = []
+        if rank not in (None, ""):
+            progression.append(f"Rank {rank}")
+        if augment_path:
+            progression.append(f"Path {augment_path}")
+        lines.append("Progression: " + " · ".join(progression))
+        rank_stats = item.get("Rank Stats")
+        if not rank_stats and rank not in (None, "") and augment_path:
+            hover_name = EXACT_RANK_AUGMENT_NAME_ALIASES.get(
+                str(item.get("Name") or "").casefold(),
+                str(item.get("Name") or "").casefold(),
+            )
+            rank_stats = EXACT_RANK_AUGMENTS.get(
+                (hover_name, str(augment_path).upper(), int(rank)),
+            )
+        if isinstance(rank_stats, dict) and rank_stats:
+            rendered = ", ".join(
+                f"{key} {value:+g}" if isinstance(value, (int, float)) else f"{key} {value}"
+                for key, value in rank_stats.items()
+            )
+            included = " (included in totals)" if item.get("Rank Stats In Total") else ""
+            lines.append(f"Rank contribution{included}: {rendered}")
+        else:
+            lines.append("Rank contribution: not separately decoded")
+    augments = item.get("Augments")
+    if isinstance(augments, (list, tuple)) and augments:
+        lines.append("Fixed augments: " + "; ".join(str(value) for value in augments))
     for key, value in item.items():
         if key not in ignored and value not in (None, "", 0, False, [], {}):
             lines.append(f"{key}: {value}")
@@ -2694,9 +2751,28 @@ class TopSetsDialog(QDialog):
         self.resize(1050, 760)
         self.icons = icons
         self._gear_cells: list[tuple[QFrame, str, dict]] = []
-        # Retain enough distinct candidates to compare meaningful alternatives
-        # without allowing an unbounded result window.
-        self.results = list(results[:wsdist.OPTIMIZER_RESULT_LIMIT])
+        # Apply the same slot-independent ear/ring identity used by the
+        # optimizer before rendering.  This prevents a position-only swap
+        # from consuming a separate row in Show Gear.
+        unique_results = []
+        seen = set()
+        for result in results:
+            tp_player, ws_player = _optimizer_result_players(result)
+            players = (tp_player, ws_player) if ws_player is not None else (tp_player,)
+            identity = tuple(
+                wsdist._canonical_gearset_key(
+                    getattr(player, "gearset", {}) or {},
+                    lambda item: str(item.get("Bridge Key") or item.get("Name2") or item.get("Name") or "Empty"),
+                ) if player is not None else None
+                for player in players
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            unique_results.append(result)
+            if len(unique_results) >= wsdist.OPTIMIZER_RESULT_LIMIT:
+                break
+        self.results = unique_results
         layout = QVBoxLayout(self)
         note = QLabel(
             "Combined TP + WS results show the TP and WS sets side by side. "
@@ -3048,20 +3124,104 @@ class GearBlacklistDialog(QDialog):
         self.accept()
 
 
+class WeaponSkillRankingOptionsDialog(QDialog):
+    """Choose WS coverage and optional damage-verified shared sets."""
+
+    def __init__(self, skill_type: str, names: list[str], selected: list[str],
+                 group_similar: bool, within_percent: float, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose weapon skills to rank")
+        self.resize(500, 590)
+        layout = QVBoxLayout(self)
+        title = QLabel(f"{skill_type} weapon skills")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+        note = QLabel(
+            "Only checked weapon skills are optimized at 1,000, 2,000, and 3,000 TP. "
+            "Selecting fewer skills reduces total search time proportionally."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.ws_list = QListWidget()
+        selected_names = set(selected or names)
+        for name in names:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if name in selected_names else Qt.CheckState.Unchecked)
+            self.ws_list.addItem(item)
+        layout.addWidget(self.ws_list, 1)
+        selection = QHBoxLayout()
+        select_all = QPushButton("Select all")
+        select_all.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        clear_all = QPushButton("Clear all")
+        clear_all.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+        selection.addWidget(select_all)
+        selection.addWidget(clear_all)
+        selection.addStretch(1)
+        layout.addLayout(selection)
+        grouping = QGroupBox("Shared-set grouping")
+        grouping_layout = QVBoxLayout(grouping)
+        group_row = QHBoxLayout()
+        self.group_similar = QCheckBox("Group similar optimized sets within")
+        self.group_similar.setChecked(group_similar)
+        self.within_percent = QDoubleSpinBox()
+        self.within_percent.setRange(0.0, 25.0)
+        self.within_percent.setDecimals(1)
+        self.within_percent.setSingleStep(0.5)
+        self.within_percent.setSuffix("% damage")
+        self.within_percent.setValue(within_percent)
+        self.within_percent.setMinimumWidth(140)
+        self.within_percent.setEnabled(group_similar)
+        self.group_similar.toggled.connect(self.within_percent.setEnabled)
+        group_row.addWidget(self.group_similar)
+        group_row.addWidget(self.within_percent)
+        group_row.addStretch(1)
+        grouping_layout.addLayout(group_row)
+        explanation = QLabel(
+            "A shared set is accepted only after every WS in the group is recalculated "
+            "and remains within this percentage of its own optimized damage."
+        )
+        explanation.setWordWrap(True)
+        grouping_layout.addWidget(explanation)
+        layout.addWidget(grouping)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_checked)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _set_all(self, state: Qt.CheckState):
+        for index in range(self.ws_list.count()):
+            self.ws_list.item(index).setCheckState(state)
+
+    def selected_weapon_skills(self) -> list[str]:
+        return [
+            self.ws_list.item(index).text()
+            for index in range(self.ws_list.count())
+            if self.ws_list.item(index).checkState() == Qt.CheckState.Checked
+        ]
+
+    def _accept_checked(self):
+        if not self.selected_weapon_skills():
+            QMessageBox.warning(self, "Weapon-skill rankings", "Select at least one weapon skill.")
+            return
+        self.accept()
+
+
 class WeaponSkillRankingDialog(QDialog):
-    """Three-column ranking of independently optimized WS sets."""
+    """Verified TP-tier rankings with a reference-standard gear preview."""
 
     def __init__(self, result: dict, icons: GearIconProvider, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Weapon-skill rankings")
-        self.resize(980, 680)
+        self.resize(1120, 740)
         self.icons = icons
         self.cell_results = {}
         layout = QVBoxLayout(self)
         note = QLabel(
-            f"{result.get('skill_type') or 'Selected weapon'}: each column is optimized "
-            "and ranked independently for the current enemy, buffs, abilities, "
-            "candidates, and locked weapon setup."
+            f"{result.get('skill_type') or 'Selected weapon'}: final winning sets are "
+            "recalculated and ranked independently for the current enemy and setup."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -3072,37 +3232,49 @@ class WeaponSkillRankingDialog(QDialog):
         self.table.setHorizontalHeaderLabels([f"{tp:,} TP ranking" for tp in tiers])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setWordWrap(True)
         self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         for column, tp_value in enumerate(tiers):
             for row, entry in enumerate(rankings.get(tp_value, ())):
                 item = QTableWidgetItem(
-                    f"{entry.get('rank', row + 1)}. {entry['ws_name']}\n"
-                    f"{float(entry['damage']):,.0f} average damage"
+                    f"#{entry.get('rank', row + 1)}  {entry['ws_name']}\n"
+                    f"{float(entry['damage']):,.0f} average"
                 )
                 item.setData(Qt.ItemDataRole.UserRole, float(entry["damage"]))
                 item.setToolTip(
-                    "Select this cell to load its optimized set into the WS editor."
+                    f"{entry['ws_name']} at {int(entry.get('tp') or tp_value):,} TP\n"
+                    f"Verified average damage: {float(entry['damage']):,.1f}"
                 )
                 self.table.setItem(row, column, item)
                 self.cell_results[(row, column)] = entry
-        self.table.resizeColumnsToContents()
-        self.table.resizeRowsToContents()
+        for row in range(row_count):
+            self.table.setRowHeight(row, 54)
         self.table.currentCellChanged.connect(self._selection_changed)
-        content = QHBoxLayout()
-        content.addWidget(self.table, 1)
+        content = QSplitter(Qt.Orientation.Horizontal)
+        content.addWidget(self.table)
         preview_box = QGroupBox("Selected WS set")
-        preview_box.setMinimumWidth(360)
-        preview_box_layout = QVBoxLayout(preview_box)
-        self.preview_scroll = QScrollArea()
-        self.preview_scroll.setWidgetResizable(True)
-        self.preview_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.preview_widget = QWidget()
-        self.preview_layout = QGridLayout(self.preview_widget)
-        self.preview_layout.setContentsMargins(2, 2, 2, 2)
-        self.preview_scroll.setWidget(self.preview_widget)
-        preview_box_layout.addWidget(self.preview_scroll, 1)
-        content.addWidget(preview_box, 0)
-        layout.addLayout(content, 1)
+        preview_box.setMinimumWidth(310)
+        preview_layout = QVBoxLayout(preview_box)
+        self.preview_title = QLabel("Select a ranking cell")
+        self.preview_title.setObjectName("sectionTitle")
+        self.preview_title.setWordWrap(True)
+        preview_layout.addWidget(self.preview_title)
+        self.scaling_details = QLabel()
+        self.scaling_details.setWordWrap(True)
+        preview_layout.addWidget(self.scaling_details)
+        self.gear_preview = ProfileGearPreview(parent) if parent is not None else None
+        if self.gear_preview is not None:
+            preview_layout.addWidget(self.gear_preview, 0, Qt.AlignmentFlag.AlignLeft)
+        self.group_details = QLabel()
+        self.group_details.setWordWrap(True)
+        preview_layout.addWidget(self.group_details)
+        preview_layout.addStretch(1)
+        content.addWidget(preview_box)
+        content.setStretchFactor(0, 1)
+        content.setStretchFactor(1, 0)
+        content.setSizes([780, 320])
+        layout.addWidget(content, 1)
         errors = list(result.get("errors") or ())
         if errors:
             error_label = QLabel(
@@ -3115,9 +3287,13 @@ class WeaponSkillRankingDialog(QDialog):
         load = QPushButton("Load selected optimized WS set")
         load.setEnabled(parent is not None)
         load.clicked.connect(self._load_selected)
+        graph = QPushButton("Generate 20,000 WS graph")
+        graph.setEnabled(parent is not None)
+        graph.clicked.connect(self._graph_selected)
         close = QPushButton("Close")
         close.clicked.connect(self.accept)
         controls.addWidget(load)
+        controls.addWidget(graph)
         controls.addStretch(1)
         controls.addWidget(close)
         layout.addLayout(controls)
@@ -3129,59 +3305,64 @@ class WeaponSkillRankingDialog(QDialog):
 
     def _selection_changed(self, *_args):
         indexes = self.table.selectedIndexes()
-        if not indexes:
-            self._render_preview(None)
-            return
-        index = indexes[0]
-        self._render_preview(self.cell_results.get((index.row(), index.column())))
+        self._render_preview(
+            self.cell_results.get((indexes[0].row(), indexes[0].column())) if indexes else None
+        )
 
     def _render_preview(self, entry: dict | None):
-        while self.preview_layout.count():
-            item = self.preview_layout.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
         if entry is None:
-            self.preview_layout.addWidget(QLabel("Select a WS ranking cell to preview its set."), 0, 0)
+            self.preview_title.setText("Select a ranking cell")
+            self.scaling_details.clear()
+            self.group_details.clear()
             return
-        title = QLabel(
+        self.preview_title.setText(
             f"{entry.get('ws_name', 'Weapon skill')} · {int(entry.get('tp') or 0):,} TP\n"
-            f"{float(entry.get('damage') or 0):,.0f} average damage"
+            f"{float(entry.get('damage') or 0):,.1f} average damage"
         )
-        title.setObjectName("sectionTitle")
-        title.setWordWrap(True)
-        self.preview_layout.addWidget(title, 0, 0, 1, 2)
+        details = entry.get("ws_details") or {}
+        modifiers = " · ".join(
+            f"{value['stat']} {float(value['percent']):g}%"
+            for value in details.get("wsc_modifiers") or ()
+        ) or "None"
+        ftp = f"{float(details.get('ftp_first', 0)):g} first hit"
+        if int(details.get("hits") or 1) > 1:
+            ftp += f" · {float(details.get('ftp_additional', 1)):g} additional hits"
+        if details.get("hybrid"):
+            ftp += f" · {float(details.get('ftp_hybrid', 0)):g} magic portion"
+        self.scaling_details.setText(
+            f"<b>WS modifiers:</b> {escape(modifiers)}<br>"
+            f"<b>fTP:</b> {escape(ftp)} · {int(details.get('hits') or 1)} hit(s)<br>"
+            f"<b>Effective TP:</b> {float(details.get('effective_tp') or entry.get('tp') or 0):,.0f}"
+        )
         player = entry.get("player")
-        gearset = getattr(player, "gearset", {}) if player is not None else {}
-        for index, slot in enumerate(SLOTS, start=1):
-            item = gearset.get(slot, gear.Empty)
-            cell = QFrame()
-            cell.setMinimumHeight(58)
-            cell.setFrameShape(QFrame.Shape.StyledPanel)
-            cell_layout = QHBoxLayout(cell)
-            cell_layout.setContentsMargins(4, 3, 4, 3)
-            icon_label = QLabel()
-            icon_label.setFixedSize(34, 34)
-            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            icon = self.icons.icon(item)
-            if not icon.isNull():
-                icon_label.setPixmap(icon.pixmap(QSize(30, 30)))
-            cell_layout.addWidget(icon_label)
-            name = QLabel(f"{slot.upper()}\n{item.get('Name') or 'Empty'}")
-            name.setWordWrap(True)
-            name.setToolTip(item_tooltip(item))
-            cell_layout.addWidget(name, 1)
-            row, column = divmod(index - 1, 2)
-            self.preview_layout.addWidget(cell, row + 1, column)
-        self.preview_layout.setRowStretch((len(SLOTS) + 1) // 2 + 1, 1)
+        if self.gear_preview is not None:
+            self.gear_preview.set_gearset(getattr(player, "gearset", {}) if player else {})
+        members = list(entry.get("group_members") or ())
+        self.group_details.setText(
+            (
+                f"Shared option: {', '.join(members)}\n"
+                f"{float(entry.get('group_loss_percent') or 0):.2f}% loss with "
+                f"{entry.get('group_representative_ws')} gear."
+            ) if len(members) > 1 else
+            "No other selected WS met the shared-set damage limit."
+        )
 
-    def _load_selected(self):
+    def _selected_entry(self):
         indexes = self.table.selectedIndexes()
         if not indexes:
-            return
-        index = indexes[0]
-        entry = self.cell_results.get((index.row(), index.column()))
+            return None
+        return self.cell_results.get((indexes[0].row(), indexes[0].column()))
+
+    def _load_selected(self):
+        entry = self._selected_entry()
         if entry is not None and self.parent() is not None:
             self.parent().load_ws_ranking_result(entry)
+            self.accept()
+
+    def _graph_selected(self):
+        entry = self._selected_entry()
+        if entry is not None and self.parent() is not None:
+            self.parent().generate_ws_ranking_graph(entry)
             self.accept()
 
 
@@ -3332,6 +3513,10 @@ class MainWindow(QMainWindow):
         self._workspace_generated_set_name = ""
         self._dashboard_ws_ranking_active = False
         self._dashboard_ws_ranking_result: dict | None = None
+        self._last_ws_ranking_result: dict | None = None
+        self._ws_ranking_selections: dict[str, list[str]] = {}
+        self._ws_ranking_group_similar = True
+        self._ws_ranking_group_percent = 2.0
         self.best_player = None
         self.best_tp_player = None
         self.best_ws_player = None
@@ -3413,15 +3598,29 @@ class MainWindow(QMainWindow):
         simulation_layout.addWidget(self.show_optimizer_status_button)
         simulation_layout.addWidget(self.stop_optimizer_button)
         simulation_layout.addWidget(self.optimizer_run_progress, 1)
-        self.optimizer_header_eta = QLabel("Est. Time Remaining: --")
+        self.optimizer_header_eta = QLabel("--")
         self.optimizer_header_eta.setObjectName("optimizerHeaderEta")
-        self.optimizer_header_eta.setMinimumWidth(150)
+        self.optimizer_header_eta.setMinimumWidth(42)
+        self.optimizer_header_eta.setMaximumWidth(62)
+        self.optimizer_header_eta.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.optimizer_header_eta.setToolTip(
             "Estimated seconds remaining for the active simulation."
         )
         simulation_layout.addWidget(self.optimizer_header_eta)
+        self.optimizer_header_cache = QPushButton("CACHE OFF")
+        self.optimizer_header_cache.setObjectName("optimizerHeaderCache")
+        self.optimizer_header_cache.setCheckable(True)
+        self.optimizer_header_cache.setChecked(bool(self.cache_enabled))
+        self.optimizer_header_cache.setMinimumWidth(78)
+        self.optimizer_header_cache.setMaximumWidth(86)
+        self.optimizer_header_cache.clicked.connect(self._set_cache_enabled)
+        self.optimizer_header_cache.setToolTip(
+            "Simulation cache availability. Detailed cache information is in Performance and storage."
+        )
+        simulation_layout.addWidget(self.optimizer_header_cache)
+        self._refresh_header_cache_indicator()
+        simulation_layout.insertWidget(1, self.show_results_button)
         simulation_layout.addStretch(1)
-        simulation_layout.addWidget(self.show_results_button)
         header.addWidget(title)
         header.addWidget(simulation_strip, 1)
         root_layout.addLayout(header)
@@ -3441,6 +3640,10 @@ class MainWindow(QMainWindow):
             QFrame#simulationHeaderPanel[state="completed"], QFrame#simulationHeaderPanel[state="restored"] { background: #252d29; border-color: #9caf94; }
             QFrame#simulationHeaderPanel[state="failed"] { background: #34252b; border-color: #c58d91; }
             QLabel#simulationHeaderLabel { color: #e6c983; border: 0; font-size: 11px; font-weight: 900; letter-spacing: 1px; padding: 0 4px; }
+            QLabel#optimizerHeaderEta { color: #fff0a8; border: 0; padding: 0 2px; font-size: 10px; font-weight: 800; }
+            QLabel#optimizerHeaderCache { color: #c58d91; border: 0; padding: 0 2px; font-size: 9px; font-weight: 800; }
+            QLabel#optimizerHeaderCache[cacheState="available"] { color: #9de2a8; }
+            QLabel#optimizerHeaderCache[cacheState="empty"] { color: #e6c983; }
             QSplitter#mainSplitter { background: #24213a; }
             QSplitter::handle { background: #57536f; width: 2px; }
             QMenuBar { background: #19172e; color: #f5f1ff; border-bottom: 1px solid #57536f; }
@@ -3636,6 +3839,10 @@ class MainWindow(QMainWindow):
 
     def _set_cache_enabled(self, enabled: bool):
         self.cache_enabled = bool(enabled)
+        if hasattr(self, "optimizer_header_cache"):
+            self.optimizer_header_cache.blockSignals(True)
+            self.optimizer_header_cache.setChecked(self.cache_enabled)
+            self.optimizer_header_cache.blockSignals(False)
         if hasattr(self, "cache_enabled_action"):
             self.cache_enabled_action.blockSignals(True)
             self.cache_enabled_action.setChecked(self.cache_enabled)
@@ -3644,8 +3851,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Simulation cache enabled" if self.cache_enabled else "Simulation cache disabled", 4000
         )
-        if hasattr(self, "cache_status_value"):
-            self._refresh_cache_status()
+        self._refresh_cache_status()
 
     @staticmethod
     def _format_bytes(value: int) -> str:
@@ -3654,15 +3860,49 @@ class MainWindow(QMainWindow):
         return f"{value / (1024 * 1024):.1f} MiB"
 
     def _refresh_cache_status(self):
+        summary = self.simulation_cache.summary()
+        self._refresh_header_cache_indicator(summary)
         if not hasattr(self, "cache_status_value"):
             return
-        summary = self.simulation_cache.summary()
         enabled = "enabled" if self.cache_enabled else "disabled"
         self.cache_status_value.setText(
             f"Cache {enabled}: {summary['entries']} entries, "
             f"{self._format_bytes(summary['bytes'])} payload / "
             f"{self._format_bytes(summary['disk_bytes'])} on disk"
         )
+
+    def _refresh_header_cache_indicator(self, summary: dict | None = None):
+        """Show whether reusable cache data is currently available."""
+        indicator = getattr(self, "optimizer_header_cache", None)
+        if indicator is None:
+            return
+        if summary is None:
+            summary = self.simulation_cache.summary()
+        entries = max(0, int(summary.get("entries", 0) or 0))
+        available = bool(getattr(self, "cache_enabled", False)) and entries > 0
+        if available:
+            label = f"CACHE {min(entries, 999):,}" if entries < 1000 else "CACHE 999+"
+            state = "available"
+            tooltip = f"{entries:,} reusable cached calculation(s) available."
+        elif not bool(getattr(self, "cache_enabled", False)):
+            label = "CACHE —"
+            state = "disabled"
+            tooltip = "No cached calculations are currently available for reuse."
+        else:
+            label = "CACHE —"
+            state = "empty"
+            tooltip = "Cache is enabled, but no reusable calculations are stored yet."
+        # Keep the top bar intentionally small; availability remains in the
+        # tooltip while the button itself is only the on/off control.
+        indicator.setText("CACHE ON" if self.cache_enabled else "CACHE OFF")
+        indicator.setChecked(bool(self.cache_enabled))
+        indicator.setProperty("cacheState", state)
+        indicator.setToolTip(
+            f"{'Reusable cache data is available.' if available else tooltip} "
+            "Click to enable or disable simulation cache reuse."
+        )
+        indicator.style().unpolish(indicator)
+        indicator.style().polish(indicator)
 
     def show_cache_info(self):
         summary = self.simulation_cache.summary()
@@ -4527,7 +4767,38 @@ class MainWindow(QMainWindow):
                 ws_sets[ws_name] = {
                     slot: gearset.get(slot, gear.Empty) for slot in SET_SLOTS
                 }
-        groups = group_similar_ws_sets(ws_sets, max_slot_differences=2)
+        groups = []
+        verified_groups = (result.get("groups") or {}).get(tp_key) or []
+        entries_by_name = {
+            str(entry.get("ws_name") or ""): entry
+            for entry in rankings.get(tp_key) or () if isinstance(entry, dict)
+        }
+        for raw_group in verified_groups:
+            representative = str(raw_group.get("representative") or "")
+            entry = entries_by_name.get(representative) or {}
+            shared_player = entry.get("player")
+            shared_gearset = getattr(shared_player, "gearset", None)
+            if not representative or not isinstance(shared_gearset, dict):
+                continue
+            groups.append({
+                **raw_group,
+                "gearset": {
+                    slot: shared_gearset.get(slot, gear.Empty) for slot in SET_SLOTS
+                },
+            })
+        if not groups and "group_similar" in result:
+            groups = [
+                {
+                    "representative": ws_name,
+                    "members": [ws_name],
+                    "gearset": dict(ws_set),
+                    "max_loss_percent": 0.0,
+                }
+                for ws_name, ws_set in ws_sets.items()
+            ]
+        elif not groups:
+            groups = group_similar_ws_sets(ws_sets, max_slot_differences=2)
+        groups.sort(key=lambda group: (-len(group.get("members") or ()), group["representative"]))
         if not groups:
             self.dashboard_ws_status.setText("WS ranking completed, but no legal gearsets were returned.")
             return
@@ -4545,10 +4816,39 @@ class MainWindow(QMainWindow):
                 "objective": ("Ranked WS damage",),
                 "ws_group": list(largest["members"]),
                 "simulation_summary": (
-                    f"Shared by {len(largest['members'])} similar WS at {int(tp_key):,} TP"
+                    f"Shared by {len(largest['members'])} WS at {int(tp_key):,} TP"
+                    + (
+                        f" within {float(result.get('group_within_percent') or 0):g}% damage"
+                        if result.get("group_similar") else ""
+                    )
                 ),
             }
-        shared_members = set(largest["members"]) if shared_supported else set()
+        set_name_by_ws = {}
+        for set_name, details in details_by_name.items():
+            optimizer = details.get("optimizer") or {}
+            ws_name = str(optimizer.get("ws_name") or "")
+            if (
+                ws_name and details.get("section_type") == "Weapon skill"
+                and details.get("variant") == "Default"
+            ):
+                set_name_by_ws.setdefault(ws_name, set_name)
+        inheritance_by_ws = {}
+        if shared_supported:
+            inheritance_by_ws.update({name: "Ws_Default" for name in largest["members"]})
+        for group in groups:
+            if group is largest and shared_supported:
+                continue
+            members = list(group.get("members") or ())
+            if len(members) < 2:
+                continue
+            representative = str(group.get("representative") or "")
+            parent_set = set_name_by_ws.get(representative)
+            if not parent_set:
+                continue
+            build["sets"][parent_set] = dict(group["gearset"])
+            inheritance_by_ws.update({
+                name: parent_set for name in members if name != representative
+            })
         for set_name, details in list(details_by_name.items()):
             optimizer = details.get("optimizer") or {}
             ws_name = str(optimizer.get("ws_name") or "")
@@ -4556,16 +4856,21 @@ class MainWindow(QMainWindow):
                 continue
             if ws_name not in ws_sets:
                 continue
-            if ws_name in shared_members:
+            inherited_from = inheritance_by_ws.get(ws_name)
+            if inherited_from:
                 build["sets"][set_name] = {slot: gear.Empty for slot in SET_SLOTS}
-                details["inherits_from"] = "Ws_Default"
-                details["simulation_summary"] = "Uses the shared Ws_Default ranking group"
+                details["inherits_from"] = inherited_from
+                details["simulation_summary"] = f"Uses shared ranked set {inherited_from}"
             else:
                 build["sets"][set_name] = dict(ws_sets[ws_name])
                 details.pop("inherits_from", None)
             details["optimization_state"] = "optimized"
         build["ws_groups"] = [
-            {"representative": group["representative"], "members": list(group["members"])}
+            {
+                "representative": group["representative"],
+                "members": list(group["members"]),
+                "max_loss_percent": group.get("max_loss_percent"),
+            }
             for group in groups
         ]
         build["published"] = False
@@ -4574,11 +4879,12 @@ class MainWindow(QMainWindow):
         group_text = " · ".join(
             f"{group['representative']}: {len(group['members'])} WS" for group in groups
         )
+        consolidated = len(inheritance_by_ws)
         prefix = (
             f"Applied {len(ws_sets)} ranked WS at {int(tp_key):,} TP; "
-            f"{len(largest['members'])} inherit Ws_Default. "
+            f"{consolidated} use shared sets. "
             if shared_supported else
-            f"Ranked {len(ws_sets)} WS at {int(tp_key):,} TP; this profile has no Ws_Default inheritance point. "
+            f"Ranked {len(ws_sets)} WS at {int(tp_key):,} TP; {consolidated} use shared sets. "
         )
         self.dashboard_ws_status.setText(prefix + group_text)
         self._refresh_build_dashboard()
@@ -4651,10 +4957,35 @@ class MainWindow(QMainWindow):
         current = self.favorite_weapon_combo.currentText()
         self.favorite_weapon_combo.blockSignals(True)
         self.favorite_weapon_combo.clear()
-        self.favorite_weapon_combo.addItems(sorted(character_favorites, key=str.casefold))
-        if current in character_favorites:
-            self.favorite_weapon_combo.setCurrentText(current)
+        for name in sorted(character_favorites, key=str.casefold):
+            self.favorite_weapon_combo.addItem(name, {"source": "favorite", "name": name})
+        # Expose the imported LAC sets directly beside local favorites.  The
+        # item data keeps the source unambiguous even when names overlap.
+        index = self.favorite_weapon_combo.findText(current)
+        if index >= 0:
+            self.favorite_weapon_combo.setCurrentIndex(index)
         self.favorite_weapon_combo.blockSignals(False)
+        self._refresh_quickset_lac_options()
+
+    def _refresh_quickset_lac_options(self):
+        if not hasattr(self, "quickset_lac_combo"):
+            return
+        current = self.quickset_lac_combo.currentText()
+        self.quickset_lac_combo.blockSignals(True)
+        self.quickset_lac_combo.clear()
+        for payload in sorted(self._profile_payloads(), key=lambda value: str(value.get("name", "")).casefold()):
+            name = str(payload.get("name") or "").strip()
+            if name:
+                self.quickset_lac_combo.addItem(name, payload.get("gearset", {}))
+        if current:
+            self.quickset_lac_combo.setCurrentText(current)
+        self.quickset_lac_combo.blockSignals(False)
+
+    def load_lac_set_into_quickset(self):
+        data = self.quickset_lac_combo.currentData() if hasattr(self, "quickset_lac_combo") else None
+        if isinstance(data, dict):
+            self.quick_set.set_gearset({slot: data.get(slot, gear.Empty) for slot in SLOTS})
+            self.statusBar().showMessage(f"Loaded {self.quickset_lac_combo.currentText()} into Quick Set", 5000)
 
     def _save_weapon_favorites(self):
         self.settings.setValue(
@@ -4666,11 +4997,31 @@ class MainWindow(QMainWindow):
         if not name:
             QMessageBox.information(self, "Favorite weapon setup", "Enter a name first.")
             return
+        lock_dialog = QDialog(self)
+        lock_dialog.setWindowTitle("Lock slots in weapon setup")
+        lock_layout = QVBoxLayout(lock_dialog)
+        lock_list = QListWidget(lock_dialog)
+        for slot in WEAPON_SLOTS:
+            row = QListWidgetItem(slot.upper())
+            row.setData(Qt.ItemDataRole.UserRole, slot)
+            row.setCheckState(Qt.CheckState.Unchecked)
+            lock_list.addItem(row)
+        lock_layout.addWidget(QLabel("Select weapon slots to lock when this setup is loaded:"))
+        lock_layout.addWidget(lock_list)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(lock_dialog.accept)
+        buttons.rejected.connect(lock_dialog.reject)
+        lock_layout.addWidget(buttons)
+        if lock_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        locked_slots = [lock_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(lock_list.count()) if lock_list.item(i).checkState() == Qt.CheckState.Checked]
+        weapon_payload = lambda editor: {slot: _gearset_payload({slot: editor.items.get(slot, gear.Empty)}).get(slot) for slot in WEAPON_SLOTS}
         character = self._favorite_weapon_character_key()
         self.favorite_weapon_setups.setdefault(character, {})[name] = {
-            "quick": _gearset_payload(self.quick_set.items),
-            "tp": _gearset_payload(self.tp_set.items),
-            "ws": _gearset_payload(self.ws_set.items),
+            "quick": weapon_payload(self.quick_set),
+            "tp": weapon_payload(self.tp_set),
+            "ws": weapon_payload(self.ws_set),
+            "locked_slots": locked_slots,
             "weapon_type": self.weapon_type_combo.currentText(),
             "ws_name": self.ws_combo.currentText(),
             "tp_value": self.tp_value.value(),
@@ -4688,7 +5039,10 @@ class MainWindow(QMainWindow):
         for key, editor in (("quick", self.quick_set), ("tp", self.tp_set), ("ws", self.ws_set)):
             saved = setup.get(key)
             if isinstance(saved, dict):
-                editor.set_gearset({slot: self._resolve_saved_item(slot, saved.get(slot)) for slot in SLOTS})
+                resolved = {slot: self._resolve_saved_item(slot, saved.get(slot)) if slot in WEAPON_SLOTS else editor.items.get(slot, gear.Empty) for slot in SLOTS}
+                editor.set_gearset(resolved)
+        for slot in setup.get("locked_slots", ()):
+            self.locked_gear[slot] = item_name(self.quick_set.items.get(slot, gear.Empty))
         self._set_combo_value(self.weapon_type_combo, setup.get("weapon_type"), AUTO_WEAPON_TYPE)
         self._refresh_ws_choices()
         self._set_combo_value(self.ws_combo, setup.get("ws_name"), self.ws_combo.currentText())
@@ -4699,6 +5053,29 @@ class MainWindow(QMainWindow):
         self.workspace_mode.setCurrentText("TP → WS Cycle")
         self._select_tab("Gear Workspace")
         self.statusBar().showMessage(f"Loaded favorite weapon setup: {name}", 5000)
+
+    def save_weapon_setup_to_lac(self):
+        """Persist the current quick setup as a normal set in the active LAC profile."""
+        name = self.favorite_weapon_name.text().strip()
+        profile = self._profile_for_job()
+        if not name or profile is None:
+            QMessageBox.information(self, "Save to LAC", "Enter a set name and select an imported LAC profile first.")
+            return
+        job = str(profile.get("job") or self.profile_job_combo.currentText())
+        path = self.bridge_store.profile_path(job)
+        try:
+            source = path.read_text(encoding="utf-8")
+            _, entries, _ = parse_set_entries(source)
+            if any(entry.name == name for entry in entries):
+                answer = QMessageBox.question(self, "Replace LAC set", f"Replace existing set '{name}'?")
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            write_set(path, name, self.quick_set.items, expected_hash=bridge_hash(source), overwrite=True)
+            self.refresh_bridge()
+            self._refresh_weapon_favorites()
+            self.statusBar().showMessage(f"Saved {name} to LAC", 5000)
+        except Exception as error:
+            QMessageBox.critical(self, "Save to LAC", str(error))
 
     def delete_favorite_weapon_setup(self):
         name = self.favorite_weapon_combo.currentText().strip()
@@ -4714,7 +5091,7 @@ class MainWindow(QMainWindow):
     def _favorite_weapon_box(self) -> QGroupBox:
         """Keep reusable weapon setups beside the gear they affect."""
         box = QGroupBox("Saved weapon setups")
-        box_layout = QVBoxLayout(box)
+        box_layout = QHBoxLayout(box)
         box_layout.setContentsMargins(6, 7, 6, 5)
         box_layout.setSpacing(0)
         self.favorite_weapon_name = QLineEdit()
@@ -4726,6 +5103,9 @@ class MainWindow(QMainWindow):
         self.favorite_weapon_combo.setMaximumWidth(250)
         save_weapon = QPushButton("Save")
         save_weapon.clicked.connect(self.save_favorite_weapon_setup)
+        save_lac = QPushButton("Save to LAC")
+        save_lac.setToolTip("Write the current quick gear set into the selected LAC profile.")
+        save_lac.clicked.connect(self.save_weapon_setup_to_lac)
         load_weapon = QPushButton("Load")
         load_weapon.clicked.connect(self.load_favorite_weapon_setup)
         delete_weapon = QPushButton("Delete")
@@ -4736,6 +5116,7 @@ class MainWindow(QMainWindow):
         save_row.setSpacing(4)
         save_row.addWidget(self.favorite_weapon_name)
         save_row.addWidget(save_weapon)
+        save_row.addWidget(save_lac)
         save_row.addStretch(1)
         load_group = QWidget()
         load_row = QHBoxLayout(load_group)
@@ -4745,9 +5126,21 @@ class MainWindow(QMainWindow):
         load_row.addWidget(load_weapon)
         load_row.addWidget(delete_weapon)
         load_row.addStretch(1)
-        box_layout.addWidget(
-            ResponsiveControlStrip(save_group, load_group, stack_width=690)
-        )
+        quick_group = QGroupBox("Load gear into Quick Set")
+        quick_row = QHBoxLayout(quick_group)
+        quick_row.setContentsMargins(4, 4, 4, 4)
+        self.quickset_lac_combo = QComboBox()
+        self.quickset_lac_combo.setMinimumWidth(180)
+        quick_row.addWidget(self.quickset_lac_combo, 1)
+        load_quick = QPushButton("Load")
+        load_quick.clicked.connect(self.load_lac_set_into_quickset)
+        quick_row.addWidget(load_quick)
+        weapon_group = QGroupBox("Weapon groups")
+        weapon_layout = QVBoxLayout(weapon_group)
+        weapon_layout.setContentsMargins(4, 4, 4, 4)
+        weapon_layout.addWidget(ResponsiveControlStrip(save_group, load_group, stack_width=690))
+        box_layout.addWidget(weapon_group, 2)
+        box_layout.addWidget(quick_group, 1)
         self._refresh_weapon_favorites()
         return box
 
@@ -4796,12 +5189,12 @@ class MainWindow(QMainWindow):
             "Copy the current Single Set armor back to the generated catalog entry it came from."
         )
         self.workspace_update_generated_button.clicked.connect(self.update_generated_set_from_workspace)
-        self.workspace_export_lac_button = QPushButton("Export set to LAC profile…")
+        self.workspace_export_lac_button = QPushButton("Save current set to LAC…")
         self.workspace_export_lac_button.setToolTip(
             "Review and write one workspace set to the selected character's LuAshitacast profile."
         )
         self.workspace_export_lac_button.clicked.connect(self.export_workspace_set_to_lac)
-        self.workspace_export_lac_button.setText("Export to LAC...")
+        self.workspace_export_lac_button.setText("Save current set to LAC…")
         transfer_layout.addWidget(self.workspace_generated_label, 1)
         transfer_layout.addWidget(self.workspace_update_generated_button)
         transfer_layout.addWidget(self.workspace_export_lac_button)
@@ -5328,14 +5721,36 @@ class MainWindow(QMainWindow):
         distribution.setMaximumHeight(30)
         distribution.setToolTip("Sample the default 20,000 weapon skills and save the compact histogram to Results.")
         distribution.clicked.connect(self.plot_ws_distribution)
+        self.ws_tp_time_checkbox = QCheckBox("WS damage vs TP/time")
+        self.ws_tp_time_checkbox.setToolTip(
+            "Show one fixed WS set's average damage at several TP levels against the time needed to reach each level."
+        )
         copy_tp_ws = QPushButton("Copy TP → WS")
         copy_tp_ws.clicked.connect(lambda: self.ws_set.set_gearset(self.tp_set.items))
         swap = QPushButton("Swap TP / WS")
         swap.clicked.connect(self.swap_tp_ws_sets)
         copy_tp_ws.setObjectName("cycleSecondaryAction")
         swap.setObjectName("cycleSecondaryAction")
-        tp_layout.addWidget(self.simulate_button, 0, Qt.AlignmentFlag.AlignHCenter)
-        ws_layout.addWidget(distribution, 0, Qt.AlignmentFlag.AlignHCenter)
+        tp_quick_row = QHBoxLayout()
+        tp_quick_row.setSpacing(4)
+        tp_quick_row.addWidget(self.simulate_button)
+        add_tp_quick = QPushButton("Add to Quick View")
+        add_tp_quick.setObjectName("cycleSecondaryAction")
+        add_tp_quick.setToolTip("Copy the TP phase gear into the Quick View set.")
+        add_tp_quick.clicked.connect(lambda: self.quick_set.set_gearset(dict(self.tp_set.items)))
+        tp_quick_row.addWidget(add_tp_quick)
+        tp_layout.addLayout(tp_quick_row)
+
+        ws_quick_row = QHBoxLayout()
+        ws_quick_row.setSpacing(4)
+        ws_quick_row.addWidget(distribution)
+        ws_quick_row.addWidget(self.ws_tp_time_checkbox)
+        add_ws_quick = QPushButton("Add to Quick View")
+        add_ws_quick.setObjectName("cycleSecondaryAction")
+        add_ws_quick.setToolTip("Copy the WS phase gear into the Quick View set.")
+        add_ws_quick.clicked.connect(lambda: self.quick_set.set_gearset(dict(self.ws_set.items)))
+        ws_quick_row.addWidget(add_ws_quick)
+        ws_layout.addLayout(ws_quick_row)
         for column in range(3):
             controls.setColumnStretch(column, 1)
         status_box = QGroupBox("Cycle status")
@@ -6151,6 +6566,13 @@ class MainWindow(QMainWindow):
         )
         self.include_shared_gear.toggled.connect(self._shared_gear_changed)
         grid.addWidget(self.include_shared_gear, 6, 0, 1, 4)
+        self.include_all_character_gear = QCheckBox("Use eligible gear from all characters for optimization")
+        self.include_all_character_gear.setToolTip(
+            "Opt-in: add modeled gear found in every discovered character export to optimizer candidate lists. "
+            "This can include non-transferable gear and does not make it equippable on the current character."
+        )
+        self.include_all_character_gear.toggled.connect(self._all_character_gear_changed)
+        grid.addWidget(self.include_all_character_gear, 7, 0, 1, 4)
         preset_row = QHBoxLayout()
         self.candidate_preset_combo = QComboBox()
         self.candidate_preset_combo.setMinimumWidth(180)
@@ -6166,7 +6588,7 @@ class MainWindow(QMainWindow):
         preset_row.addWidget(load_candidates)
         preset_row.addWidget(save_candidates)
         preset_row.addWidget(delete_candidates)
-        grid.addLayout(preset_row, 7, 0, 1, 4)
+        grid.addLayout(preset_row, 8, 0, 1, 4)
         candidate_column = QVBoxLayout()
         candidate_column.addWidget(candidates, 1)
         top.addLayout(candidate_column, 1)
@@ -6212,11 +6634,18 @@ class MainWindow(QMainWindow):
             "primary-loss bands and is intended for overnight searches."
         )
         self.substat_combos = []
+        self.substat_minimums = []
         for _index, default_stat in enumerate(("Magic Evasion", "Evasion", "Defense")):
             combo = QComboBox()
             combo.addItems(SUBSTAT_OPTIONS)
             combo.setCurrentText(default_stat)
             self.substat_combos.append(combo)
+            minimum = QDoubleSpinBox()
+            minimum.setRange(0.0, 99999.0)
+            minimum.setDecimals(1)
+            minimum.setEnabled(default_stat != "None")
+            combo.currentTextChanged.connect(lambda value, control=minimum: control.setEnabled(value != "None"))
+            self.substat_minimums.append(minimum)
         self.optimize_action.currentTextChanged.connect(self._refresh_optimizer_metrics)
         self.substat_base_action.currentTextChanged.connect(
             lambda _text: self._refresh_optimizer_metrics(self.optimize_action.currentText())
@@ -6294,6 +6723,7 @@ class MainWindow(QMainWindow):
         self.tradeoff_depth.setVisible(False)
         for index, combo in enumerate(self.substat_combos, start=1):
             form.addRow(f"Secondary stat priority {index}", combo)
+            form.addRow(f"Minimum value {index}", self.substat_minimums[index - 1])
         form.addRow("Minimum PDT reduction %", self.pdt)
         form.addRow("Minimum MDT reduction %", self.mdt)
         form.addRow("Minimum DT reduction %", self.dt)
@@ -6362,6 +6792,11 @@ class MainWindow(QMainWindow):
         self.optimizer_primary_controls = primary_controls
         primary_controls.setSpacing(7)
         primary_controls.addWidget(self.optimize_button, 2)
+        self.queue_optimizer_button = QPushButton("Add to Queue")
+        self.queue_optimizer_button.setMinimumHeight(42)
+        self.queue_optimizer_button.setToolTip("Save the current optimizer configuration to the local queue.")
+        self.queue_optimizer_button.clicked.connect(self.add_optimizer_to_queue)
+        primary_controls.addWidget(self.queue_optimizer_button, 1)
         primary_controls.addWidget(self.stop_optimizer_button, 1)
         self.show_optimizer_status_button = QPushButton("Show simulation")
         self.show_optimizer_status_button.setObjectName("optimizerShowAction")
@@ -6378,12 +6813,6 @@ class MainWindow(QMainWindow):
         primary_controls.addWidget(self.show_top_sets_button, 1)
         control_layout.addLayout(primary_controls)
 
-        secondary_controls = QHBoxLayout()
-        secondary_controls.setSpacing(7)
-        secondary_controls.addWidget(QLabel("Result"))
-        secondary_controls.addWidget(self.equip_best_button)
-        secondary_controls.addStretch(1)
-        control_layout.addLayout(secondary_controls)
         layout.addWidget(self.optimizer_control_panel)
         layout.addLayout(top)
         layout.addStretch(1)
@@ -6611,15 +7040,15 @@ class MainWindow(QMainWindow):
     def _set_optimizer_header_eta(
         self, remaining: float | None = None, status: str | None = None,
     ):
-        """Show a short seconds-only ETA beside the persistent progress bar."""
+        """Show only a compact seconds value beside the persistent progress bar."""
         if not hasattr(self, "optimizer_header_eta"):
             return
-        if status is not None:
-            text = f"Est. Time Remaining: {status}"
-        elif remaining is None:
-            text = "Est. Time Remaining: --"
+        if remaining is not None:
+            text = f"{max(0, math.ceil(float(remaining)))}s"
+        elif status == "complete":
+            text = "0s"
         else:
-            text = f"Est. Time Remaining: {max(0, math.ceil(float(remaining)))}s"
+            text = "--"
         self.optimizer_header_eta.setText(text)
 
     def _refresh_profile_builder_batch_status(self):
@@ -6867,6 +7296,16 @@ class MainWindow(QMainWindow):
             self.metric_combo.setCurrentText(current)
 
     def _refresh_combined_options(self, action: str):
+        # Tradeoff searches use the secondary-action selector as the metric
+        # being maximized; make that relationship explicit in the form.
+        if hasattr(self, "metric_combo") and hasattr(self, "substat_base_action"):
+            form = self.metric_combo.parentWidget().layout()
+            metric_label = form.labelForField(self.metric_combo) if form else None
+            substat_label = form.labelForField(self.substat_base_action) if form else None
+            if metric_label is not None:
+                metric_label.setText("Primary metric" if action in {"Tradeoff optimization", "Sub-stat optimization"} else "Metric")
+            if substat_label is not None:
+                substat_label.setText("Metric" if action in {"Tradeoff optimization", "Sub-stat optimization"} else "Sub-stat damage action")
         self.combined_defense_both.setVisible(action == "Combined TP + WS")
         ranking = action in {"Rank weapon-type WS", WARM_CACHE_ACTION}
         self.ranking_weapon_type.setVisible(ranking)
@@ -6905,6 +7344,17 @@ class MainWindow(QMainWindow):
         finally:
             self._applying_search_quality = False
         self._refresh_parallel_mode(self.parallel_mode.currentText())
+        self._refresh_custom_search_controls()
+
+    def _refresh_custom_search_controls(self):
+        """Keep routine quality presets compact; expose tuning only for Custom."""
+        custom = hasattr(self, "optimizer_quality") and self.optimizer_quality.currentText() == "Custom"
+        for widget in (getattr(self, "restarts", None), getattr(self, "optimizer_passes", None), getattr(self, "workers", None)):
+            if widget is not None:
+                widget.setVisible(custom)
+                label = widget.parentWidget().layout().labelForField(widget) if widget.parentWidget() and widget.parentWidget().layout() else None
+                if label is not None:
+                    label.setVisible(custom)
 
     def _optimizer_search_controls_changed(self, _value=None):
         if not getattr(self, "_applying_search_quality", False):
@@ -6917,6 +7367,20 @@ class MainWindow(QMainWindow):
             self.optimizer_quality.setCurrentText(expected)
             self.optimizer_quality.blockSignals(False)
         self._refresh_parallel_mode(self.parallel_mode.currentText())
+        self._refresh_custom_search_controls()
+
+    def add_optimizer_to_queue(self):
+        queue = getattr(self, "_optimizer_queue", None)
+        if queue is None:
+            queue = self._optimizer_queue = []
+        queue.append({
+            "action": self.optimize_action.currentText(),
+            "metric": self.metric_combo.currentText(),
+            "quality": self.optimizer_quality.currentText(),
+            "runs": self.restarts.value(),
+            "passes": self.optimizer_passes.value(),
+        })
+        self.statusBar().showMessage(f"Added optimization to queue ({len(queue)} queued)", 4000)
 
     def _refresh_parallel_mode(self, mode: str):
         split_one_run = mode == "Split one search run"
@@ -7918,6 +8382,14 @@ class MainWindow(QMainWindow):
         self.lac_editor_save_button.clicked.connect(self.save_lac_editor)
         toolbar_layout.addWidget(self.lac_editor_reload_button)
         toolbar_layout.addWidget(self.lac_editor_save_button)
+        self.lac_editor_find = QLineEdit()
+        self.lac_editor_find.setPlaceholderText("Find in LAC…")
+        self.lac_editor_find.setMaximumWidth(220)
+        self.lac_editor_find.returnPressed.connect(self.find_lac_text)
+        find_button = QPushButton("Find")
+        find_button.clicked.connect(self.find_lac_text)
+        toolbar_layout.addWidget(self.lac_editor_find)
+        toolbar_layout.addWidget(find_button)
         layout.addWidget(toolbar)
 
         self.lac_editor = LuaCodeEditor()
@@ -7946,6 +8418,18 @@ class MainWindow(QMainWindow):
         self._lac_editor_job_label = ""
         self._refresh_lac_editor_jobs(load=False)
         return tab
+
+    def find_lac_text(self):
+        query = self.lac_editor_find.text().strip() if hasattr(self, "lac_editor_find") else ""
+        if not query or not hasattr(self, "lac_editor"):
+            return
+        if self.lac_editor.find(query):
+            return
+        cursor = self.lac_editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        self.lac_editor.setTextCursor(cursor)
+        if not self.lac_editor.find(query):
+            self.lac_editor_status.setText(f"Not found: {query}")
 
     def _refresh_lac_editor_jobs(self, *, load: bool = True):
         if not hasattr(self, "lac_editor_job_combo"):
@@ -8193,7 +8677,7 @@ class MainWindow(QMainWindow):
         self.profile_builder_depth.currentTextChanged.connect(self._profile_builder_settings_changed)
         self.profile_builder_tp.valueChanged.connect(self._profile_builder_settings_changed)
         self.profile_builder_seed.textChanged.connect(self._profile_builder_settings_changed)
-        self.profile_build_button = QPushButton("Create starting sets")
+        self.profile_build_button = QPushButton("Generate base sets")
         self.profile_build_button.setObjectName("primaryAction")
         self.profile_build_button.clicked.connect(self.build_complete_lac_profile)
         self.profile_optimize_all_button = QPushButton("Improve all combat sets")
@@ -8246,7 +8730,7 @@ class MainWindow(QMainWindow):
         generated_layout.setSpacing(4)
         catalog_toolbar = QHBoxLayout()
         catalog_toolbar.setSpacing(5)
-        self.profile_builder_catalog_summary = QLabel("Create starting sets to populate the catalog.")
+        self.profile_builder_catalog_summary = QLabel("Generate base sets to populate the catalog.")
         self.profile_builder_filter = QComboBox()
         self.profile_builder_filter.addItems([
             "All sets", "Needs improvement", "Warnings", "TP", "Weapon skill", "Utility / defense",
@@ -9478,7 +9962,7 @@ class MainWindow(QMainWindow):
         items = [gear.Empty, *self.equipment.get(slot, [])]
         items.extend(
             item for item in self.shared_catalog.values()
-            if slot in item.get("Slots", ())
+            if slot in item.get("Slots", ()) and not item.get("Optimizer Only")
         )
         for item in items:
             if slot == "ear1" and is_right_ear_only(item):
@@ -9523,6 +10007,10 @@ class MainWindow(QMainWindow):
         # aspirational gear is candidate-only and never enters Quick Look.
         items = [*self.items_for_slot(slot), *self.porter_items_for_slot(slot),
                  *self.aspirational_items_for_slot(slot)]
+        items.extend(
+            item for item in self.shared_catalog.values()
+            if slot in item.get("Slots", ()) and item.get("Optimizer Only")
+        )
         items = [
             item for item in items
             if not _blacklist_matches(item, self.gear_blacklist)
@@ -9639,10 +10127,29 @@ class MainWindow(QMainWindow):
             4000,
         )
 
+    def _all_character_gear_changed(self, enabled: bool):
+        self._refresh_shared_gear()
+        self._refresh_locked_gear_options()
+        self._reset_invalid_equipment()
+        for slot in SLOTS:
+            self._update_candidate_button(slot)
+        self.statusBar().showMessage(
+            "All-character optimizer gear enabled." if enabled else "All-character optimizer gear disabled.",
+            4000,
+        )
+
     def _refresh_shared_gear(self):
         """Merge transferable inventory from other bridge characters when enabled."""
         self.shared_catalog = {}
-        if not getattr(self, "include_shared_gear", None) or not self.include_shared_gear.isChecked():
+        include_transferable = bool(
+            getattr(self, "include_shared_gear", None)
+            and self.include_shared_gear.isChecked()
+        )
+        include_all = bool(
+            getattr(self, "include_all_character_gear", None)
+            and self.include_all_character_gear.isChecked()
+        )
+        if not include_transferable and not include_all:
             return
         if not self.bridge_store.bridge_path or not self.bridge_store.ashita_root:
             return
@@ -9658,13 +10165,17 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
             for item in store.catalog.values():
-                if not item.get("Eligible") or not item.get("Transferable", False):
+                owned_storage = int(item.get("Total Count") or 0) > 0
+                if not item.get("Eligible") and not (include_all and owned_storage and item.get("Model Complete")):
+                    continue
+                if not include_all and not item.get("Transferable", False):
                     continue
                 name = item_name(item)
                 if name in known:
                     continue
                 shared = copy.deepcopy(item)
                 shared["Shared Only"] = True
+                shared["Optimizer Only"] = bool(include_all and not item.get("Transferable", False))
                 shared["Shared Characters"] = [label]
                 self.shared_catalog[name] = shared
                 known.add(name)
@@ -9673,6 +10184,7 @@ class MainWindow(QMainWindow):
         return {
             "exclude_under_119": bool(self.exclude_under_119.isChecked()),
             "include_shared_gear": bool(self.include_shared_gear.isChecked()),
+            "include_all_character_gear": bool(self.include_all_character_gear.isChecked()),
             "aspirational": sorted(self.aspirational_selected),
             "locks": {
                 slot: str(value or "")
@@ -10133,6 +10645,7 @@ class MainWindow(QMainWindow):
             } if isinstance(aspirational, list) else set()
             self.exclude_under_119.setChecked(bool(candidate_state.get("exclude_under_119", False)))
             self.include_shared_gear.setChecked(bool(candidate_state.get("include_shared_gear", False)))
+            self.include_all_character_gear.setChecked(bool(candidate_state.get("include_all_character_gear", False)))
             self._refresh_shared_gear()
             self._refresh_locked_gear_options()
             locks = candidate_state.get("locks") if isinstance(candidate_state.get("locks"), dict) else {}
@@ -10531,6 +11044,10 @@ class MainWindow(QMainWindow):
             for tp_value, rows in (result.get("rankings") or {}).items():
                 rankings[str(tp_value)] = _serialize_top_results(list(rows))
             saved["rankings"] = rankings
+            saved["groups"] = {
+                str(tp_value): rows
+                for tp_value, rows in (result.get("groups") or {}).items()
+            }
             return saved
         substat_summary = result[5] if isinstance(result, (tuple, list)) and len(result) > 5 else []
         return {
@@ -10546,6 +11063,10 @@ class MainWindow(QMainWindow):
             restored["rankings"] = {
                 int(tp_value): _restore_top_results(rows, context)
                 for tp_value, rows in (payload.get("rankings") or {}).items()
+            }
+            restored["groups"] = {
+                int(tp_value): rows
+                for tp_value, rows in (payload.get("groups") or {}).items()
             }
             return restored
         return (
@@ -10941,7 +11462,36 @@ class MainWindow(QMainWindow):
                     raise ValueError(
                         "Equip a modeled melee or ranged weapon before running WS rankings."
                     )
-                check_gear = _lock_ranking_weapon_slots(check_gear, self.quick_set.items)
+                optimizer_locked_weapons = {
+                    slot for slot in WEAPON_SLOTS if self.locked_gear.get(slot)
+                }
+                check_gear = _lock_ranking_weapon_slots(
+                    check_gear, self.quick_set.items, optimizer_locked_weapons
+                )
+            ranking_names = list(WS_BY_SKILL.get(ranking_skill, ()))
+            ranking_group_similar = False
+            ranking_group_percent = self._ws_ranking_group_percent
+            if ranking_mode and not warm_cache_mode:
+                options = WeaponSkillRankingOptionsDialog(
+                    ranking_skill,
+                    ranking_names,
+                    self._ws_ranking_selections.get(ranking_skill, ranking_names),
+                    self._ws_ranking_group_similar,
+                    self._ws_ranking_group_percent,
+                    self,
+                )
+                if options.exec() != QDialog.DialogCode.Accepted:
+                    if self._dashboard_ws_ranking_active:
+                        self._dashboard_ws_ranking_active = False
+                        self.dashboard_ws_status.setText("Weapon-skill ranking canceled.")
+                        self._refresh_build_dashboard()
+                    return
+                ranking_names = options.selected_weapon_skills()
+                ranking_group_similar = options.group_similar.isChecked()
+                ranking_group_percent = options.within_percent.value()
+                self._ws_ranking_selections[ranking_skill] = list(ranking_names)
+                self._ws_ranking_group_similar = ranking_group_similar
+                self._ws_ranking_group_percent = ranking_group_percent
             optimizer_ws_type = (
                 "ranged" if ranking_skill in {"Archery", "Marksmanship"}
                 else "melee" if ranking_mode else self._ws_type()
@@ -10998,7 +11548,7 @@ class MainWindow(QMainWindow):
             )
             if ranking_mode:
                 args = common + (
-                    list(WS_BY_SKILL[ranking_skill]), optimizer_ws_type, check_gear,
+                    ranking_names, optimizer_ws_type, check_gear,
                     dict(self.quick_set.items), pdt_requirement, mdt_requirement,
                 )
                 kwargs = {
@@ -11006,6 +11556,8 @@ class MainWindow(QMainWindow):
                     "tp_values": (1000, 2000, 3000),
                     "restarts": self.restarts.value(), "workers": self.workers.value(),
                     "seed": seed, "parallel_mode": parallel_mode,
+                    "group_similar": ranking_group_similar,
+                    "group_within_percent": ranking_group_percent,
                 }
             elif substat_mode:
                 args = common + (
@@ -11013,8 +11565,10 @@ class MainWindow(QMainWindow):
                     self.tp_value.value(), check_gear, dict(self.quick_set.items),
                     pdt_requirement, mdt_requirement, self.metric_combo.currentText(), False, 2,
                     [
-                        {"target": stat, "loss_percent": self.substat_loss_percent.value()}
-                        for stat in selected_substats
+                        {"target": combo.currentText(), "minimum": minimum.value(),
+                         "loss_percent": self.substat_loss_percent.value()}
+                        for combo, minimum in zip(self.substat_combos, self.substat_minimums)
+                        if combo.currentText() != "None"
                     ],
                 )
                 kwargs = {
@@ -11404,6 +11958,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("overnight_simulations/enemies", scenario_names)
         self._clear_optimizer_log()
         self._optimizer_run_state = {}
+        self._last_ws_ranking_result = None
         self._optimizer_started_at = time.monotonic()
         self._optimizer_eta_started_at = self._optimizer_started_at
         self._optimizer_progress_samples = []
@@ -11755,15 +12310,26 @@ class MainWindow(QMainWindow):
         ranking_state = ranking_states[0] if ranking_states else None
         ranking_done = int(ranking_state.get("ranking_completed", 0)) if ranking_state else 0
         ranking_total = int(ranking_state.get("ranking_total", 0)) if ranking_state else 0
-        if ranking_state and ranking_done > 0 and elapsed > 1:
+        if ranking_state and ranking_done > 0:
             # Ranking work is intentionally sequential (one optimizer call per
             # WS/TP cell), so use the measured mean cell time rather than the
             # generic optimizer fraction, which assumes equal search runs.
-            remaining = elapsed / ranking_done * max(0, ranking_total - ranking_done)
-            self.optimizer_eta_value.setText(
-                f"Estimated time remaining: {self._format_duration(remaining)}"
+            ranking_started = float(
+                ranking_state.get("ranking_started_at") or eta_started or time.monotonic()
             )
-            self._set_optimizer_header_eta(remaining)
+            ranking_elapsed = max(0.0, time.monotonic() - ranking_started)
+            remaining = (
+                ranking_elapsed / ranking_done * max(0, ranking_total - ranking_done)
+                if ranking_elapsed >= 1.0 else None
+            )
+            if remaining is not None:
+                self.optimizer_eta_value.setText(
+                    f"Estimated time remaining: {self._format_duration(remaining)}"
+                )
+                self._set_optimizer_header_eta(remaining)
+            else:
+                self.optimizer_eta_value.setText("Estimated time remaining: calculating…")
+                self._set_optimizer_header_eta(status="calculating…")
         else:
             remaining = _remaining_time_estimate(
                 self._optimizer_progress_samples, elapsed=elapsed, progress=progress,
@@ -11877,6 +12443,7 @@ class MainWindow(QMainWindow):
                     "improvement": "none yet",
                 },
             )
+            state.setdefault("ranking_started_at", time.monotonic())
             state["ranking_completed"] = max(0, current - 1)
             state["ranking_total"] = max(1, total)
             state["fraction"] = min(1.0, (current - 1) / max(1, total))
@@ -11989,7 +12556,8 @@ class MainWindow(QMainWindow):
         self.optimize_button.setEnabled(True)
         self.stop_optimizer_button.setEnabled(False)
         self.equip_best_button.setEnabled(False)
-        self._set_optimizer_gear_results_enabled(False)
+        self._last_ws_ranking_result = result
+        self._set_optimizer_gear_results_enabled(True)
         self.optimizer_activity.setText("Completed")
         self._set_optimizer_run_ui(
             "completed", f"Weapon-skill ranking complete · {success_count} results.", 100.0
@@ -12221,6 +12789,12 @@ class MainWindow(QMainWindow):
             self._set_optimizer_run_ui("running", message)
 
     def show_top_sets(self):
+        if self._last_ws_ranking_result is not None and not self.optimizer_top_results:
+            self.ws_ranking_dialog = WeaponSkillRankingDialog(
+                self._last_ws_ranking_result, self.icons, self
+            )
+            self.ws_ranking_dialog.show()
+            return
         if not self.optimizer_top_results:
             return
         self.top_sets_dialog = TopSetsDialog(self.optimizer_top_results, self.icons, self)
@@ -12274,6 +12848,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Loaded {entry.get('ws_name')} optimized WS set", 5000
         )
+
+    def generate_ws_ranking_graph(self, entry: dict):
+        """Load the selected verified WS/TP result and start its 20k graph."""
+        self.load_ws_ranking_result(entry)
+        self.statusBar().showMessage(
+            f"Preparing 20,000-sample graph for {entry.get('ws_name')} "
+            f"at {int(entry.get('tp') or 1000):,} TP", 5000,
+        )
+        QTimer.singleShot(0, self.plot_ws_distribution)
 
     def equip_best(self):
         if self.best_player is not None:
@@ -12330,6 +12913,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Simulation failed", str(error))
 
     def plot_ws_distribution(self):
+        if hasattr(self, "ws_tp_time_checkbox") and self.ws_tp_time_checkbox.isChecked():
+            self.plot_ws_tp_time()
+            return
         if hasattr(self, "plot_thread") and self.plot_thread.isRunning():
             return
         try:
@@ -12357,6 +12943,56 @@ class MainWindow(QMainWindow):
             self.plot_thread.start()
         except Exception as error:
             QMessageBox.critical(self, "Distribution plot", str(error))
+
+    def plot_ws_tp_time(self):
+        """Plot fixed-set WS damage against the time needed to reach each TP tier."""
+        try:
+            player, enemy, _buffs, _abilities = self._context(self.ws_set.items)
+            ws_name = self.ws_combo.currentText().strip()
+            if not ws_name or ws_name == "None":
+                raise ValueError("Select a weapon skill before creating a TP/time graph.")
+            ws_type = self._ws_type()
+            tiers = tuple(range(1000, 3001, 250))
+            points = []
+            for tp in tiers:
+                damage = float(actions.average_ws(
+                    player, enemy, ws_name, tp, ws_type, "Damage dealt"
+                )[1][0])
+                elapsed, _output, _invert = actions.average_attack_round(
+                    player, enemy, 0.0, float(tp), "Time to WS"
+                )
+                points.append((float(elapsed), damage, tp))
+            self._render_ws_tp_time_graph(
+                self.cycle_result_figure, self.cycle_result_canvas, points, ws_name
+            )
+            self.plot_status.setText(
+                f"WS damage vs TP/time graph complete for {ws_name} using one fixed set."
+            )
+        except Exception as error:
+            self._plot_distribution_failed(str(error))
+
+    def _render_ws_tp_time_graph(self, figure, canvas, points, ws_name: str):
+        if figure is None or canvas is None:
+            return
+        figure.clear()
+        figure.set_facecolor("#17142e")
+        axis = figure.add_subplot(111)
+        axis.set_facecolor("#17142e")
+        x = [point[0] for point in points]
+        y = [point[1] for point in points]
+        axis.plot(x, y, color="#f3d989", marker="o", linewidth=2.2)
+        for elapsed, damage, tp in points:
+            axis.annotate(f"{tp:,} TP", (elapsed, damage), xytext=(0, 8),
+                          textcoords="offset points", ha="center", color="#f1e9dc", fontsize=8)
+        axis.set_title(f"{ws_name} · damage by TP and time", color="#f5f0e8")
+        axis.set_xlabel("Time to TP threshold (seconds)", color="#c9c3d4")
+        axis.set_ylabel("Average weapon-skill damage", color="#c9c3d4")
+        axis.tick_params(colors="#c9c3d4")
+        for spine in axis.spines.values():
+            spine.set_color("#665f7b")
+        axis.grid(True, color="#403a58", alpha=0.65)
+        figure.tight_layout()
+        canvas.draw_idle()
 
     def _simulation_done(self, summary: dict):
         try:

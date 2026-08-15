@@ -20,6 +20,7 @@ from contextlib import redirect_stdout
 from datetime import datetime # For timestamping new sets to put on BG Wiki
 from itertools import product
 from io import StringIO
+from copy import copy
 
 # Use an external gear.py file
 # https://stackoverflow.com/questions/47350078/importing-external-module-in-single-file-exe-created-with-pyinstaller
@@ -30,7 +31,7 @@ import time
 import queue as queue_module
 sys.path.append(os.path.dirname(sys.executable))
 from gear import *
-from equipment_rules import apply_weapon_slot_rules, has_conditional_set_effect, ranged_attack_ready
+from equipment_rules import apply_weapon_slot_rules, has_conditional_set_effect, ranged_attack_ready, ranged_pair_compatible
 
 
 OPTIMIZER_RESULT_LIMIT = 50
@@ -1173,6 +1174,12 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                     or (slot2 in weapon_empty and item2.get("Name") != "Empty")):
                                 continue
 
+                            # A bow/crossbow/gun is never a valid candidate
+                            # with a non-projectile or mismatched projectile,
+                            # even for a melee/TP search where no shot is fired.
+                            if not ranged_pair_compatible(test_set):
+                                continue
+
 
                             if (test_set["ring1"]==test_set["ring2"]) and (test_set["ring1"]["Name"]!="Empty") and not duplicate_allowed(test_set["ring1"]):
                                 continue
@@ -2174,7 +2181,8 @@ def optimize_tradeoffs(main_job, sub_job, master_level, buffs, abilities, enemy,
     for overnight runs without introducing arbitrary stat weights.
     """
     specs = [
-        {"target": str(spec.get("target") or "").strip()}
+        {"target": str(spec.get("target") or "").strip(),
+         "minimum": max(0.0, float(spec.get("minimum", 0.0) or 0.0))}
         for spec in (substat_specs or ())
         if str(spec.get("target") or "").strip()
     ]
@@ -2247,10 +2255,11 @@ def optimize_tradeoffs(main_job, sub_job, master_level, buffs, abilities, enemy,
                     f"({phase_number}/{len(loss_bands) * len(targets)})..."
                 )
             phase_seed = None if seed is None else int(seed) + phase_number
+            minimum = next((spec["minimum"] for spec in specs if spec["target"] == target), 0.0)
             phase = {
                 "target": target,
                 "primary_floor": damage_floor,
-                "constraints": [],
+                "constraints": [(target, minimum)] if minimum > 0 else [],
             }
             player, output, metric = build_set(
                 main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
@@ -2331,12 +2340,108 @@ def optimize_substats(main_job, sub_job, master_level, buffs, abilities, enemy,
     )
 
 
+def weapon_skill_display_details(player, enemy, ws_name, input_tp, ws_type):
+    """Return compact, calculation-derived WS scaling details for the GUI."""
+    tp = effective_ws_tp(input_tp, player)
+    dual_wield = (
+        player.gearset["sub"].get("Type") == "Weapon"
+        or player.gearset["main"].get("Skill Type") == "Hand-to-Hand"
+    )
+    info = weaponskill_info(ws_name, tp, player, enemy, [], dual_wield)
+    modifiers = []
+    # WSC definitions are linear in the seven attributes.  Measuring the
+    # modeled function keeps this display in sync with its authoritative WS
+    # formulas without maintaining a second table that can drift.
+    for stat in ("STR", "DEX", "VIT", "AGI", "INT", "MND", "CHR"):
+        probe = copy(player)
+        probe.stats = dict(player.stats)
+        probe.stats[stat] = float(probe.stats.get(stat, 0)) + 1000.0
+        probe_info = weaponskill_info(ws_name, tp, probe, enemy, [], dual_wield)
+        coefficient = (float(probe_info["wsc"]) - float(info["wsc"])) / 1000.0
+        if abs(coefficient) >= 0.0005:
+            modifiers.append({"stat": stat, "percent": round(coefficient * 100, 1)})
+    ftp_first = float(info["ftp"]) + float(player.stats.get("ftp", 0))
+    ftp_additional = ftp_first if info["ftp_rep"] else 1.0
+    ftp_hybrid = float(info.get("ftp_hybrid", 0))
+    if info.get("hybrid"):
+        ftp_hybrid += float(player.stats.get("ftp", 0))
+    return {
+        "effective_tp": float(tp),
+        "wsc_modifiers": modifiers,
+        "wsc": float(info["wsc"]),
+        "ftp_first": ftp_first,
+        "ftp_additional": ftp_additional,
+        "ftp_replicates": bool(info["ftp_rep"]),
+        "ftp_hybrid": ftp_hybrid,
+        "hits": int(info["nhits"]),
+        "hybrid": bool(info["hybrid"]),
+        "magical": bool(info["magical"]),
+    }
+
+
+def _group_ranked_weapon_skills(rows, enemy, ws_type, within_percent):
+    """Assign verified shared sets whose loss stays inside the requested limit."""
+    remaining = list(rows)
+    groups = []
+    limit = max(0.0, float(within_percent))
+    while remaining:
+        best = None
+        for representative in remaining:
+            covered = []
+            total_loss = 0.0
+            for member in remaining:
+                optimal = max(0.0, float(member["damage"]))
+                try:
+                    output = average_ws(
+                        representative["player"], enemy, member["ws_name"],
+                        member["tp"], ws_type, "Damage dealt",
+                    )[1]
+                    shared_damage = float(output[0])
+                    if not np.isfinite(shared_damage):
+                        continue
+                except Exception:
+                    continue
+                loss = 0.0 if optimal <= 0 else max(
+                    0.0, 100.0 * (optimal - shared_damage) / optimal
+                )
+                if loss <= limit + 1e-9:
+                    covered.append((member, shared_damage, loss))
+                    total_loss += loss
+            score = (-len(covered), total_loss, representative["ws_name"].casefold())
+            if best is None or score < best[0]:
+                best = (score, representative, covered)
+        _score, representative, covered = best
+        if not covered:
+            covered = [(representative, float(representative["damage"]), 0.0)]
+        member_names = [member["ws_name"] for member, _damage, _loss in covered]
+        group_id = len(groups) + 1
+        for member, shared_damage, loss in covered:
+            member.update({
+                "group_id": group_id,
+                "group_representative_ws": representative["ws_name"],
+                "group_damage": shared_damage,
+                "group_loss_percent": loss,
+                "group_members": member_names,
+            })
+        groups.append({
+            "id": group_id,
+            "representative": representative["ws_name"],
+            "members": member_names,
+            "max_loss_percent": max(loss for _member, _damage, loss in covered),
+            "average_loss_percent": sum(loss for _member, _damage, loss in covered) / len(covered),
+        })
+        covered_ids = {id(member) for member, _damage, _loss in covered}
+        remaining = [member for member in remaining if id(member) not in covered_ids]
+    return groups
+
+
 def rank_weapon_skills(main_job, sub_job, master_level, buffs, abilities, enemy,
                        weapon_skill_names, ws_type, check_gear, starting_gearset,
                        pdt_requirement, mdt_requirement, *, dt_requirement=0,
                        tp_values=(1000, 2000, 3000), restarts=1, workers=0,
                        seed=None, n_iter=10, parallel_mode="search_runs",
-                       progress_callback=None, progress_queue=None, stop_event=None):
+                       progress_callback=None, progress_queue=None, stop_event=None,
+                       group_similar=False, group_within_percent=2.0):
     """Optimize and rank every supplied WS independently at each TP tier.
 
     Weapon-slot locking belongs to the caller because the GUI knows which
@@ -2384,15 +2489,29 @@ def rank_weapon_skills(main_job, sub_job, master_level, buffs, abilities, enemy,
                     ),
                     progress_queue=progress_queue, stop_event=stop_event,
                 )
+                # Re-evaluate the returned winner in the parent process.  This
+                # prevents a stale worker estimate from producing a displayed
+                # value or ranking order that disagrees with the actual set.
+                if isinstance(getattr(player, "stats", None), dict):
+                    output = average_ws(
+                        player, enemy, ws_name, tp_value, ws_type, "Damage dealt"
+                    )[1]
                 damage = float(output[0])
+                if not np.isfinite(damage):
+                    raise ValueError("The final optimized set returned non-finite WS damage.")
+                details = (
+                    weapon_skill_display_details(player, enemy, ws_name, tp_value, ws_type)
+                    if isinstance(getattr(player, "stats", None), dict) else {}
+                )
                 rankings[tp_value].append({
                     "ws_name": ws_name,
                     "tp": tp_value,
                     "damage": damage,
                     "player": player,
                     "output": output,
-                    "metric": float(metric),
+                    "metric": damage,
                     "seed": winning_seed,
+                    "ws_details": details,
                 })
             except OptimizerStopped:
                 raise
@@ -2405,12 +2524,17 @@ def rank_weapon_skills(main_job, sub_job, master_level, buffs, abilities, enemy,
                 notify(f"WS ranking skipped {ws_name} at {tp_value:,} TP: {error}")
             completed += 1
 
+    groups = {}
     for tp_value in tiers:
         rankings[tp_value].sort(
             key=lambda row: (-row["damage"], row["ws_name"].casefold())
         )
         for rank, row in enumerate(rankings[tp_value], start=1):
             row["rank"] = rank
+        if group_similar and rankings[tp_value]:
+            groups[tp_value] = _group_ranked_weapon_skills(
+                rankings[tp_value], enemy, ws_type, group_within_percent
+            )
     if not any(rankings.values()):
         detail = errors[0]["error"] if errors else "No usable result was returned."
         raise ValueError(f"No weapon skill could be ranked: {detail}")
@@ -2418,7 +2542,12 @@ def rank_weapon_skills(main_job, sub_job, master_level, buffs, abilities, enemy,
         f"WS ranking complete: {completed - len(errors)}/{total} optimized "
         f"successfully."
     )
-    return {"tp_values": tiers, "rankings": rankings, "errors": errors}
+    return {
+        "tp_values": tiers, "rankings": rankings, "errors": errors,
+        "group_similar": bool(group_similar),
+        "group_within_percent": float(group_within_percent),
+        "groups": groups,
+    }
 
 if __name__ == "__main__":
 

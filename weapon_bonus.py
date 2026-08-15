@@ -5,6 +5,24 @@ Author: Kastra (Asura server)
 '''
 from get_dex_crit import *
 import numpy as np
+import re
+
+
+def _weapon_bonus_keys(name):
+    """Return the raw and normalized names used by imported bridge weapons."""
+    text = str(name or "").strip()
+    keys = [text]
+    base = text.split(" [", 1)[0].strip()
+    match = re.search(r"(?:rank=|\bR)(\d+)\b", text, re.IGNORECASE)
+    if match:
+        ranked = f"{base} R{int(match.group(1))}"
+        if ranked not in keys:
+            keys.append(ranked)
+    # A bridge identity such as "Kikoku [path=A; rank=2]" must resolve to
+    # its exact rank before considering the unranked weapon's default bonus.
+    if base not in keys:
+        keys.append(base)
+    return keys
 
 def get_weapon_bonus(main_wpn_name, rng_wpn_name, ws_name):
 
@@ -112,8 +130,12 @@ def get_weapon_bonus(main_wpn_name, rng_wpn_name, ws_name):
         "Yagrush": {"Mystic Boon": 0.3},
 
         # Ergon weapons
+        "Epeolatry R10": {"Dimidiation": 0.10},
         "Epeolatry R15": {"Dimidiation": 0.15},
         "Idris R15": {"Exudation": 0.15},
+
+        # Exact intermediate REMA observation from the augment audit.
+        "Kikoku R2": {"Blade: Metsu": 0.02},
 
         # Aeonic Weapons
         "Aeneas R15": {"Exenterator": 0.1},
@@ -135,9 +157,13 @@ def get_weapon_bonus(main_wpn_name, rng_wpn_name, ws_name):
 
 
     ws_bonus = 0
-    if main_wpn_name in weapon_skill_bonuses:
-        ws_bonus += weapon_skill_bonuses[main_wpn_name].get(ws_name, 0)
-    if rng_wpn_name in weapon_skill_bonuses:
-        ws_bonus += weapon_skill_bonuses[rng_wpn_name].get(ws_name, 0)
+    for candidate in _weapon_bonus_keys(main_wpn_name):
+        if candidate in weapon_skill_bonuses:
+            ws_bonus += weapon_skill_bonuses[candidate].get(ws_name, 0)
+            break
+    for candidate in _weapon_bonus_keys(rng_wpn_name):
+        if candidate in weapon_skill_bonuses:
+            ws_bonus += weapon_skill_bonuses[candidate].get(ws_name, 0)
+            break
 
     return ws_bonus
