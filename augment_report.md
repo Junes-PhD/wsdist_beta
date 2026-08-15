@@ -322,17 +322,17 @@ above can then hold the shared item rule.
 | Amalric Doublet | A | 15 |  |  |
 | Amalric Gages | D | 15 |  |  |
 | Amalric Nails | D | 15 |  |  |
-| Amalric Slops | a | 15 |  |  |
-| Carmine Cuisses +1 | C | 15 |  |  |
-| Carmine Mask +1 | C | 15 |  |  |
-| Comm. Charm +2 | — | 6 |  |  |
-| Mirage Stole +2 | — | 6 |  |  |
-| Nibiru Cudgel | A | 15 |  |  |
-| Psycloth Lappas | A | 15 |  |  |
-| Rawhide Mask | A | 11 |  |  |
-| Sailfi Belt +1 | — | 7 |  |  |
-| Solstice | C | 15 |  |  |
-| Vanya Robe | B | 15 |  |  |
+| Amalric Slops | A | 15 |  |  |
+| Carmine Cuisses +1 | D | 15 |  |  |
+| Carmine Mask +1 | D | 15 |  |  |
+| Comm. Charm +2 | A | 6 |  |  |
+| Mirage Stole +2 | A | 6 |  |  |
+| Nibiru Cudgel | B | 15 |  |  |
+| Psycloth Lappas | B | 15 |  |  |
+| Rawhide Mask | B | 11 |  |  |
+| Sailfi Belt +1 | A | 7 |  |  |
+| Solstice | D | 15 |  |  |
+| Vanya Robe | C | 15 |  |  |
 
 ### Kroot_361003
 
@@ -437,7 +437,7 @@ above can then hold the shared item rule.
 
 | Item | Path | Rank | Rank bonuses | Source / notes |
 |---|---|---:|---|---|
-| Coiste Bodhar | — | 5 |  |  |
+| Coiste Bodhar | A | 5 |  |  |
 | Ryuo Sune-Ate +1 | B | 15 |  |  |
 | Sailfi Belt +1 | A | 15 | STR +15; Double Attack +5% | Missing path normalized to single-path A; copied from reviewed Malware/Stuxnet record |
 | Sam. Nodowa +2 | — | 4 |  |  |
