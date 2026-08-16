@@ -873,6 +873,18 @@ def item_name(item: dict) -> str:
     return str(item.get("Name2") or item.get("Name") or "Empty")
 
 
+def _item_job_eligible(item: dict, job: str) -> bool:
+    """Normalize bridge job metadata and enforce the active job restriction."""
+    jobs = item.get("Jobs", gear.all_jobs)
+    if jobs is None:
+        jobs = gear.all_jobs
+    if isinstance(jobs, str):
+        jobs = re.split(r"[\s,;/|]+", jobs)
+    return str(job).casefold() in {
+        str(value).strip().casefold() for value in jobs if str(value).strip()
+    }
+
+
 def _normalized_item_name(value) -> str:
     return str(value or "").strip().casefold()
 
@@ -4973,13 +4985,59 @@ class MainWindow(QMainWindow):
         current = self.quickset_lac_combo.currentText()
         self.quickset_lac_combo.blockSignals(True)
         self.quickset_lac_combo.clear()
-        for payload in sorted(self._profile_payloads(), key=lambda value: str(value.get("name", "")).casefold()):
+        for payload in sorted(self._profile_payloads_with_lac_weapon_maps(), key=lambda value: str(value.get("name", "")).casefold()):
             name = str(payload.get("name") or "").strip()
             if name:
                 self.quickset_lac_combo.addItem(name, payload.get("gearset", {}))
         if current:
             self.quickset_lac_combo.setCurrentText(current)
         self.quickset_lac_combo.blockSignals(False)
+
+    def _profile_payloads_with_lac_weapon_maps(self) -> list[dict]:
+        """Add the friendly names from LAC weaponSetMap/gunSetMap to loaders.
+
+        LAC profiles commonly keep the actual equipment in ``sets`` while
+        exposing user-facing weapon groups through maps.  GearSetBuilder
+        imports the target sets, but not always the map labels, so load the
+        labels from the active Lua source and point them at the imported set.
+        """
+        payloads = self._profile_payloads()
+        profile = self._profile_for_job()
+        if profile is None:
+            return payloads
+        job = str(profile.get("job") or self.profile_job_combo.currentText())
+        try:
+            source = self.bridge_store.profile_path(job).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return payloads
+        by_name = {str(item.get("name") or ""): item for item in payloads}
+        aliases = []
+        table_pattern = re.compile(
+            r"local\s+(weaponSetMap|gunSetMap)\s*=\s*\{(.*?)\n\s*\};",
+            re.IGNORECASE | re.DOTALL,
+        )
+        entry_pattern = re.compile(
+            r"(?:\[\s*['\"]([^'\"]+)['\"]\s*\]|([A-Za-z_][\w]*))\s*=\s*['\"]([^'\"]+)['\"]"
+        )
+        seen = {str(item.get("name") or "").casefold() for item in payloads}
+        for table_name, body in table_pattern.findall(source):
+            group = "Weapon group" if table_name.casefold().startswith("weapon") else "Gun group"
+            for quoted_key, bare_key, target in entry_pattern.findall(body):
+                label = quoted_key or bare_key
+                payload = by_name.get(target)
+                if payload is None:
+                    continue
+                display = f"{group} · {label}"
+                if display.casefold() in seen:
+                    continue
+                mapped = copy.deepcopy(payload)
+                mapped["name"] = display
+                mapped["lac_map"] = table_name
+                mapped["lac_map_key"] = label
+                mapped["mapped_set"] = target
+                aliases.append(mapped)
+                seen.add(display.casefold())
+        return payloads + aliases
 
     def load_lac_set_into_quickset(self):
         data = self.quickset_lac_combo.currentData() if hasattr(self, "quickset_lac_combo") else None
@@ -7175,8 +7233,7 @@ class MainWindow(QMainWindow):
         records = []
         for name, record in self.aspirational_catalog.items():
             item = record["item"]
-            jobs = [str(value).casefold() for value in item.get("Jobs", gear.all_jobs)]
-            if job not in jobs or self._aspirational_item_is_owned(item):
+            if not _item_job_eligible(item, job) or self._aspirational_item_is_owned(item):
                 continue
             if slot_filter and slot_filter not in record["slots"]:
                 continue
@@ -9967,9 +10024,8 @@ class MainWindow(QMainWindow):
         for item in items:
             if slot == "ear1" and is_right_ear_only(item):
                 continue
-            jobs = [str(value).lower() for value in item.get("Jobs", gear.all_jobs)]
             name = item_name(item)
-            if job not in jobs or name in seen or _blacklist_matches(item, self.gear_blacklist):
+            if not _item_job_eligible(item, job) or name in seen or _blacklist_matches(item, self.gear_blacklist):
                 continue
             seen.add(name)
             result.append(item)
@@ -10011,6 +10067,16 @@ class MainWindow(QMainWindow):
             item for item in self.shared_catalog.values()
             if slot in item.get("Slots", ()) and item.get("Optimizer Only")
         )
+        # Optimizer-only cross-character gear is appended after items_for_slot
+        # and therefore must receive the same current-job and ear-position
+        # checks here.  Without this filter, the all-character toggle could
+        # offer gear that the active job cannot equip.
+        job = JOBS[self.main_job.currentText()]
+        items = [
+            item for item in items
+            if _item_job_eligible(item, job)
+            and not (slot == "ear1" and is_right_ear_only(item))
+        ]
         items = [
             item for item in items
             if not _blacklist_matches(item, self.gear_blacklist)
@@ -10042,10 +10108,9 @@ class MainWindow(QMainWindow):
         seen = set()
         for item in items:
             name = item_name(item)
-            jobs = [str(value).lower() for value in item.get("Jobs", gear.all_jobs)]
             if (
                 name in seen
-                or job not in jobs
+                or not _item_job_eligible(item, job)
                 or (slot == "ear1" and is_right_ear_only(item))
                 or not _blacklist_matches(item, self.gear_blacklist)
             ):
@@ -10141,6 +10206,7 @@ class MainWindow(QMainWindow):
     def _refresh_shared_gear(self):
         """Merge transferable inventory from other bridge characters when enabled."""
         self.shared_catalog = {}
+        current_job = JOBS.get(self.main_job.currentText(), "")
         include_transferable = bool(
             getattr(self, "include_shared_gear", None)
             and self.include_shared_gear.isChecked()
@@ -10167,6 +10233,8 @@ class MainWindow(QMainWindow):
             for item in store.catalog.values():
                 owned_storage = int(item.get("Total Count") or 0) > 0
                 if not item.get("Eligible") and not (include_all and owned_storage and item.get("Model Complete")):
+                    continue
+                if not _item_job_eligible(item, current_job):
                     continue
                 if not include_all and not item.get("Transferable", False):
                     continue
@@ -10752,6 +10820,8 @@ class MainWindow(QMainWindow):
         self.spell_combo.addItems(dict.fromkeys(spells))
         if current in spells:
             self.spell_combo.setCurrentText(current)
+        # Shared all-character gear is rebuilt for the newly selected job.
+        self._refresh_shared_gear()
         self._reset_invalid_equipment()
         self._refresh_ws_choices()
         self._refresh_magic_damage_spell_choices()

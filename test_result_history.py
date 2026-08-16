@@ -21,7 +21,8 @@ class ResultHistoryTests(unittest.TestCase):
             history.add("Malware", "cycle", "Fourth", {"metrics": {"dps": 4}})
             records = history.list("Malware")
             self.assertEqual(len(records), 3)
-            self.assertIn(pinned, {record["id"] for record in records})
+            s\
+                i]helf.assertIn(pinned, {record["id"] for record in records})
             self.assertNotIn(first, {record["id"] for record in records})
             self.assertEqual(history.get(pinned)["payload"]["metrics"]["dps"], 2)
 

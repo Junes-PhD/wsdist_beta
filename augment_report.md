@@ -438,10 +438,10 @@ above can then hold the shared item rule.
 | Item | Path | Rank | Rank bonuses | Source / notes |
 |---|---|---:|---|---|
 | Coiste Bodhar | A | 5 |  |  |
-| Ryuo Sune-Ate +1 | B | 15 |  |  |
+| Ryuo Sune-Ate +1 | C | 15 |  |  |
 | Sailfi Belt +1 | A | 15 | STR +15; Double Attack +5% | Missing path normalized to single-path A; copied from reviewed Malware/Stuxnet record |
-| Sam. Nodowa +2 | — | 4 |  |  |
-| Tatena. Gote +1 | — | 15 |  |  |
+| Sam. Nodowa +2 | A | 4 |  |  |
+| Tatena. Gote +1 | A | 15 |  |  | accuracy +40 all attributes +10 (STR VIT DEX etc) Triple attack +4%
 | Tatena. Haidate +1 | A | 15 | Accuracy +60; All Attributes +10; Triple Attack +3% | Missing path normalized to single-path A; copied from reviewed Kroot/Malware record |
 | Tatena. Sune. +1 | A | 15 | Accuracy +60; All Attributes +10; Triple Attack +3% | Missing path normalized to single-path A; copied from reviewed Stuxnet record |
 
@@ -449,15 +449,15 @@ above can then hold the shared item rule.
 
 | Item | Path | Rank | Rank bonuses | Source / notes |
 |---|---|---:|---|---|
-| Argute Stole +1 | — | 7 |  |  |
-| Clr. Torque +1 | — | 7 |  |  |
-| Murky Ring | — | 3 |  |  |
-| Obstin. Sash | — | 2 |  |  |
-| Pedagogy Staff | B | 7 |  |  |
-| Psycloth Lappas | C | 15 |  |  |
-| Queller Rod | C | 15 |  |  |
-| Vanya Clogs | C | 15 |  |  |
-| Vanya Hood | C | 15 |  |  |
+| Argute Stole +1 | A | 7 |  |  |
+| Clr. Torque +1 | A | 7 |  |  |
+| Murky Ring | A | 3 |  |  |
+| Obstin. Sash | A | 2 |  |  |
+| Pedagogy Staff | C | 7 |  |  |
+| Psycloth Lappas | S | 15 |  |  |
+| Queller Rod | D | 15 |  |  |
+| Vanya Clogs | D | 15 |  |  |
+| Vanya Hood | D | 15 |  |  |
 
 ### Stuxnet_119614 (normalized interpretation)
 

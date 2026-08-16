@@ -17,6 +17,7 @@ from qt_gui_main import (
     _dps_series_chart_data, _quick_cache_request, _quick_result_chart_data,
     _optimizer_current_result_lines, _optimizer_result_players, _remaining_time_estimate,
     _normalized_search_quality, _reference_enemy_names, _search_quality_settings,
+    _item_job_eligible,
     _run_overnight_cache_task, _ws_distribution_chart_data,
     item_tooltip, magic_damage_spell_choices, weapon_skill_choices,
 )
@@ -30,6 +31,11 @@ from wsdist import obvious_blacklist_suggestions, universal_blacklist_suggestion
 
 
 class ProfileReportHelperTests(unittest.TestCase):
+    def test_job_eligibility_normalizes_imported_job_metadata(self):
+        self.assertTrue(_item_job_eligible({"Jobs": ["sam"]}, "SAM"))
+        self.assertTrue(_item_job_eligible({"Jobs": "sam, drg"}, "drg"))
+        self.assertFalse(_item_job_eligible({"Jobs": ["war"]}, "sam"))
+
     def test_ranked_item_tooltip_explains_missing_or_decoded_contribution(self):
         missing = item_tooltip({"Name": "Epeolatry", "Rank": 10})
         self.assertIn("Progression: Rank 10", missing)
