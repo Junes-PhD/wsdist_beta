@@ -9,10 +9,10 @@ on:
       - 'README.md'
       - 'requirements.txt'
       # - 'defaults.txt'
-      # - 'icons32/*'
-      # - 'item_list.txt'
-      # - 'enemies.py'
-      # - 'gear.py'
+      # - 'assets/icons32/*'
+      # - 'data/item_list.csv'
+      # - 'data/enemies.py'
+      # - 'data/gear.py'
 
   # On a pull request to a branch.
   pull_request:
@@ -22,10 +22,10 @@ on:
       - 'README.md'
       - 'requirements.txt'
       # - 'defaults.txt'
-      # - 'icons32/*'
-      # - 'item_list.txt'
-      # - 'enemies.py'
-      # - 'gear.py'
+      # - 'assets/icons32/*'
+      # - 'data/item_list.csv'
+      # - 'data/enemies.py'
+      # - 'data/gear.py'
 
 env:
   # System
@@ -58,7 +58,7 @@ jobs:
         # pip install colorama
 
     - name: Create Installer
-      run: pyinstaller --exclude-module gear --exclude-module enemies --clean --onefile --icon=icons32/23937.ico qt_gui_main.py
+      run: pyinstaller --clean --onefile --icon=assets/icons32/23937.ico --add-data "data/item_list.csv;data" --add-data "assets/icons32.zip;assets" --add-data "assets/checkmark-gold.svg;assets" qt_gui_main.py
 
     - name: Upload Installer
       uses: actions/upload-artifact@v4
@@ -84,11 +84,8 @@ jobs:
     - name: Zip Artifacts
       run: |
         zip -r ./kastra_ffxi_sim-full.zip ./qt_gui_main.exe
-        zip -r ./kastra_ffxi_sim-full.zip ./gear.py
-        zip -r ./kastra_ffxi_sim-full.zip ./enemies.py
-        zip -r ./kastra_ffxi_sim-full.zip ./item_list.csv
-        zip -r ./kastra_ffxi_sim-full.zip ./defaults.pkl
-        zip -r ./kastra_ffxi_sim-full.zip ./icons32
+        zip -r ./kastra_ffxi_sim-full.zip ./data
+        zip -r ./kastra_ffxi_sim-full.zip ./assets
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
