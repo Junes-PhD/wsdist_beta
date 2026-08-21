@@ -610,7 +610,13 @@ def _with_polutils_model(record: dict) -> dict:
     # the bridge producer did not provide a model.
     if not record.get("stats"):
         enriched["stats"] = deepcopy(model.get("stats") or {})
-        enriched["model_complete"] = bool(model.get("complete"))
+        # An exported record may intentionally have no numeric stats (for
+        # example a shield whose modeled effect is supplied by the built-in
+        # catalog). Preserve its explicit completeness flag when POLUtils has
+        # no richer model to contribute.
+        enriched["model_complete"] = bool(
+            record.get("model_complete") or model.get("complete")
+        )
         enriched["stat_source"] = "POLUtils native FFXI DAT resources"
         enriched["data_source"] = "POLUtils native FFXI DAT resources"
     return enriched

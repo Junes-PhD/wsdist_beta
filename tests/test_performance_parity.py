@@ -32,6 +32,7 @@ from engine.wsdist import (
     balanced_pareto_record, pareto_frontier, prune_dominated_candidates,
     starting_item_candidates,
 )
+from engine.gpu_optimizer import ROW_COUNT, score_melee_ws_batch, select_best_damage
 
 
 def empty_gearset():
@@ -73,6 +74,55 @@ class PerformanceParityTests(unittest.TestCase):
         self.assertAlmostEqual(result[0], (first * 0.8 + other * 0.7 * 2) * 1.2)
         self.assertAlmostEqual(result[1], first * 0.8 * 1.2)
         self.assertAlmostEqual(result[2], actions.get_tp(0.8, 720, 0.25) + 10 * 1.25 * 2 * 0.7)
+
+    def test_gpu_batch_backend_matches_compiled_melee_core(self):
+        row = np.zeros((2, ROW_COUNT), dtype=float)
+        row[:, 0] = 100
+        row[:, 1] = 20
+        row[:, 2] = 80
+        row[:, 3] = 15
+        row[:, 4] = 120
+        row[:, 5] = 1.4
+        row[:, 6] = 1.0
+        row[:, 7] = [4, 5]
+        row[:, 8] = [0, 1]
+        row[:, 9] = [900, 950]
+        row[:, 10] = [800, 850]
+        row[:, 11] = 0
+        row[:, 12] = 0
+        row[:, 13] = 0.1
+        row[:, 14] = 0.05
+        row[:, 15] = 1300
+        row[:, 16] = 0.25
+        row[:, 17] = 0.4
+        row[:, 18] = 0.5
+        row[:, 19] = 0.3
+        row[:, 20] = 0.35
+        row[:, 21] = 0.1
+        row[:, 22] = 0.05
+        row[:, 23] = 0.02
+        row[:, 30] = 0.95
+        row[:, 31] = 0.8
+        row[:, 32] = 600
+        row[:, 33] = 0.25
+        row[:, 34] = 1000
+        expected = np.array([
+            actions._average_ws_melee_average_core(
+                100, 20, 80, 15, 120, 1.4, 1.0, int(row[0, 7]), int(row[0, 8]),
+                900, 800, "Axe", "Axe", 0.1, 0.05, 1300, 0.25, 0.4, 0.5,
+                0.3, 0.35, 0.1, 0.05, 0.02, 0, 0, 0, 0, 0, False, 0.95,
+                0.8, 600, 0.25, 1000, 0, 0, 0,
+            ),
+            actions._average_ws_melee_average_core(
+                100, 20, 80, 15, 120, 1.4, 1.0, int(row[1, 7]), int(row[1, 8]),
+                950, 850, "Axe", "Axe", 0.1, 0.05, 1300, 0.25, 0.4, 0.5,
+                0.3, 0.35, 0.1, 0.05, 0.02, 0, 0, 0, 0, 0, False, 0.95,
+                0.8, 600, 0.25, 1000, 0, 0, 0,
+            ),
+        ])
+        actual = score_melee_ws_batch(row, prefer_gpu=False)
+        self.assertTrue(np.allclose(actual, expected))
+        self.assertEqual(select_best_damage(row, prefer_gpu=False)[0], int(np.argmax(expected[:, 0])))
 
     def test_optimizer_retains_up_to_fifty_distinct_gear_results(self):
         results = [
