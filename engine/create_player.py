@@ -5,6 +5,7 @@ Author: Kastra (Asura server)
 '''
 from collections import OrderedDict
 from copy import deepcopy
+import os
 
 from data.enemies import *
 from engine.equipment_rules import apply_ear_slot_rules, apply_weapon_slot_rules, conditional_gear_bonuses
@@ -15,7 +16,17 @@ _BASE_STATS_CACHE_LIMIT = 128
 _GEAR_STAT_CACHE = {}
 _GEAR_STAT_CACHE_LIMIT = 8192
 _PLAYER_CACHE = OrderedDict()
-_PLAYER_CACHE_LIMIT = 512
+
+
+def _configured_cache_limit(name, default, minimum=1):
+    """Read a positive cache size without making startup depend on valid env input."""
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+_PLAYER_CACHE_LIMIT = _configured_cache_limit("FFXI_PLAYER_CACHE_SIZE", 1024)
 _DAMAGE_TAKEN_STATS = ("PDT", "MDT", "DT", "PDT2", "MDT2", "DT2")
 
 
@@ -1203,13 +1214,21 @@ class create_player:
 
 
 
-def get_cached_player(main_job, sub_job, master_level=20, gearset=None, buffs=None, abilities=None):
-    """Reuse an immutable-equivalent player context across optimizer phases."""
-    gear_key = tuple(
-        (slot, tuple(sorted((str(field), repr(value)) for field, value in item.items())))
-        for slot, item in sorted((gearset or {}).items())
-        if isinstance(item, dict)
-    )
+def get_cached_player(main_job, sub_job, master_level=20, gearset=None, buffs=None,
+                      abilities=None, *, cache_gear_key=None, copy_cached=True):
+    """Reuse an immutable-equivalent player context across optimizer phases.
+
+    Optimizer workers may pass their already-frozen gear key and request a
+    read-only cache value. Public/default callers still receive a defensive
+    deep copy, preserving the original isolation contract.
+    """
+    gear_key = cache_gear_key
+    if gear_key is None:
+        gear_key = tuple(
+            (slot, tuple(sorted((str(field), repr(value)) for field, value in item.items())))
+            for slot, item in sorted((gearset or {}).items())
+            if isinstance(item, dict)
+        )
     key = (
         str(main_job).lower(), str(sub_job).lower(), int(master_level),
         gear_key, _freeze_cache_value(buffs or {}), _freeze_cache_value(abilities or {}),
@@ -1217,11 +1236,12 @@ def get_cached_player(main_job, sub_job, master_level=20, gearset=None, buffs=No
     cached = _PLAYER_CACHE.get(key)
     if cached is not None:
         _PLAYER_CACHE.move_to_end(key)
-        return deepcopy(cached)
+        return deepcopy(cached) if copy_cached else cached
     player = create_player(main_job, sub_job, master_level, gearset, buffs, abilities)
     # Keep the cache insulated from callers that adjust a result for display
-    # or export after the optimizer returns it.
-    _PLAYER_CACHE[key] = deepcopy(player)
+    # or export after the optimizer returns it. Optimizer-only read access can
+    # keep the newly-created instance directly and avoid a full object copy.
+    _PLAYER_CACHE[key] = deepcopy(player) if copy_cached else player
     if len(_PLAYER_CACHE) > _PLAYER_CACHE_LIMIT:
         _PLAYER_CACHE.popitem(last=False)
     return player

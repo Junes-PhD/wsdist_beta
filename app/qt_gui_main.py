@@ -122,6 +122,12 @@ def _reference_enemy_names(current_name: str, enabled: bool = True) -> tuple[str
     return tuple(dict.fromkeys(names))
 
 
+def _selected_reference_enemy_names(selected_names) -> tuple[str, ...]:
+    """Normalize independently selected reference-enemy names."""
+    selected = set(str(name).strip() for name in (selected_names or ()) if str(name).strip())
+    return tuple(name for name in PROFILE_REFERENCE_ENEMIES if name in selected)
+
+
 def _normalized_search_quality(value: str, *, legacy_deep: bool = False) -> str:
     """Normalize persisted search quality, migrating the former Deep tier."""
     text = str(value or "").strip().title()
@@ -594,6 +600,21 @@ def _ws_tp_time_chart_data(points) -> list[tuple[float, float, float, float]] | 
         return chart or None
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _ws_tp_time_points(ws_player, tp_player, enemy, ws_name: str, ws_type: str,
+                       tiers=range(1000, 3001, 250)):
+    """Calculate graph points with WS damage and TP generation sets separated."""
+    points = []
+    for tp in tiers:
+        damage = float(actions.average_ws(
+            ws_player, enemy, ws_name, tp, ws_type, "Damage dealt"
+        )[1][0])
+        elapsed, _output, _invert = actions.average_attack_round(
+            tp_player, enemy, 0.0, float(tp), "Time to WS"
+        )
+        points.append((float(tp), damage, float(elapsed)))
+    return points
 
 
 def _remaining_time_estimate(samples: list[tuple[float, float]], *,
@@ -5337,6 +5358,10 @@ class MainWindow(QMainWindow):
                 getattr(self, "cycle_reference_details_checkbox", None)
                 and self.cycle_reference_details_checkbox.isChecked()
             )
+        visible_references = (
+            set(self._selected_cycle_reference_names())
+            if canvas is getattr(self, "cycle_result_canvas", None) else None
+        )
         primary = _dps_series_chart_data(summary)
         if primary is None:
             return False
@@ -5358,6 +5383,8 @@ class MainWindow(QMainWindow):
         for index, (name, reference) in enumerate(
             (summary.get("reference_summaries") or {}).items()
         ):
+            if visible_references is not None and name not in visible_references:
+                continue
             chart = _dps_series_chart_data(reference)
             if chart is not None and "total" in chart:
                 color = reference_colors[index % len(reference_colors)]
@@ -5366,6 +5393,8 @@ class MainWindow(QMainWindow):
             for index, (name, reference) in enumerate(
                 (summary.get("reference_summaries") or {}).items()
             ):
+                if visible_references is not None and name not in visible_references:
+                    continue
                 chart = _dps_series_chart_data(reference)
                 if chart is None:
                     continue
@@ -5519,9 +5548,15 @@ class MainWindow(QMainWindow):
             label=f"Mean {chart['mean']:,.0f}",
         )
         reference_colors = ("#72c7e8", "#d99bea", "#9de2a8")
+        visible_references = (
+            set(self._selected_cycle_reference_names())
+            if canvas is getattr(self, "cycle_result_canvas", None) else None
+        )
         for index, (name, reference) in enumerate(
             (distribution.get("reference_distributions") or {}).items()
         ):
+            if visible_references is not None and name not in visible_references:
+                continue
             reference_chart = _ws_distribution_chart_data(reference)
             if reference_chart is None:
                 continue
@@ -5586,6 +5621,31 @@ class MainWindow(QMainWindow):
                 self._last_cycle_distribution, ws_name=self.ws_combo.currentText(),
                 reference_details=self.cycle_reference_details_checkbox.isChecked(),
             )
+
+    def _cycle_reference_selection_toggle(self, _enabled: bool):
+        """Apply reference visibility changes to the retained cycle graph."""
+        selected = self._selected_cycle_reference_names()
+        if hasattr(self, "cycle_reference_details_checkbox"):
+            self.cycle_reference_details_checkbox.setEnabled(bool(selected))
+            if not selected and self.cycle_reference_details_checkbox.isChecked():
+                self.cycle_reference_details_checkbox.setChecked(False)
+        if self._last_cycle_dps_summary:
+            self._render_cycle_dps_graph(self._last_cycle_dps_summary)
+        elif self._last_cycle_distribution:
+            self._render_ws_distribution_graph(
+                self.cycle_result_figure, self.cycle_result_canvas,
+                self._last_cycle_distribution, ws_name=self.ws_combo.currentText(),
+                reference_details=(
+                    self.cycle_reference_details_checkbox.isChecked()
+                    if selected else False
+                ),
+            )
+        if selected:
+            self.plot_status.setText(
+                "Reference selection changed; run the simulation to calculate newly selected enemies."
+            )
+        else:
+            self.plot_status.setText("All reference enemies are hidden from the simulation graph.")
 
     def _quick_tab(self) -> QWidget:
         tab = QWidget()
@@ -5856,15 +5916,19 @@ class MainWindow(QMainWindow):
         status_box.setObjectName("cycleStatusPanel")
         status_layout = QVBoxLayout(status_box)
         status_layout.setContentsMargins(7, 8, 7, 7)
-        self.cycle_reference_checkbox = QCheckBox("Reference enemies")
-        self.cycle_reference_checkbox.setObjectName("referenceEnemyToggle")
-        self.cycle_reference_checkbox.setSizePolicy(
-            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
-        )
-        self.cycle_reference_checkbox.setChecked(True)
-        self.cycle_reference_checkbox.setToolTip(
-            "Include the three Profile Builder reference enemies in the 2-hour and WS graphs."
-        )
+        self.cycle_reference_checks = {}
+        for name in PROFILE_REFERENCE_ENEMIES:
+            checkbox = QCheckBox(name)
+            checkbox.setObjectName("referenceEnemyToggle")
+            checkbox.setSizePolicy(
+                QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed
+            )
+            checkbox.setChecked(True)
+            checkbox.setToolTip(
+                f"Include {name} in the 2-hour and WS graphs."
+            )
+            checkbox.toggled.connect(self._cycle_reference_selection_toggle)
+            self.cycle_reference_checks[name] = checkbox
         self.cycle_reference_details_checkbox = QCheckBox("More reference info")
         self.cycle_reference_details_checkbox.setObjectName("referenceEnemyToggle")
         self.cycle_reference_details_checkbox.setSizePolicy(
@@ -5877,11 +5941,8 @@ class MainWindow(QMainWindow):
         self.cycle_reference_details_checkbox.toggled.connect(
             self._cycle_reference_details_toggle
         )
-        self.cycle_reference_checkbox.toggled.connect(
-            self.cycle_reference_details_checkbox.setEnabled
-        )
         self.cycle_reference_details_checkbox.setEnabled(
-            self.cycle_reference_checkbox.isChecked()
+            bool(self._selected_cycle_reference_names())
         )
         self.plot_status = QLabel("Ready · choose a WS and run a reproducible cycle.")
         self.plot_status.setObjectName("cycleStatus")
@@ -5902,7 +5963,9 @@ class MainWindow(QMainWindow):
         graph_header.setSpacing(8)
         graph_header.addWidget(graph_title, 1)
         graph_header.addWidget(self.ws_tp_time_checkbox)
-        graph_header.addWidget(self.cycle_reference_checkbox)
+        graph_header.addWidget(QLabel("References:"))
+        for checkbox in self.cycle_reference_checks.values():
+            graph_header.addWidget(checkbox)
         graph_header.addWidget(self.cycle_reference_details_checkbox)
         graph_layout.addLayout(graph_header)
         if FigureCanvas is not None and Figure is not None:
@@ -7414,9 +7477,13 @@ class MainWindow(QMainWindow):
         if label is not None:
             label.setVisible(ranking)
         substats = action in {"Tradeoff optimization", "Sub-stat optimization"}
-        for widget in (self.substat_base_action, self.substat_loss_percent, self.tradeoff_depth, *self.substat_combos):
+        tradeoff_widgets = (
+            self.substat_base_action, self.substat_loss_percent, self.tradeoff_depth,
+            *self.substat_combos, *self.substat_minimums,
+        )
+        for widget in tradeoff_widgets:
             widget.setVisible(substats)
-        for widget in (self.substat_base_action, self.substat_loss_percent, self.tradeoff_depth, *self.substat_combos):
+        for widget in tradeoff_widgets:
             label = self.substat_base_action.parentWidget().layout().labelForField(widget)
             if label is not None:
                 label.setVisible(substats)
@@ -10633,6 +10700,7 @@ class MainWindow(QMainWindow):
                 "substat_loss_percent": self.substat_loss_percent.value(),
                 "tradeoff_depth": self.tradeoff_depth.currentText(),
                 "substat_stats": [combo.currentText() for combo in self.substat_combos],
+                "substat_minimums": [minimum.value() for minimum in self.substat_minimums],
                 "pdt": self.pdt.value(), "mdt": self.mdt.value(), "dt": self.dt.value(),
                 "combined_defense_both": self.combined_defense_both.isChecked(),
                 "quality": self.optimizer_quality.currentText(),
@@ -10727,6 +10795,13 @@ class MainWindow(QMainWindow):
         if isinstance(saved_substats, list):
             for combo, value in zip(self.substat_combos, saved_substats):
                 self._set_combo_value(combo, value, "None")
+        saved_minimums = optimizer.get("substat_minimums")
+        if isinstance(saved_minimums, list):
+            for minimum, value in zip(self.substat_minimums, saved_minimums):
+                try:
+                    minimum.setValue(float(value))
+                except (TypeError, ValueError):
+                    pass
         self._set_combo_value(self.parallel_mode, optimizer.get("parallel_mode"), self.parallel_mode.currentText())
         saved_quality = _normalized_search_quality(
             optimizer.get("quality", "Fast"), legacy_deep=legacy_search_names
@@ -10992,15 +11067,26 @@ class MainWindow(QMainWindow):
         enemy = _report_enemy(context["enemy"], context["debuffs"])
         return player, enemy, buffs, abilities
 
-    def _reference_enemy_cases(self, enabled: bool = True) -> list[tuple[str, object]]:
-        """Build the Profile Builder reference enemies with the active debuffs."""
-        if not enabled:
+    def _selected_cycle_reference_names(self) -> tuple[str, ...]:
+        checks = getattr(self, "cycle_reference_checks", {})
+        if not checks:
+            return ()
+        return _selected_reference_enemy_names(
+            name for name, checkbox in checks.items() if checkbox.isChecked()
+        )
+
+    def _reference_enemy_cases(self, selected_names=None) -> list[tuple[str, object]]:
+        """Build only the selected Profile Builder reference enemies."""
+        if isinstance(selected_names, bool):
+            selected_names = PROFILE_REFERENCE_ENEMIES if selected_names else ()
+        selected = set(_selected_reference_enemy_names(selected_names))
+        if not selected:
             return []
         context = self._combat_context()
         current_name = self.enemy_combo.currentText().strip()
         cases = []
         for name in _reference_enemy_names(current_name, True):
-            if name == current_name:
+            if name == current_name or name not in selected:
                 continue
             preset = enemies.preset_enemies.get(name)
             if preset is not None:
@@ -13063,7 +13149,7 @@ class MainWindow(QMainWindow):
             seed = self._simulation_seed()
             self._running_simulation_seed = seed
             reference_enemies = self._reference_enemy_cases(
-                self.cycle_reference_checkbox.isChecked()
+                self._selected_cycle_reference_names()
             )
             self.plot_status.setText(
                 f"Running two-hour DPS simulation · {ws_name} at {self.tp_value.value():,} TP..."
@@ -13104,7 +13190,7 @@ class MainWindow(QMainWindow):
                 player, enemy, ws_name, self.tp_value.value(), self._ws_type(),
                 seed=self._simulation_seed(),
                 reference_enemies=self._reference_enemy_cases(
-                    self.cycle_reference_checkbox.isChecked()
+                    self._selected_cycle_reference_names()
                 ), parent=self,
             )
             self.plot_thread.completed.connect(self._plot_distribution_done)
@@ -13115,28 +13201,22 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Distribution plot", str(error))
 
     def plot_ws_tp_time(self):
-        """Plot fixed-set WS damage against the time needed to reach each TP tier."""
+        """Plot WS damage/time using WS damage gear and TP gear generation."""
         try:
-            player, enemy, _buffs, _abilities = self._context(self.ws_set.items)
+            ws_player, enemy, _buffs, _abilities = self._context(self.ws_set.items)
+            tp_player, _tp_enemy, _tp_buffs, _tp_abilities = self._context(self.tp_set.items)
             ws_name = self.ws_combo.currentText().strip()
             if not ws_name or ws_name == "None":
                 raise ValueError("Select a weapon skill before creating a TP/time graph.")
             ws_type = self._ws_type()
-            tiers = tuple(range(1000, 3001, 250))
-            points = []
-            for tp in tiers:
-                damage = float(actions.average_ws(
-                    player, enemy, ws_name, tp, ws_type, "Damage dealt"
-                )[1][0])
-                elapsed, _output, _invert = actions.average_attack_round(
-                    player, enemy, 0.0, float(tp), "Time to WS"
-                )
-                points.append((float(tp), damage, float(elapsed)))
+            points = _ws_tp_time_points(
+                ws_player, tp_player, enemy, ws_name, ws_type,
+            )
             self._render_ws_tp_time_graph(
                 self.cycle_result_figure, self.cycle_result_canvas, points, ws_name
             )
             self.plot_status.setText(
-                f"Fixed-WS damage-per-TP-time graph complete for {ws_name}."
+                f"WS damage-per-TP-time graph complete for {ws_name} using the selected TP set."
             )
         except Exception as error:
             self._plot_distribution_failed(str(error))
@@ -13151,22 +13231,41 @@ class MainWindow(QMainWindow):
         figure.clear()
         figure.set_facecolor("#17142e")
         axis = figure.add_subplot(111)
+        damage_axis = axis.twinx()
         axis.set_facecolor("#17142e")
+        damage_axis.set_facecolor("none")
         x = [point[0] for point in chart]
         y = [point[1] for point in chart]
-        axis.plot(x, y, color="#f3d989", marker="o", linewidth=2.2)
-        for tp, damage_per_time, _damage, _elapsed in chart:
+        damage = [point[2] for point in chart]
+        rate_line, = axis.plot(
+            x, y, color="#f3d989", marker="o", linewidth=2.2,
+            label="WS damage / time to TP",
+        )
+        damage_line, = damage_axis.plot(
+            x, damage, color="#72c7e8", marker="s", linewidth=1.9,
+            label="Average WS damage",
+        )
+        for tp, damage_per_time, average_damage, _elapsed in chart:
             axis.annotate(f"{damage_per_time:,.0f}", (tp, damage_per_time), xytext=(0, 8),
                           textcoords="offset points", ha="center", color="#f1e9dc", fontsize=8)
+            damage_axis.annotate(f"{average_damage:,.0f}", (tp, average_damage), xytext=(0, -14),
+                                 textcoords="offset points", ha="center", color="#9de2fa", fontsize=8)
         axis.set_title(f"{ws_name} · WS damage per time to TP", color="#f5f0e8")
         axis.set_xlabel("TP threshold", color="#c9c3d4")
         axis.set_ylabel("Average WS damage / time to TP threshold (damage/s)", color="#c9c3d4")
+        damage_axis.set_ylabel("Average WS damage", color="#9de2fa")
         axis.set_xticks(x)
         axis.set_xticklabels([f"{tp:,.0f}" for tp in x])
         axis.tick_params(colors="#c9c3d4")
+        damage_axis.tick_params(axis="y", colors="#9de2fa")
         for spine in axis.spines.values():
             spine.set_color("#665f7b")
+        damage_axis.spines["right"].set_color("#72c7e8")
         axis.grid(True, color="#403a58", alpha=0.65)
+        axis.legend((rate_line, damage_line),
+                    (rate_line.get_label(), damage_line.get_label()),
+                    loc="best", facecolor="#211d3b", edgecolor="#665f7b",
+                    labelcolor="#f5f0e8")
         figure.tight_layout()
         canvas.draw_idle()
 

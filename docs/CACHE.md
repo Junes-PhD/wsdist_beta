@@ -61,11 +61,33 @@ Do not build a full job-by-gear-by-enemy-by-WS Cartesian LUT. Use shared interme
 
 ### Phase 4 - Optimizer reuse
 
-- Compile candidate items once per worker.
+- [x] Freeze each candidate item once per worker and reuse its gear key.
+- [x] Pass that same key into the player cache instead of rebuilding it.
+- [x] Keep optimizer-only player-cache hits read-only, avoiding deep copies.
+- [x] Store compact `(metric, output)` evaluation records except for substat searches.
+- [x] Increase the compact worker LRU and report hits, misses, and evictions.
+- [x] Cache average-WS formulas by effective stats/abilities plus named-gear exceptions.
+- [x] Rank equipment candidates by normalized value for earlier strong results;
+  ranking changes visit order only and removes no candidates.
+- [x] Cache item PDT/MDT/DT contributions and pre-filter items that cannot
+  participate in any defensively valid set using an optimistic bound.
 - Extend the existing one/two-slot delta approach from defense totals to raw gear aggregates.
 - Recalculate non-additive set and conditional effects safely.
 - Keep hot profile/action caches in worker RAM.
 - Return completed cache rows to the parent and persist them in batches; never query SQLite per candidate.
+
+Runtime cache sizes can be tuned before launching the application:
+
+```powershell
+$env:FFXI_PLAYER_CACHE_SIZE='1024'
+$env:FFXI_EVAL_CACHE_SIZE='16384'
+$env:FFXI_WS_FORMULA_CACHE_SIZE='16384'
+python qt_gui_main.py
+```
+
+Substat searches default to a smaller 4,096-entry evaluation LRU because their
+records must retain a `Player` for constraint checks. Ordinary searches retain
+only compact numeric results and default to 16,384 entries.
 
 ### Phase 5 - Layered warming and persistence
 

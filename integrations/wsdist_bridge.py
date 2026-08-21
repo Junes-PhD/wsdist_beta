@@ -605,11 +605,21 @@ def _with_polutils_model(record: dict) -> dict:
     if not enriched.get("description") and model.get("description"):
         enriched["description"] = model["description"]
 
-    # Character-scoped scanner/profile stats already include decoded and manual
-    # augments. Preserve them exactly; POLUtils supplies the base only when
-    # the bridge producer did not provide a model.
-    if not record.get("stats"):
-        enriched["stats"] = deepcopy(model.get("stats") or {})
+    native_stats = model.get("stats") or {}
+    existing_stats = record.get("stats")
+
+    # The installed bridge catalog labels its legacy FFXIAH-derived records as
+    # "bundled dataset". For an unaugmented record, replace that stale base
+    # model with the native client description. This is what makes POLUtils the
+    # primary source rather than only a fallback for empty records.
+    if (native_stats and record.get("stat_source") == "bundled dataset"
+            and _record_is_unaugmented(record)):
+        enriched["stats"] = deepcopy(native_stats)
+        enriched["model_complete"] = bool(model.get("complete"))
+        enriched["stat_source"] = "POLUtils native FFXI DAT resources"
+        enriched["data_source"] = "POLUtils native FFXI DAT resources"
+    elif not existing_stats:
+        enriched["stats"] = deepcopy(native_stats)
         # An exported record may intentionally have no numeric stats (for
         # example a shield whose modeled effect is supplied by the built-in
         # catalog). Preserve its explicit completeness flag when POLUtils has
@@ -619,6 +629,19 @@ def _with_polutils_model(record: dict) -> dict:
         )
         enriched["stat_source"] = "POLUtils native FFXI DAT resources"
         enriched["data_source"] = "POLUtils native FFXI DAT resources"
+    elif native_stats and isinstance(existing_stats, dict):
+        # Records with in-game/manual augment payloads retain their supplied
+        # values. Fill only fields absent from that payload with native base
+        # stats, so an augment can override a native value without being lost.
+        merged = deepcopy(existing_stats)
+        added = False
+        for key, value in native_stats.items():
+            if key not in merged:
+                merged[key] = value
+                added = True
+        if added:
+            enriched["stats"] = merged
+            enriched["native_base_source"] = "POLUtils native FFXI DAT resources"
     return enriched
 
 
@@ -655,6 +678,12 @@ def _with_unverified_warning(record: dict) -> dict:
 def _with_builtin_model(record: dict, item: dict) -> dict:
     """Overlay the curated WSDist model without counting bridge stats twice."""
     item_id = int(record.get("item_id") or 0)
+    # A native unaugmented model is already authoritative. Do not let a
+    # legacy same-name row reintroduce FFXIAH-era values after POLUtils has
+    # replaced the bundled base stats.
+    if (record.get("stat_source") == "POLUtils native FFXI DAT resources"
+            and _record_is_unaugmented(record)):
+        return item
     # For these items the built-in rows are explicitly R30 models.  A
     # character-scoped bridge is authoritative for the base/current variant;
     # never overlay a max-rank row onto it.  This also repairs older bridge

@@ -19,3 +19,15 @@ changed item in an optimizer winner.
 The local `_reference/ffxiah_items.tgz` archive is useful for checking IDs,
 slots, jobs, and descriptions. Effect-only behavior still needs an in-game or
 authoritative source check, such as the [Hasso reference](https://www.bg-wiki.com/ffxi/Hasso).
+
+## Confirmed POLUtils check
+
+The native POLUtils catalog was checked against all seven owned-gear bridge
+databases (5,452 owned records). Every owned item ID was present in the local
+POLUtils catalog. Unaugmented records now use the native POLUtils base stats;
+in-game and manually supplied augment values remain authoritative.
+
+Verified canary item: **Theophany Cap +2** (item ID `23042`). The simulator
+must show Evasion `46` rather than the legacy bundled value `131`, along with
+Magic Accuracy `37`, Defense `105`, Cure Potency `11`, Cure spellcasting time
+`-6`, and Gear Haste `6`. This item was confirmed correct in the simulator.

@@ -60,7 +60,38 @@ namespace PolUtilsGearExtractor
 
         private static string Field(Item item, string name)
         {
-            return item.HasField(name) ? item.GetFieldText(name) : null;
+            if (!item.HasField(name))
+                return null;
+
+            // POLUtils displays many numeric values as "HEX (decimal)".
+            // Export the decimal portion so the downstream JSON converter
+            // does not have to understand presentation-oriented field text.
+            var text = item.GetFieldText(name);
+            var open = text.IndexOf('(');
+            var close = text.IndexOf(')', open + 1);
+            if (open >= 0 && close > open)
+                return text.Substring(open + 1, close - open - 1).Trim();
+            return text;
+        }
+
+        private static string NumericField(Item item, string name)
+        {
+            if (!item.HasField(name))
+                return null;
+
+            var value = item.GetFieldValue(name);
+            if (value != null)
+            {
+                try
+                {
+                    return Convert.ToUInt64(value, CultureInfo.InvariantCulture).ToString(CultureInfo.InvariantCulture);
+                }
+                catch (FormatException) { }
+                catch (InvalidCastException) { }
+                catch (OverflowException) { }
+            }
+
+            return Field(item, name);
         }
 
         private static Dictionary<string, object> ExportItem(Item item, int sourceFile)
@@ -70,19 +101,19 @@ namespace PolUtilsGearExtractor
                 return null;
 
             var result = new Dictionary<string, object>();
-            result["item_id"] = Field(item, "id");
+            result["item_id"] = NumericField(item, "id");
             result["name"] = name;
             result["description"] = Field(item, "description") ?? String.Empty;
-            result["level"] = Field(item, "level") ?? "0";
-            result["item_level"] = Field(item, "iLevel") ?? "0";
-            result["slots_mask"] = Field(item, "slots") ?? "0";
-            result["races_mask"] = Field(item, "races") ?? "0";
-            result["jobs_mask"] = Field(item, "jobs") ?? "0";
-            result["damage"] = Field(item, "damage") ?? "0";
-            result["delay"] = Field(item, "delay") ?? "0";
-            result["skill"] = Field(item, "skill") ?? "0";
-            result["type"] = Field(item, "type") ?? "0";
-            result["flags"] = Field(item, "flags") ?? "0";
+            result["level"] = NumericField(item, "level") ?? "0";
+            result["item_level"] = NumericField(item, "iLevel") ?? "0";
+            result["slots_mask"] = NumericField(item, "slots") ?? "0";
+            result["races_mask"] = NumericField(item, "races") ?? "0";
+            result["jobs_mask"] = NumericField(item, "jobs") ?? "0";
+            result["damage"] = NumericField(item, "damage") ?? "0";
+            result["delay"] = NumericField(item, "delay") ?? "0";
+            result["skill"] = NumericField(item, "skill") ?? "0";
+            result["type"] = NumericField(item, "type") ?? "0";
+            result["flags"] = NumericField(item, "flags") ?? "0";
             result["source_file"] = sourceFile;
             return result;
         }

@@ -30,7 +30,8 @@ from data.gear import *
 from engine.wsdist import (
     CombinedSetResult, apply_forced_empty_slots, build_set, optimize_set,
     balanced_pareto_record, pareto_frontier, prune_dominated_candidates,
-    starting_item_candidates,
+    starting_item_candidates, rank_equipment_candidates,
+    filter_defense_infeasible_candidates,
 )
 from engine.gpu_optimizer import ROW_COUNT, score_melee_ws_batch, select_best_damage
 
@@ -561,6 +562,103 @@ class PerformanceParityTests(unittest.TestCase):
             19,
         )
 
+    def test_player_cache_accepts_precomputed_key_and_read_only_hits(self):
+        player_module._PLAYER_CACHE.clear()
+        gearset = empty_gearset()
+        gear_key = tuple(
+            (slot, tuple(sorted((str(field), repr(value)) for field, value in item.items())))
+            for slot, item in sorted(gearset.items())
+        )
+
+        first = player_module.get_cached_player(
+            "sam", "war", 50, gearset, {}, {},
+            cache_gear_key=gear_key, copy_cached=False,
+        )
+        second = player_module.get_cached_player(
+            "sam", "war", 50, gearset, {}, {},
+            cache_gear_key=gear_key, copy_cached=False,
+        )
+        defensive_copy = player_module.get_cached_player(
+            "sam", "war", 50, gearset, {}, {}, cache_gear_key=gear_key,
+        )
+
+        self.assertIs(first, second)
+        self.assertIsNot(first, defensive_copy)
+        defensive_copy.stats["STR"] = -999
+        self.assertNotEqual(first.stats["STR"], defensive_copy.stats["STR"])
+
+    def test_ws_formula_signature_shares_equivalent_armor_only(self):
+        gearset = empty_gearset()
+        first = create_player("sam", "war", 50, gearset, {}, {})
+        second = create_player("sam", "war", 50, gearset, {}, {})
+        second.gearset["head"] = {
+            **second.gearset["head"], "Name": "Different cosmetic head",
+            "Name2": "Different cosmetic head",
+        }
+
+        self.assertEqual(
+            wsdist_module._ws_formula_signature(first),
+            wsdist_module._ws_formula_signature(second),
+        )
+
+        second.gearset["main"] = {
+            **second.gearset["main"], "Name": "Shining One", "Name2": "Shining One",
+        }
+        self.assertNotEqual(
+            wsdist_module._ws_formula_signature(first),
+            wsdist_module._ws_formula_signature(second),
+        )
+
+    def test_safe_equipment_ranking_reorders_without_removing_candidates(self):
+        weak = {"Name": "Weak", "Type": "Armor", "Skill Type": "None", "STR": 1}
+        strong = {
+            "Name": "Strong", "Type": "Armor", "Skill Type": "None",
+            "STR": 20, "Weapon Skill Damage": 10,
+        }
+        conditional = {
+            "Name": "Conditional", "Type": "Armor", "Skill Type": "None",
+            "STR": 2, "Conditional Effects": {"Test": {"STR": 50}},
+        }
+        original = {"body": [weak, strong, conditional]}
+        ranked = rank_equipment_candidates(original)
+
+        self.assertEqual(
+            {item["Name"] for item in ranked["body"]},
+            {"Weak", "Strong", "Conditional"},
+        )
+        self.assertEqual(ranked["body"][0]["Name"], "Strong")
+        self.assertEqual(len(ranked["body"]), len(original["body"]))
+
+    def test_defense_feasibility_cache_removes_only_provably_bad_items(self):
+        bad_body = {"Name": "Bad body", "Type": "Armor", "Skill Type": "None"}
+        good_body = {
+            "Name": "Good body", "Type": "Armor", "Skill Type": "None", "PDT": -30,
+        }
+        good_head = {
+            "Name": "Good head", "Type": "Armor", "Skill Type": "None",
+            "PDT": -25, "MDT": -25,
+        }
+        filtered, removed = filter_defense_infeasible_candidates(
+            {"body": [bad_body, good_body], "head": [good_head]},
+            pdt_requirement=-50, mdt_requirement=-25,
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertEqual([item["Name"] for item in filtered["body"]], ["Good body"])
+        self.assertEqual([item["Name"] for item in filtered["head"]], ["Good head"])
+
+    def test_defense_feasibility_cache_keeps_all_items_when_floor_is_unproven(self):
+        body = {"Name": "Body", "Type": "Armor", "Skill Type": "None"}
+        head = {"Name": "Head", "Type": "Armor", "Skill Type": "None"}
+        filtered, removed = filter_defense_infeasible_candidates(
+            {"body": [body], "head": [head]},
+            pdt_requirement=-50, mdt_requirement=-25,
+        )
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(filtered["body"], [body])
+        self.assertEqual(filtered["head"], [head])
+
     def test_optimizer_fixed_seed_golden_result(self):
         base, check_gear, enemy = self.optimizer_inputs()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -850,6 +948,58 @@ class PerformanceParityTests(unittest.TestCase):
                 combined_player.tp_player.gearset[slot],
                 combined_player.ws_player.gearset[slot],
             )
+
+    def test_combined_optimizer_retains_multiple_linked_tp_ws_pairs(self):
+        """Show Gear must receive more than the single combined winner when alternatives exist."""
+        base, check_gear, enemy = self.optimizer_inputs()
+
+        def variant(slot, name):
+            gearset = {key: dict(item) for key, item in base.items()}
+            gearset[slot]["Name"] = name
+            gearset[slot]["Name2"] = name
+            return create_player("nin", "war", 50, gearset)
+
+        ws_winner = create_player("nin", "war", 50, base.copy())
+        ws_alternative = variant("head", "WS alternative")
+        tp_winner = create_player("nin", "war", 50, base.copy())
+        tp_alternative = variant("legs", "TP alternative")
+        ws_top = [
+            {"player": ws_winner, "metric": 200.0, "seed": "ws-1"},
+            {"player": ws_alternative, "metric": 199.0, "seed": "ws-2"},
+        ]
+        tp_top = [
+            {"player": tp_winner, "metric": 300.0, "seed": "tp-1"},
+            {"player": tp_alternative, "metric": 299.0, "seed": "tp-2"},
+        ]
+        ws_result = (ws_winner, (), 200.0, "ws-1", ws_top)
+        tp_result = (tp_winner, (), 300.0, "tp-1", tp_top)
+
+        with patch.object(
+            wsdist_module, "optimize_set", side_effect=[ws_result, tp_result]
+        ), patch.object(
+            wsdist_module,
+            "_combined_tp_ws_metric_pair",
+            side_effect=lambda tp, ws, *_args: (
+                float(len(tp.gearset["head"]["Name"]) + len(ws.gearset["head"]["Name"])),
+                (1.0, 2.0, 3.0, 4.0, 5.0),
+            ),
+        ):
+            result = wsdist_module._optimize_combined_pair(
+                "nin", "war", 50, {}, {}, enemy, "Blade: Shun", 1000,
+                check_gear, base.copy(), 199, 199, 199, False, 1,
+                restarts=1, workers=1, seed=1, n_iter=1,
+                return_details=True, return_top_results=True,
+            )
+
+        ranked = result[4]
+        self.assertEqual(len(ranked), 4)
+        self.assertEqual(
+            len({
+                (row["tp_player"].gearset["legs"]["Name"], row["ws_player"].gearset["head"]["Name"])
+                for row in ranked
+            }),
+            4,
+        )
 
     def test_combined_defense_scope_can_apply_only_to_tp(self):
         base, _check_gear, enemy = self.optimizer_inputs()

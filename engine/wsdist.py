@@ -11,6 +11,7 @@ This algorithm may get caught in a crit build if starting from a crit build, but
 Author: Kastra (Asura server)
 '''
 from engine.create_player import *
+from engine.create_player import _freeze_cache_value
 import numpy as np
 from engine.actions import *
 import sys
@@ -41,6 +42,43 @@ _HAND_SLOTS = frozenset(("main", "sub"))
 _RANGED_SLOTS = frozenset(("ranged", "ammo"))
 _EAR_SLOTS = frozenset(("ear1", "ear2"))
 _RING_SLOTS = frozenset(("ring1", "ring2"))
+
+
+def _configured_cache_limit(name, default, minimum=1):
+    """Read a positive optimizer cache size with a safe fallback."""
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _ws_formula_signature(player):
+    """Key average WS results by effective inputs, not armor identities.
+
+    Most equipment affects average_ws only through aggregated player stats.
+    The compact gear fragment below covers the identity/type exceptions read
+    by average_ws and weaponskill_info, allowing equivalent armor from other
+    sets/jobs to share a formula result without conflating special weapons.
+    """
+    gearset = player.gearset
+
+    def fields(slot, *names):
+        item = gearset.get(slot, {})
+        return tuple(item.get(name) for name in names)
+
+    return (
+        player.main_job,
+        player.sub_job,
+        player.master_level,
+        _freeze_cache_value(player.stats),
+        _freeze_cache_value(player.abilities),
+        fields("main", "Name", "Name2", "Type", "Skill Type"),
+        fields("sub", "Type", "Skill Type"),
+        fields("ranged", "Name2", "Type", "Skill Type"),
+        fields("ammo", "Type", "Skill Type"),
+        fields("neck", "Name"),
+        fields("waist", "Name"),
+    )
 
 
 class OptimizerStopped(RuntimeError):
@@ -476,6 +514,186 @@ def prune_dominated_candidates(check_gear: dict[str, list[dict]]) -> tuple[dict[
     return pruned, removed
 
 
+_SAFE_RANK_WEIGHTS = {
+    # Direct WS/physical damage inputs get the strongest ordering signal.
+    "DMG": 2.0, "Weapon Skill Damage": 2.0, "STR": 1.0, "DEX": 1.0,
+    "VIT": 0.5, "AGI": 0.5, "Attack": 0.8, "Ranged Attack": 0.8,
+    "Crit Rate": 0.8, "Crit Damage": 0.8, "PDL": 0.7,
+    # These are useful for TP/combined searches and harmless as an ordering
+    # hint for WS searches; they never decide whether a candidate is legal.
+    "Store TP": 0.8, "TP Bonus": 1.2, "Gear Haste": 0.8,
+    "JA Haste": 0.8, "Magic Haste": 0.8, "Dual Wield": 0.8,
+    "DA": 0.5, "TA": 0.7, "QA": 0.9, "Martial Arts": 0.6,
+    "Accuracy": 0.35, "Ranged Accuracy": 0.35,
+    "Magic Accuracy": 0.35, "Magic Attack": 0.8, "Magic Damage": 1.0,
+}
+
+
+def rank_equipment_candidates(
+    check_gear: dict[str, list[dict]], *, action_type="weapon skill",
+    pdt_requirement=0, mdt_requirement=0, dt_requirement=0,
+) -> dict[str, list[dict]]:
+    """Order candidates by a conservative, context-aware value estimate.
+
+    This function deliberately never removes an item. Scores are only used
+    to visit promising candidates earlier, which improves early best-set
+    quality without changing the exhaustive candidate set or combat formula.
+    Values are normalized within each slot so unlike units such as STR and
+    Weapon Skill Damage cannot overwhelm the ranking merely because of scale.
+    """
+    ranked = {}
+    defensive_search = any(float(value) < 0 for value in (
+        pdt_requirement, mdt_requirement, dt_requirement,
+    ))
+    rank_weights = _SAFE_RANK_WEIGHTS
+    if action_type == "weapon skill":
+        # WS damage searches should lead with damage stats. TP-speed stats are
+        # still retained in the score, but are intentionally secondary.
+        rank_weights = dict(_SAFE_RANK_WEIGHTS)
+        rank_weights.update({"Store TP": 0.2, "Gear Haste": 0.15,
+                             "JA Haste": 0.15, "Magic Haste": 0.15,
+                             "Dual Wield": 0.25})
+    for slot, items in check_gear.items():
+        if len(items) < 2:
+            ranked[slot] = list(items)
+            continue
+
+        numeric = [_numeric_combat_stats(item) for item in items]
+        ranges = {}
+        for stats in numeric:
+            for key, value in stats.items():
+                ranges[key] = max(ranges.get(key, 0.0), abs(value))
+
+        scored = []
+        for index, (item, stats) in enumerate(zip(items, numeric)):
+            score = 0.0
+            for key, value in stats.items():
+                scale = ranges.get(key, 0.0)
+                if not scale:
+                    continue
+                weight = rank_weights.get(key, 0.0)
+                if weight:
+                    score += weight * value / scale
+                elif defensive_search and key in _LOWER_IS_BETTER_STATS:
+                    # PDT/MDT/DT values are normally negative; more negative
+                    # is better when a defensive floor is active.
+                    score += 0.5 * max(0.0, -value) / scale
+            # Keep multi-slot/conditional equipment visible near the front so
+            # its complete-set behavior is discovered early. It remains fully
+            # subject to the normal legality checks.
+            if forced_empty_slots(item) or has_conditional_set_effect(item):
+                score += 0.05
+            scored.append((score, index, item))
+
+        # Original index is the stable tie-breaker. No random starting choice
+        # is changed because callers apply this after choosing the baseline.
+        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+        ranked[slot] = [item for _score, _index, item in scored]
+    return ranked
+
+
+_DEFENSE_TOTAL_STATS = ("PDT", "MDT", "DT", "PDT2", "MDT2", "DT2")
+
+
+def _defense_buff_totals(buffs):
+    totals = [0.0] * len(_DEFENSE_TOTAL_STATS)
+    for source in (buffs or {}).values():
+        for index, stat in enumerate(_DEFENSE_TOTAL_STATS):
+            value = source.get(stat, 0) if isinstance(source, dict) else 0
+            try:
+                totals[index] += float(value)
+            except (TypeError, ValueError):
+                continue
+    return totals
+
+
+def _defense_requirements_met(totals, main_item, abilities, pdt, mdt, dt):
+    actual_pdt, actual_mdt = damage_taken_from_totals(totals, main_item, abilities)
+    actual_dt = damage_taken_dt_from_totals(totals, main_item, abilities)
+    return (
+        (pdt >= 0 or actual_pdt <= pdt)
+        and (mdt >= 0 or actual_mdt <= mdt)
+        and (dt >= 0 or actual_dt <= dt)
+    )
+
+
+def filter_defense_infeasible_candidates(
+    check_gear: dict[str, list[dict]], buffs=None, abilities=None,
+    pdt_requirement=0, mdt_requirement=0, dt_requirement=0, item_cache=None,
+) -> tuple[dict[str, list[dict]], int]:
+    """Remove only items provably unable to join a defensive-valid set.
+
+    The bound intentionally combines the best independent contribution from
+    every other slot, even when those items could not coexist. That makes the
+    bound optimistic. Therefore an item rejected by it cannot be part of a
+    valid set. If no feasible set can be proven, or if filtering would empty a
+    slot, the original candidates are retained for the existing closest-set
+    fallback path.
+    """
+    thresholds = (pdt_requirement, mdt_requirement, dt_requirement)
+    if not any(float(value) < 0 for value in thresholds):
+        return {slot: list(items) for slot, items in check_gear.items()}, 0
+
+    item_cache = item_cache if item_cache is not None else {}
+    buff_totals = _defense_buff_totals(buffs)
+
+    def optimistic_totals(fixed_slot=None, fixed_item=None):
+        totals = list(buff_totals)
+        for slot, items in check_gear.items():
+            if slot == fixed_slot:
+                values = damage_taken_item_values(fixed_item, item_cache)
+            elif items:
+                # Per-stat minima intentionally come from independent items;
+                # this is an upper-bound relaxation, never an over-prune.
+                values_by_stat = [
+                    damage_taken_item_values(item, item_cache) for item in items
+                ]
+                values = tuple(min(row[index] for row in values_by_stat)
+                               for index in range(len(_DEFENSE_TOTAL_STATS)))
+            else:
+                values = (0,) * len(_DEFENSE_TOTAL_STATS)
+            for index, value in enumerate(values):
+                totals[index] += value
+        return totals
+
+    def optimistic_main_item(fixed_slot, fixed_item):
+        if fixed_slot == "main":
+            return fixed_item
+        # Aftermath on Bravura/Claustrum is an extra -20 DT. Treating one as
+        # available even when it is not is deliberately optimistic and can
+        # only preserve too many items, never remove a valid one.
+        if (abilities or {}).get("Aftermath", 0) > 0:
+            return {"Name": "Bravura"}
+        return {}
+
+    global_totals = optimistic_totals()
+    if not _defense_requirements_met(
+        global_totals, optimistic_main_item(None, None), abilities,
+        pdt_requirement, mdt_requirement, dt_requirement,
+    ):
+        return {slot: list(items) for slot, items in check_gear.items()}, 0
+
+    filtered = {}
+    removed = 0
+    for slot, items in check_gear.items():
+        survivors = []
+        for item in items:
+            totals = optimistic_totals(slot, item)
+            if _defense_requirements_met(
+                totals, optimistic_main_item(slot, item), abilities,
+                pdt_requirement, mdt_requirement, dt_requirement,
+            ):
+                survivors.append(item)
+        # If the relaxed per-stat bounds disagree so strongly that every item
+        # in a slot is rejected, keep that slot untouched. This preserves the
+        # exact search/fallback behavior instead of making a risky assumption.
+        if not survivors:
+            survivors = list(items)
+        removed += len(items) - len(survivors)
+        filtered[slot] = survivors
+    return filtered, removed
+
+
 def obvious_blacklist_suggestions(items_by_slot: dict[str, list[dict]]) -> dict[str, set[str]]:
     """Suggest globally safe blacklist entries from strictly dominated gear.
 
@@ -706,9 +924,20 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     # avoids recomputing a player and action when multiple slot-pair paths
     # revisit the same gear set, without any cross-process SQLite contention.
     evaluation_cache = OrderedDict()
-    evaluation_cache_limit = 2048
+    # Normal searches retain only compact score/output records, so a much
+    # larger LRU is affordable. Substat searches need Player instances and
+    # keep the lower memory ceiling.
+    evaluation_cache_limit = _configured_cache_limit(
+        "FFXI_EVAL_CACHE_SIZE", 4096 if substat_spec else 16384
+    )
     evaluation_cache_hits = 0
     evaluation_cache_misses = 0
+    evaluation_cache_evictions = 0
+    ws_formula_cache = OrderedDict()
+    ws_formula_cache_limit = _configured_cache_limit("FFXI_WS_FORMULA_CACHE_SIZE", 16384)
+    ws_formula_cache_hits = 0
+    ws_formula_cache_misses = 0
+    ws_formula_cache_evictions = 0
     item_token_cache = {}
     rng = np.random.default_rng(seed) if seed is not None else np.random
     best_set = None
@@ -755,7 +984,8 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         )
 
     def evaluate_gearset(gearset):
-        nonlocal evaluation_cache_hits, evaluation_cache_misses
+        nonlocal evaluation_cache_hits, evaluation_cache_misses, evaluation_cache_evictions
+        nonlocal ws_formula_cache_hits, ws_formula_cache_misses, ws_formula_cache_evictions
         key = evaluation_key(gearset)
         cached = evaluation_cache.get(key)
         if cached is not None:
@@ -763,10 +993,27 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
             evaluation_cache.move_to_end(key)
             return cached
         evaluation_cache_misses += 1
-        player = get_cached_player(main_job, sub_job, master_level, gearset, buffs, abilities)
+        player = get_cached_player(
+            main_job, sub_job, master_level, gearset, buffs, abilities,
+            cache_gear_key=key, copy_cached=False,
+        )
         if action_type == "weapon skill":
-            metric_base, output = average_ws(player, enemy, ws_name, min_tp, ws_type, input_metric)
-            metric = metric_base ** output[-1]
+            formula_key = _ws_formula_signature(player)
+            formula_result = ws_formula_cache.get(formula_key)
+            if formula_result is not None:
+                ws_formula_cache_hits += 1
+                ws_formula_cache.move_to_end(formula_key)
+                metric, output = formula_result
+            else:
+                ws_formula_cache_misses += 1
+                metric_base, output = average_ws(
+                    player, enemy, ws_name, min_tp, ws_type, input_metric
+                )
+                metric = metric_base ** output[-1]
+                ws_formula_cache[formula_key] = (metric, output)
+                if len(ws_formula_cache) > ws_formula_cache_limit:
+                    ws_formula_cache.popitem(last=False)
+                    ws_formula_cache_evictions += 1
         elif action_type == "combined tp/ws":
             if combined_ws_player is None:
                 metric, output = _combined_tp_ws_metric(player, enemy, ws_name, min_tp, ws_type)
@@ -782,10 +1029,14 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
             metric = metric_base ** output[-1]
         else:
             raise ValueError(f"Unknown action_type ({action_type})")
-        result = player, metric, output
+        # The ordinary optimizer never reads candidate Player objects after
+        # scoring. Keeping only the compact result greatly increases useful
+        # LRU capacity and avoids pinning every gearset graph in memory.
+        result = (player if substat_spec else None), metric, output
         evaluation_cache[key] = result
         if len(evaluation_cache) > evaluation_cache_limit:
             evaluation_cache.popitem(last=False)
+            evaluation_cache_evictions += 1
         return result
 
     def progress_results_text():
@@ -933,6 +1184,20 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                     }
 
     check_gear = _prepare_candidates(check_gear, main_job, ws_type)
+    check_gear, defense_removed = filter_defense_infeasible_candidates(
+        check_gear,
+        buffs=buffs,
+        abilities=abilities,
+        pdt_requirement=pdt_requirement,
+        mdt_requirement=mdt_requirement,
+        dt_requirement=dt_requirement,
+        item_cache=damage_taken_item_cache,
+    )
+    if defense_removed:
+        report_progress(
+            f"Defensive feasibility cache removed {defense_removed:,} candidates "
+            "that cannot meet the requested PDT/MDT/DT floors."
+        )
     for items in check_gear.values():
         rng.shuffle(items)
     work_slots = _candidate_work_slots(check_gear)
@@ -984,6 +1249,18 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     if duplicate_tp_bonus_weapon(starting_gearset["main"], starting_gearset["sub"]):
         starting_gearset["sub"] = Empty
         report_progress("Removed second +1000 TP Bonus weapon from sub slot.")
+
+    # Safe ordering only: all candidates remain in the exhaustive search. Do
+    # this after the random baseline is selected so seeded restart behavior is
+    # not changed by the ranking pass.
+    check_gear = rank_equipment_candidates(
+        check_gear,
+        action_type=action_type,
+        pdt_requirement=pdt_requirement,
+        mdt_requirement=mdt_requirement,
+        dt_requirement=dt_requirement,
+    )
+    report_progress("Safe equipment value ranking applied; no candidates removed.")
 
     best_set =  starting_gearset.copy()
 
@@ -1598,8 +1875,17 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     memo_rate = 100 * evaluation_cache_hits / memo_total if memo_total else 0.0
     completion_message = (
         f"Search completed. Worker memo: {evaluation_cache_hits:,} hits, "
-        f"{evaluation_cache_misses:,} misses ({memo_rate:.1f}% hit rate)."
+        f"{evaluation_cache_misses:,} misses ({memo_rate:.1f}% hit rate), "
+        f"{evaluation_cache_evictions:,} evictions."
     )
+    if action_type == "weapon skill":
+        formula_total = ws_formula_cache_hits + ws_formula_cache_misses
+        formula_rate = 100 * ws_formula_cache_hits / formula_total if formula_total else 0.0
+        completion_message += (
+            f" WS formula cache: {ws_formula_cache_hits:,} hits, "
+            f"{ws_formula_cache_misses:,} misses ({formula_rate:.1f}% hit rate), "
+            f"{ws_formula_cache_evictions:,} evictions."
+        )
     if return_details:
         report_progress(completion_message)
         return best_player, best_output, result_metric
@@ -1748,8 +2034,18 @@ def _optimize_combined_pair(main_job, sub_job, master_level, buffs, abilities, e
         progress_callback=progress_callback, progress_queue=progress_queue,
         stop_event=stop_event, combined_ws_player=ws_player,
     )
+    # Keep the retained alternatives from both halves of the combined search.
+    # The previous implementation paired every TP alternative with only the
+    # single winning WS result, so Show Gear could never display a genuinely
+    # varied linked TP + WS list.  TP alternatives were optimized against the
+    # winning WS overlay; WS alternatives are independently optimized and are
+    # re-evaluated below as linked pairs.  This does not change the winner, but
+    # gives the result viewer the same retained-candidate coverage as the
+    # underlying searches.
     tp_top = list(tp_result[4] or [])
-    ws_top = [{"player": ws_result[0], "metric": ws_result[2], "seed": ws_result[3]}]
+    ws_top = list(ws_result[4] or [])
+    if not ws_top:
+        ws_top = [{"player": ws_result[0], "metric": ws_result[2], "seed": ws_result[3]}]
     if not tp_top:
         tp_top = [{"player": tp_result[0], "metric": tp_result[2], "seed": tp_result[3]}]
 
@@ -1761,14 +2057,23 @@ def _optimize_combined_pair(main_job, sub_job, master_level, buffs, abilities, e
     }
     ws_type = "ranged" if ws_name in ranged_ws_names else "melee"
     pair_results = []
+    pair_seen = set()
     for tp_entry in tp_top:
         for ws_entry in ws_top:
+            tp_player = tp_entry.get("player")
+            ws_player = ws_entry.get("player")
+            if tp_player is None or ws_player is None:
+                continue
+            pair_key = (_gearset_key(tp_player), _gearset_key(ws_player))
+            if pair_key in pair_seen:
+                continue
+            pair_seen.add(pair_key)
             metric, output = _combined_tp_ws_metric_pair(
-                tp_entry["player"], ws_entry["player"], enemy, ws_name, min_tp, ws_type
+                tp_player, ws_player, enemy, ws_name, min_tp, ws_type
             )
             pair_results.append({
-                "player": CombinedSetResult(tp_entry["player"], ws_entry["player"]),
-                "tp_player": tp_entry["player"], "ws_player": ws_entry["player"],
+                "player": CombinedSetResult(tp_player, ws_player),
+                "tp_player": tp_player, "ws_player": ws_player,
                 "output": output, "metric": metric,
                 "tp_metric": tp_entry.get("metric"), "ws_metric": ws_entry.get("metric"),
                 "tp_seed": tp_entry.get("seed"), "ws_seed": ws_entry.get("seed"),

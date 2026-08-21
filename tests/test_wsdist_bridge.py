@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from integrations.lac_profile import (
     bridge_hash, parse_set_entries, prepare_managed_update, prepare_profile_builder_update, prepare_set_renames,
@@ -10,6 +11,7 @@ from integrations.lac_profile import (
 from integrations.wsdist_bridge import (
     BridgeStore, _gear_record, _with_builtin_model, _with_curated_model,
     _with_unverified_warning, _exact_rank_augment, _builtin_augment_path,
+    _with_polutils_model,
     hoxne_stat_bonus,
 )
 from data.gear import Bifrost_Ring
@@ -17,6 +19,48 @@ from data.weapon_bonus import get_weapon_bonus
 
 
 class BridgeTests(unittest.TestCase):
+    def test_polutils_is_primary_base_model_and_preserves_manual_stats(self):
+        model = {
+            "Name": "Native Cap",
+            "stats": {"Defense": 105, "STR": 24},
+            "slots_mask": 16,
+            "jobs_mask": 8,
+            "skill": 0,
+            "item_level": 119,
+            "complete": True,
+            "description": "DEF:105 STR+24",
+        }
+        with patch.dict("integrations.wsdist_bridge.POLUTILS_MODELS", {"23042": model}, clear=True):
+            native = _with_polutils_model({"item_id": 23042, "stats": {}})
+            self.assertEqual(native["stats"], model["stats"])
+            self.assertEqual(native["data_source"], "POLUtils native FFXI DAT resources")
+
+            manual = _with_polutils_model({
+                "item_id": 23042,
+                "stats": {"Defense": 105, "STR": 99},
+                "augments": ["Manual augment"],
+            })
+            self.assertEqual(manual["stats"]["STR"], 99)
+            self.assertEqual(manual["augments"], ["Manual augment"])
+            self.assertNotIn("data_source", manual)
+
+            bundled = _with_polutils_model({
+                "item_id": 23042,
+                "stat_source": "bundled dataset",
+                "stats": {"Defense": 105, "Accuracy": 37, "Evasion": 131},
+            })
+            self.assertEqual(bundled["stats"], model["stats"])
+            self.assertEqual(bundled["stat_source"], "POLUtils native FFXI DAT resources")
+
+            augmented = _with_polutils_model({
+                "item_id": 23042,
+                "stat_source": "bundled dataset",
+                "stats": {"Defense": 105, "Evasion": 131, "STR": 99},
+                "augments": ["Manual augment"],
+            })
+            self.assertEqual(augmented["stats"]["Evasion"], 131)
+            self.assertEqual(augmented["stats"]["STR"], 99)
+
     def test_bifrost_ring_converts_hp_to_mp(self):
         self.assertEqual(Bifrost_Ring["HP"], -70)
         self.assertEqual(Bifrost_Ring["MP"], 70)

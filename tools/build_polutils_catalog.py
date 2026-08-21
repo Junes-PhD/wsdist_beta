@@ -20,6 +20,18 @@ DESCRIPTION_STATS = {
     "Rapid Shot", "Recycle", "Conserve MP", "Conserve TP", "Daken",
     "Zanshin", "Kick Attacks", "Subtle Blow", "Subtle Blow II",
     "Shield Skill", "Parrying Skill", "Magic Accuracy Skill",
+    "Hand-to-Hand Skill", "Dagger Skill", "Sword Skill", "Great Sword Skill",
+    "Axe Skill", "Great Axe Skill", "Scythe Skill", "Polearm Skill",
+    "Katana Skill", "Great Katana Skill", "Club Skill", "Staff Skill",
+    "Archery Skill", "Marksmanship Skill", "Throwing Skill", "Elemental Magic Skill",
+    "Enfeebling Magic Skill", "Healing Magic Skill", "Enhancing Magic Skill",
+    "Divine Magic Skill", "Dark Magic Skill", "Summoning Magic Skill",
+    "Ninjutsu Skill", "Singing Skill", "String Skill", "Wind Skill",
+    "Geomancy Skill", "Handbell Skill", "Cure Potency Received",
+    "TP Bonus", "Double Attack", "Triple Attack", "Quadruple Attack",
+    "Critical hit rate", "Critical hit damage", "Physical damage limit",
+    "Counter", "Regain", "Fencer", "Martial Arts", "Occult Acumen",
+    "Treasure Hunter", "Movement speed", "Cure spellcasting time",
 }
 
 ALIASES = {
@@ -48,13 +60,21 @@ ALIASES = {
     "shield skill": "Shield Skill", "parrying skill": "Parrying Skill",
     "enfeebling magic skill": "Enfeebling Magic Skill",
     "elemental magic skill": "Elemental Magic Skill",
+    "double attack": "DA", "triple attack": "TA", "quadruple attack": "QA",
+    "critical hit rate": "Crit Rate", "critical hit damage": "Crit Damage",
+    "physical damage limit": "PDL", "movement speed": "Movement Speed",
 }
+
+STAT_CANONICAL = {value.casefold(): value for value in DESCRIPTION_STATS}
 
 
 def normalize_key(raw: str) -> str:
-    cleaned = re.sub(r"\s+", " ", raw.strip().strip('"')).replace(".", "")
+    cleaned = re.sub(r"\s+", " ", raw.strip().replace('"', "")).replace(".", "")
     lowered = cleaned.casefold()
-    return ALIASES.get(lowered, cleaned)
+    if lowered.startswith("pet "):
+        return "Pet: " + normalize_key(cleaned[4:])
+    aliased = ALIASES.get(lowered, cleaned)
+    return STAT_CANONICAL.get(aliased.casefold(), aliased)
 
 
 def parse_number(value: str, *, hexadecimal: bool = False) -> int:
@@ -70,6 +90,9 @@ def parse_description(description: str) -> dict[str, int]:
     text = str(description or "").replace("\r", "\n")
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", " ", text)
     for line in text.splitlines():
+        if line.strip().casefold().startswith("set:"):
+            continue
+        line = re.sub(r"\bPet:\s*", "Pet ", line, flags=re.IGNORECASE)
         for match in re.finditer(
             r'([A-Za-z][A-Za-z\s.\-/"]*?)\s*:\s*([+-]?)\s*(\d+(?:\.\d+)?)\s*%?',
             line,
@@ -85,7 +108,7 @@ def parse_description(description: str) -> dict[str, int]:
 
 def add_stat(result: dict[str, int], raw_key: str, sign: str, number: str) -> None:
     key = normalize_key(raw_key)
-    if key not in DESCRIPTION_STATS:
+    if key not in DESCRIPTION_STATS and not key.startswith("Pet: "):
         return
     value = float((sign or "") + number)
     result[key] = int(value) if value.is_integer() else value
@@ -96,7 +119,7 @@ def model(item: dict) -> dict:
     stats = parse_description(item.get("description", ""))
     damage = parse_number(item.get("damage"))
     delay = parse_number(item.get("delay"))
-    skill = parse_number(item.get("skill"), hexadecimal=True)
+    skill = parse_number(item.get("skill"))
     if damage:
         stats["DMG"] = damage
     if delay:
@@ -106,10 +129,10 @@ def model(item: dict) -> dict:
         "Name2": item.get("name", ""),
         "Item ID": item_id,
         "stats": stats,
-        "slots_mask": parse_number(item.get("slots_mask"), hexadecimal=True),
-        "jobs_mask": parse_number(item.get("jobs_mask"), hexadecimal=True),
+        "slots_mask": parse_number(item.get("slots_mask")),
+        "jobs_mask": parse_number(item.get("jobs_mask")),
         "skill": skill,
-        "type": parse_number(item.get("type"), hexadecimal=True),
+        "type": parse_number(item.get("type")),
         "level": parse_number(item.get("level")),
         "item_level": parse_number(item.get("item_level")),
         "description": item.get("description", ""),

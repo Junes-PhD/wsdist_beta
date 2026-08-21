@@ -2,6 +2,7 @@ import unittest
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from data import gear
 from engine.create_player import create_enemy
@@ -16,10 +17,11 @@ from app.qt_gui_main import (
     _profile_set_descriptor, _profile_ws_name,
     _dps_series_chart_data, _quick_cache_request, _quick_result_chart_data,
     _optimizer_current_result_lines, _optimizer_result_players, _remaining_time_estimate,
-    _normalized_search_quality, _reference_enemy_names, _search_quality_settings,
+    _normalized_search_quality, _reference_enemy_names, _selected_reference_enemy_names,
+    _search_quality_settings,
     _item_job_eligible,
     _run_overnight_cache_task, _ws_distribution_chart_data,
-    _ws_tp_time_chart_data,
+    _ws_tp_time_chart_data, _ws_tp_time_points,
     item_tooltip, magic_damage_spell_choices, weapon_skill_choices,
 )
 from persistence.simulation_cache import SimulationCache
@@ -61,6 +63,12 @@ class ProfileReportHelperTests(unittest.TestCase):
             ("Apex Toad", "Apex Knight Lugcrawler", "Apex Archaic Cogs"),
         )
         self.assertEqual(_reference_enemy_names("Custom target", False), ("Custom target",))
+        self.assertEqual(
+            _selected_reference_enemy_names([
+                "Apex Archaic Cogs", "unknown", "Apex Toad", "Apex Toad",
+            ]),
+            ("Apex Toad", "Apex Archaic Cogs"),
+        )
 
     def test_search_quality_policy_and_legacy_deep_migration(self):
         self.assertEqual(_search_quality_settings("Fast"), (4, 6, True))
@@ -218,6 +226,35 @@ class ProfileReportHelperTests(unittest.TestCase):
             (1000.0, 1000.0, 10000.0, 10.0),
             (2000.0, 750.0, 15000.0, 20.0),
         ])
+
+    def test_fixed_ws_tp_time_points_use_ws_damage_and_tp_generation_sets(self):
+        ws_player = object()
+        tp_player = object()
+        with patch("app.qt_gui_main.actions.average_ws", return_value=(0, [12000, 0])) as ws_call:
+            with patch("app.qt_gui_main.actions.average_attack_round", return_value=(8.0, [], 0)) as tp_call:
+                points = _ws_tp_time_points(
+                    ws_player, tp_player, object(), "Savage Blade", "melee",
+                    tiers=(1000,),
+                )
+
+        self.assertEqual(points, [(1000.0, 12000.0, 8.0)])
+        self.assertIs(ws_call.call_args.args[0], ws_player)
+        self.assertIs(tp_call.call_args.args[0], tp_player)
+
+    def test_fixed_ws_tp_time_graph_has_independent_average_damage_axis(self):
+        from matplotlib.figure import Figure
+
+        figure = Figure()
+        canvas = SimpleNamespace(draw_idle=lambda: None)
+        MainWindow._render_ws_tp_time_graph(
+            object(), figure, canvas,
+            [(1000, 12000, 12), (2000, 18000, 20)],
+            "Savage Blade",
+        )
+
+        self.assertEqual(len(figure.axes), 2)
+        self.assertIn("damage/s", figure.axes[0].get_ylabel())
+        self.assertEqual(figure.axes[1].get_ylabel(), "Average WS damage")
 
     def test_optimizer_running_state_is_explicit(self):
         self.assertEqual(OPTIMIZER_STATE_LABELS["running"], "SIMULATION RUNNING")
