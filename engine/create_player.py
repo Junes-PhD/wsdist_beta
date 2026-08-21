@@ -3,12 +3,19 @@ File containing code to build a player character with gear and aggregate stats.
 
 Author: Kastra (Asura server)
 '''
+from collections import OrderedDict
+from copy import deepcopy
+
 from data.enemies import *
 from engine.equipment_rules import apply_ear_slot_rules, apply_weapon_slot_rules, conditional_gear_bonuses
 
 
 _BASE_STATS_CACHE = {}
 _BASE_STATS_CACHE_LIMIT = 128
+_GEAR_STAT_CACHE = {}
+_GEAR_STAT_CACHE_LIMIT = 8192
+_PLAYER_CACHE = OrderedDict()
+_PLAYER_CACHE_LIMIT = 512
 _DAMAGE_TAKEN_STATS = ("PDT", "MDT", "DT", "PDT2", "MDT2", "DT2")
 
 
@@ -49,6 +56,62 @@ def damage_taken_item_values(item, item_cache=None):
     if item_cache is not None:
         item_cache[id(item)] = (item, values)
     return values
+
+
+def _gear_stat_contributions(item, slot, main_job):
+    """Return parsed stat contributions for an immutable catalog item."""
+    key = (id(item), slot, main_job)
+    cached = _GEAR_STAT_CACHE.get(key)
+    if cached is not None and cached[0] is item:
+        return cached[1]
+
+    ignore_stats = {
+        "Name", "Name2", "Type", "DMG", "Delay", "Jobs", "Skill Type", "Rank",
+        "Augment Path", "Dynamis Divergence", "Conditional Effects",
+    }
+    ignore_main_sub_skills = {
+        "Hand-to-Hand Skill", "Dagger Skill", "Sword Skill", "Great Sword Skill",
+        "Axe Skill", "Great Axe Skill", "Scythe Skill", "Polearm Skill",
+        "Katana Skill", "Great Katana Skill", "Club Skill", "Staff Skill",
+        "Evasion Skill", "Divine Magic Skill", "Elemental Magic Skill",
+        "Dark Magic Skill", "Ninjutsu Skill", "Summoning Magic Skill",
+        "Blue Magic Skill", "Magic Accuracy Skill",
+    }
+    weapon_local_stats = {
+        "FUA", "OA8", "OA7", "OA6", "OA5", "OA4", "OA3", "OA2",
+        "EnSpell Damage", "EnSpell Damage%",
+    }
+    contributions = []
+    for stat, raw_value in item.items():
+        if stat in ignore_stats:
+            continue
+        if stat == "Triple Shot" and main_job == "rng":
+            continue
+        if stat == "Double Shot" and main_job == "cor":
+            continue
+        if stat == "WSC":
+            contributions.append((stat, raw_value, True))
+            continue
+        if slot in ("main", "sub") and stat in ignore_main_sub_skills:
+            target = f"{slot} {stat}"
+        elif slot in ("main", "sub") and stat in weapon_local_stats:
+            target = f"{stat} {slot}"
+        else:
+            target = stat
+        if not isinstance(raw_value, (int, float)):
+            try:
+                raw_value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+        # Weapon skill values on main/sub are stored under slot-specific keys.
+        if slot in ("main", "sub") and stat in ignore_main_sub_skills:
+            target = f"{slot} {stat}"
+        contributions.append((target, raw_value, False))
+
+    if len(_GEAR_STAT_CACHE) >= _GEAR_STAT_CACHE_LIMIT:
+        _GEAR_STAT_CACHE.clear()
+    _GEAR_STAT_CACHE[key] = (item, tuple(contributions))
+    return _GEAR_STAT_CACHE[key][1]
 
 
 def damage_taken_totals(gearset, buffs=None, item_cache=None):
@@ -781,36 +844,14 @@ class create_player:
         #
         # Add stats from the equipped gear, including set bonuses at the end.
         #
-        # A list of stats to not include in <stats>. These do not affect player stats. We will use DMG and Delay in the main code later to calculate damage, though.
-        ignore_stats = ["Name","Name2","Type","DMG","Delay","Jobs","Skill Type","Rank",
-                        "Augment Path", "Dynamis Divergence", "Conditional Effects"]
         for slot in self.gearset:
-            for stat in self.gearset[slot]:
-                if stat=="Triple Shot" and self.main_job=="rng": # Skip Triple Shot bonuses on Oshosi for RNG
-                    continue
-                if stat=="Double Shot" and self.main_job=="cor": # Skip Double Shot bonuses on Oshosi for COR
-                    continue
-                if stat not in ignore_stats:
-                    # A list of combat skills to ignore when seen in the main or sub slots. These skills apply only to their respective slots on weapons so we create a new stat for them.
-                    ignore_main_sub_skills = ["Hand-to-Hand Skill","Dagger Skill","Sword Skill","Great Sword Skill","Axe Skill","Great Axe Skill","Scythe Skill","Polearm Skill","Katana Skill","Great Katana Skill","Club Skill","Staff Skill","Evasion Skill","Divine Magic Skill","Elemental Magic Skill","Dark Magic Skill","Ninjutsu Skill","Summoning Magic Skill","Blue Magic Skill","Magic Accuracy Skill"]
-                    raw_value = self.gearset[slot][stat]
-                    if stat == "WSC":
-                        self.stats[stat] = self.stats.get(stat,[]) + [raw_value]
-                        continue
-                    if not isinstance(raw_value, (int, float)):
-                        try:
-                            raw_value = float(raw_value)
-                        except (TypeError, ValueError):
-                            # Ignore effect-only/string metadata that cannot
-                            # contribute to numeric player stats.
-                            continue
-                    if not (slot in ["main","sub"] and stat in ignore_main_sub_skills):
-                        if stat in ["FUA","OA8","OA7","OA6","OA5","OA4","OA3","OA2","EnSpell Damage","EnSpell Damage%"] and slot in ["main", "sub"]: # OAX stats apply only to the weapon they are attached to.
-                            self.stats[f"{stat} {slot}"] = self.stats.get(f"{stat} {slot}",0) + raw_value
-                        else:
-                            self.stats[stat] = self.stats.get(stat,0) + raw_value
-                    else:
-                        self.stats[f"{slot} {stat}"] = self.stats.get(f"{slot} {stat}",0) + raw_value
+            for stat, value, is_wsc in _gear_stat_contributions(
+                self.gearset[slot], slot, self.main_job
+            ):
+                if is_wsc:
+                    self.stats[stat] = self.stats.get(stat, []) + [value]
+                else:
+                    self.stats[stat] = self.stats.get(stat, 0) + value
 
         # Cross-slot effects are deliberately absent from each item's raw
         # numeric row. Add them once only when the complete combination is
@@ -1160,6 +1201,30 @@ class create_player:
         _BASE_STATS_CACHE[cache_key] = self.stats.copy()
 
 
+
+
+def get_cached_player(main_job, sub_job, master_level=20, gearset=None, buffs=None, abilities=None):
+    """Reuse an immutable-equivalent player context across optimizer phases."""
+    gear_key = tuple(
+        (slot, tuple(sorted((str(field), repr(value)) for field, value in item.items())))
+        for slot, item in sorted((gearset or {}).items())
+        if isinstance(item, dict)
+    )
+    key = (
+        str(main_job).lower(), str(sub_job).lower(), int(master_level),
+        gear_key, _freeze_cache_value(buffs or {}), _freeze_cache_value(abilities or {}),
+    )
+    cached = _PLAYER_CACHE.get(key)
+    if cached is not None:
+        _PLAYER_CACHE.move_to_end(key)
+        return deepcopy(cached)
+    player = create_player(main_job, sub_job, master_level, gearset, buffs, abilities)
+    # Keep the cache insulated from callers that adjust a result for display
+    # or export after the optimizer returns it.
+    _PLAYER_CACHE[key] = deepcopy(player)
+    if len(_PLAYER_CACHE) > _PLAYER_CACHE_LIMIT:
+        _PLAYER_CACHE.popitem(last=False)
+    return player
 
 
 if __name__ == "__main__":

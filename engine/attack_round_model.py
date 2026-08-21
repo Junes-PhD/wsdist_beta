@@ -12,6 +12,10 @@ from collections import defaultdict
 from functools import lru_cache
 from math import comb
 
+import numpy as np
+
+from engine.numba_compat import njit
+
 
 def _clamp(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
@@ -89,6 +93,37 @@ def _binomial(attempts, hit_rate):
     }
 
 
+@njit(cache=True)
+def _expected_rounds_kernel(tp_values, probabilities, remaining):
+    """Evaluate the TP recurrence in compiled numeric code."""
+    zero_probability = 0.0
+    positive_count = 0
+    for index in range(len(tp_values)):
+        if tp_values[index] <= 0:
+            zero_probability += probabilities[index]
+        elif probabilities[index] > 0:
+            positive_count += 1
+    if zero_probability >= 1.0 - 1e-12:
+        return np.inf
+
+    values = np.zeros(remaining + 1, dtype=np.float64)
+    positive_tp = np.empty(positive_count, dtype=np.int64)
+    positive_probability = np.empty(positive_count, dtype=np.float64)
+    position = 0
+    for index in range(len(tp_values)):
+        if tp_values[index] > 0 and probabilities[index] > 0:
+            positive_tp[position] = tp_values[index]
+            positive_probability[position] = probabilities[index]
+            position += 1
+
+    for needed in range(1, remaining + 1):
+        total = 1.0
+        for index in range(positive_count):
+            total += positive_probability[index] * values[max(0, needed - positive_tp[index])]
+        values[needed] = total / (1.0 - zero_probability)
+    return values[remaining]
+
+
 @lru_cache(maxsize=4096)
 def _tp_distribution_cached(config):
     """Return ``((tp, probability), ...)`` for a canonical immutable config."""
@@ -150,21 +185,22 @@ def tp_distribution(**values):
     return _tp_distribution_cached(config)
 
 
+@lru_cache(maxsize=32768)
+def _expected_rounds_cached(distribution, remaining):
+    """Cache the compiled recurrence for repeated gear/TP configurations."""
+    if remaining <= 0:
+        return 0.0
+    tp_values = np.asarray([int(tp) for tp, _ in distribution], dtype=np.int64)
+    probabilities = np.asarray([float(probability) for _, probability in distribution], dtype=np.float64)
+    return float(_expected_rounds_kernel(tp_values, probabilities, int(remaining)))
+
+
 def expected_rounds(distribution, starting_tp, target_tp):
     """Expected complete rounds to reach target TP for an iid TP distribution."""
     remaining = max(0, int(round(float(target_tp) - float(starting_tp))))
     if remaining <= 0:
         return 0.0
-    zero_probability = sum(probability for tp, probability in distribution if tp <= 0)
-    if zero_probability >= 1.0 - 1e-12:
-        return float("inf")
-    values = [0.0] * (remaining + 1)
-    positive = [(int(tp), probability) for tp, probability in distribution if tp > 0 and probability > 0]
-    for needed in range(1, remaining + 1):
-        values[needed] = (
-            1.0 + sum(probability * values[max(0, needed - tp)] for tp, probability in positive)
-        ) / (1.0 - zero_probability)
-    return values[remaining]
+    return _expected_rounds_cached(tuple(distribution), remaining)
 
 
 def time_to_ws_breakdown(*, starting_tp, target_tp, round_seconds, regain_per_round=0.0, **config):

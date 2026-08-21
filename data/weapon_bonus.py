@@ -6,6 +6,7 @@ Author: Kastra (Asura server)
 from engine.get_dex_crit import *
 import numpy as np
 import re
+from functools import lru_cache
 
 
 def _weapon_bonus_keys(name):
@@ -24,7 +25,15 @@ def _weapon_bonus_keys(name):
         keys.append(base)
     return keys
 
+@lru_cache(maxsize=4096)
 def get_weapon_bonus(main_wpn_name, rng_wpn_name, ws_name):
+    """Return the weapon-specific WS bonus, reusing repeated lookups.
+
+    ``average_ws`` evaluates many gearsets that share the same main weapon,
+    ranged weapon, and WS.  The bonus table is immutable, but it used to be
+    rebuilt and searched on every call.  Keep the public function signature
+    unchanged while memoizing the pure lookup.
+    """
 
     weapon_skill_bonuses = {
 

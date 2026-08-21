@@ -9,6 +9,7 @@ Author: Kastra (Asura server)
 import matplotlib.pyplot as plt
 import numpy as np
 import random
+from concurrent.futures import ProcessPoolExecutor, wait
 from engine.get_hit_rate import get_hit_rate
 from data.weaponskill_info import weaponskill_info
 from engine.get_ma_rate import get_ma_rate3
@@ -22,6 +23,143 @@ from engine.get_dint_m_v import *
 from engine.get_delay_timing import *
 from engine.attack_round_model import time_to_ws_breakdown
 from engine.equipment_rules import ranged_attack_ready
+from engine.numba_compat import njit
+
+
+@njit(cache=True)
+def _average_ws_melee_average_core(
+        main_dmg, fstr_main, sub_dmg, fstr_sub, wsc, ftp, ftp2,
+        main_hits, sub_hits, player_attack1, player_attack2,
+        main_skill_type, sub_skill_type, pdl_trait, pdl_gear,
+        enemy_defense, crit_rate, first_main_hit_crit_rate,
+        striking_crit_rate,
+        crit_dmg, adjusted_crit_dmg, wsd, ws_bonus, ws_trait,
+        sneak_attack_bonus, trick_attack_bonus, climactic_flourish_bonus,
+        striking_flourish_bonus, ternary_flourish_bonus, striking_flourish,
+        hit_rate11, hit_rate21, mdelay, stp, base_tp,
+        fotia_gorget, fotia_belt, conserve_tp,
+):
+    """Compile the repeated numeric portion of an average melee WS.
+
+    The surrounding WS rules remain in Python because they select the WS and
+    job-specific formulas.  Once those inputs are resolved, this core only
+    performs numeric pDIF, damage, and TP-return work and is shared by every
+    candidate in a deterministic optimizer pass.
+    """
+    main_hit_pdif = get_avg_pdif_melee(
+        player_attack1, main_skill_type, pdl_trait, pdl_gear,
+        enemy_defense, crit_rate,
+    )
+    main_hit_damage = get_avg_phys_damage(
+        main_dmg, fstr_main, wsc, main_hit_pdif, ftp2, crit_rate,
+        crit_dmg, 0, ws_bonus, ws_trait,
+    )
+    physical_damage = main_hits * main_hit_damage
+
+    first_main_hit_pdif = get_avg_pdif_melee(
+        player_attack1, main_skill_type, pdl_trait, pdl_gear,
+        enemy_defense, first_main_hit_crit_rate,
+    )
+    first_main_hit_damage = get_avg_phys_damage(
+        main_dmg, fstr_main, wsc, first_main_hit_pdif, ftp,
+        first_main_hit_crit_rate, adjusted_crit_dmg, wsd, ws_bonus,
+        ws_trait, sneak_attack_bonus, trick_attack_bonus,
+        climactic_flourish_bonus, striking_flourish_bonus,
+        ternary_flourish_bonus,
+    )
+    hybrid_first_hit_damage = first_main_hit_damage * hit_rate11
+    physical_damage += (
+        first_main_hit_damage * hit_rate11
+        - main_hit_damage * hit_rate11
+    )
+
+    if striking_flourish:
+        striking_flourish_pdif1 = get_avg_pdif_melee(
+            player_attack1, main_skill_type, pdl_trait, pdl_gear,
+            enemy_defense, striking_crit_rate,
+        )
+        striking_flourish_da_damage = get_avg_phys_damage(
+            main_dmg, fstr_main, wsc, striking_flourish_pdif1, ftp2,
+            striking_crit_rate, crit_dmg, 0, ws_bonus, ws_trait,
+        )
+        physical_damage += (
+            striking_flourish_da_damage - main_hit_damage
+        ) * hit_rate11
+
+    if sub_hits > 0:
+        offhand_pdif = get_avg_pdif_melee(
+            player_attack2, sub_skill_type, pdl_trait, pdl_gear,
+            enemy_defense, crit_rate,
+        )
+        offhand_damage = get_avg_phys_damage(
+            sub_dmg, fstr_sub, wsc, offhand_pdif, ftp2, crit_rate,
+            crit_dmg, 0, ws_bonus, ws_trait,
+        )
+        physical_damage += offhand_damage * sub_hits
+
+    first_delay = mdelay / 2.0 if main_skill_type == "Hand-to-Hand" else mdelay
+    if first_delay <= 180.0:
+        base_delay_tp = int(61.0 + (first_delay - 180.0) * 63.0 / 360.0)
+    elif first_delay <= 540.0:
+        base_delay_tp = int(61.0 + (first_delay - 180.0) * 88.0 / 360.0)
+    elif first_delay <= 630.0:
+        base_delay_tp = int(149.0 + (first_delay - 540.0) * 20.0 / 360.0)
+    elif first_delay <= 720.0:
+        base_delay_tp = int(154.0 + (first_delay - 630.0) * 28.0 / 360.0)
+    elif first_delay <= 900.0:
+        base_delay_tp = int(161.0 + (first_delay - 720.0) * 24.0 / 360.0)
+    else:
+        base_delay_tp = int(173.0 + (first_delay - 900.0) * 28.0 / 360.0)
+    tp_return = (hit_rate11 + hit_rate21) * int(base_delay_tp * (1.0 + stp))
+    tp_return += 10.0 * (1.0 + stp) * (
+        main_hits + sub_hits - hit_rate11 - hit_rate21
+    )
+    tp_return += base_tp * fotia_gorget * fotia_belt
+    tp_return += 95.0 * min(1.0, conserve_tp)
+
+    return physical_damage, hybrid_first_hit_damage, tp_return
+
+
+@njit(cache=True)
+def _average_ws_ranged_average_core(
+        ranged_damage, fstr_ranged, wsc, avg_pdif, ftp, ftp2,
+        crit_rate, crit_damage, wsd, ws_bonus, ws_trait,
+        hover_shot, true_shot, hit_rate_first, hit_rate_other, hits,
+        ranged_delay, ammo_delay, store_tp,
+):
+    """Compile the numeric portion of a deterministic ranged WS average."""
+    first_damage = get_avg_phys_damage(
+        ranged_damage, fstr_ranged, wsc, avg_pdif, ftp, crit_rate,
+        crit_damage, wsd, ws_bonus, ws_trait,
+    ) * (1.0 + hover_shot)
+    other_damage = get_avg_phys_damage(
+        ranged_damage, fstr_ranged, wsc, avg_pdif, ftp2, crit_rate,
+        crit_damage, 0, ws_bonus, ws_trait,
+    ) * (1.0 + hover_shot)
+
+    physical_damage = (
+        first_damage * hit_rate_first
+        + other_damage * hit_rate_other * (hits - 1)
+    ) * (1.0 + true_shot)
+    hybrid_first_hit_damage = first_damage * hit_rate_first * (1.0 + true_shot)
+
+    delay = ranged_delay + ammo_delay
+    if delay <= 180.0:
+        base_delay_tp = int(61.0 + (delay - 180.0) * 63.0 / 360.0)
+    elif delay <= 540.0:
+        base_delay_tp = int(61.0 + (delay - 180.0) * 88.0 / 360.0)
+    elif delay <= 630.0:
+        base_delay_tp = int(149.0 + (delay - 540.0) * 20.0 / 360.0)
+    elif delay <= 720.0:
+        base_delay_tp = int(154.0 + (delay - 630.0) * 28.0 / 360.0)
+    elif delay <= 900.0:
+        base_delay_tp = int(161.0 + (delay - 720.0) * 24.0 / 360.0)
+    else:
+        base_delay_tp = int(173.0 + (delay - 900.0) * 28.0 / 360.0)
+    tp_return = hit_rate_first * int(base_delay_tp * (1.0 + store_tp))
+    tp_return += 10.0 * (1.0 + store_tp) * (hits - 1) * hit_rate_other
+    return physical_damage, hybrid_first_hit_damage, tp_return
+
 
 def color_text(color, text):
     #
@@ -272,7 +410,7 @@ def run_simulation(player_tp, player_ws, enemy, ws_threshold, ws_name, ws_type,
 
 
 def simulate_ws_distribution(player, enemy, ws_name, input_tp, ws_type, *, seed=None, samples=20000,
-                             stop_event=None):
+                             stop_event=None, workers=1):
     """Return a compact, reproducible WS distribution summary."""
     state = np.random.get_state()
     python_state = random.getstate()
@@ -281,16 +419,41 @@ def simulate_ws_distribution(player, enemy, ws_name, input_tp, ws_type, *, seed=
             normalized_seed = int(seed) & 0xFFFFFFFF
             np.random.seed(normalized_seed)
             random.seed(normalized_seed)
-        damage = []
-        for _ in range(max(1, int(samples))):
-            if stop_event is not None and stop_event.is_set():
-                raise SimulationStopped("Weapon-skill distribution stopped by user.")
-            output = average_ws(
-                player, enemy, ws_name, input_tp, ws_type, "Damage dealt",
-                simulation=True, single=True, verbose=False,
-            )
-            damage.append(float(output[0]))
-        values = np.asarray(damage, dtype=float)
+        sample_count = max(1, int(samples))
+        worker_count = max(1, min(int(workers or 1), sample_count))
+        if worker_count == 1:
+            values = np.empty(sample_count, dtype=float)
+            for index in range(sample_count):
+                if stop_event is not None and stop_event.is_set():
+                    raise SimulationStopped("Weapon-skill distribution stopped by user.")
+                output = average_ws(
+                    player, enemy, ws_name, input_tp, ws_type, "Damage dealt",
+                    simulation=True, single=True, verbose=False,
+                )
+                values[index] = float(output[0])
+        else:
+            chunk_sizes = [sample_count // worker_count] * worker_count
+            for index in range(sample_count % worker_count):
+                chunk_sizes[index] += 1
+            seed_values = np.random.SeedSequence(seed).generate_state(worker_count)
+            requests = []
+            for chunk_seed, chunk_size in zip(seed_values, chunk_sizes):
+                requests.append((
+                    player, enemy, ws_name, input_tp, ws_type,
+                    int(chunk_seed), int(chunk_size),
+                ))
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(_simulate_ws_distribution_chunk, request) for request in requests]
+                pending = set(futures)
+                chunks = []
+                while pending:
+                    done, pending = wait(pending, timeout=0.25)
+                    if stop_event is not None and stop_event.is_set():
+                        for future in pending:
+                            future.cancel()
+                        raise SimulationStopped("Weapon-skill distribution stopped by user.")
+                    chunks.extend(future.result() for future in done)
+            values = np.concatenate(chunks) if chunks else np.empty(0, dtype=float)
         if not np.all(np.isfinite(values)):
             raise ValueError("Weapon-skill distribution produced a non-finite damage value.")
         counts, edges = np.histogram(values, bins=min(160, max(20, int(np.sqrt(len(values))))))
@@ -307,6 +470,21 @@ def simulate_ws_distribution(player, enemy, ws_name, input_tp, ws_type, *, seed=
     finally:
         np.random.set_state(state)
         random.setstate(python_state)
+
+
+def _simulate_ws_distribution_chunk(request):
+    """Evaluate one independent WS sample block in a worker process."""
+    player, enemy, ws_name, input_tp, ws_type, seed, samples = request
+    np.random.seed(int(seed) & 0xFFFFFFFF)
+    random.seed(int(seed) & 0xFFFFFFFF)
+    values = np.empty(int(samples), dtype=float)
+    for index in range(int(samples)):
+        output = average_ws(
+            player, enemy, ws_name, input_tp, ws_type, "Damage dealt",
+            simulation=True, single=True, verbose=False,
+        )
+        values[index] = float(output[0])
+    return values
 
 def average_attack_round(player, enemy, starting_tp, ws_threshold, input_metric, simulation=False, verbose=False):
     #
@@ -1893,21 +2071,22 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
     oa3_sub = player.stats.get("OA3 sub",0)/100
     oa2_sub = player.stats.get("OA2 sub",0)/100
 
-    oa_list = np.array([player.stats.get("OA3 main",0),
-            player.stats.get("OA2 main",0),
-            player.stats.get("OA8 sub",0),
-            player.stats.get("OA7 sub",0),
-            player.stats.get("OA6 sub",0),
-            player.stats.get("OA5 sub",0),
-            player.stats.get("OA4 sub",0),
-            player.stats.get("OA3 sub",0),
-            player.stats.get("OA2 sub",0),
-            ])/100
+    oa_list = (
+        player.stats.get("OA3 main",0) / 100,
+        player.stats.get("OA2 main",0) / 100,
+        player.stats.get("OA8 sub",0) / 100,
+        player.stats.get("OA7 sub",0) / 100,
+        player.stats.get("OA6 sub",0) / 100,
+        player.stats.get("OA5 sub",0) / 100,
+        player.stats.get("OA4 sub",0) / 100,
+        player.stats.get("OA3 sub",0) / 100,
+        player.stats.get("OA2 sub",0) / 100,
+    )
 
     # Follow-up attack does not apply to weapon skills, so we hard-code zero here. The TP function uses actual values
     fua_main = 0
     fua_sub = 0
-    fua_list = np.array([fua_main, fua_sub])
+    fua_list = (fua_main, fua_sub)
 
     pdl_gear = player.stats.get("PDL",0)/100
     pdl_trait = player.stats.get("PDL Trait",0)/100
@@ -2007,37 +2186,26 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
 
             # Now calculate damage dealt for these hits.
             # I calculate Hand-to-Hand off-hand attack using STR/2 instead of STR in the player class code, which lowers damage by a few % when compared to attack2 = attack1. I keep attack2 = attack1 in this main code for now.
+            # Compile the repeated numeric portion of the average WS.
+            striking_flourish_crit_rate = min(
+                1.0, crit_rate + striking_crit_rate * (crit_rate > 0)
+            )
             player_attack2 = player_attack1 if main_skill_type == "Hand-to-Hand" else player_attack2
-
-            # Calculate how much damage the main hits would do if they were treated as sub-hits.
-            main_hit_pdif = get_avg_pdif_melee(player_attack1, main_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
-            main_hit_damage = get_avg_phys_damage(main_dmg, fstr_main, wsc, main_hit_pdif, ftp2, crit_rate, crit_dmg, 0, ws_bonus, ws_trait) # Using FTP2, WSD=0, etc
-            physical_damage += main_hits*main_hit_damage
-
-            # Calculate the correction to the first hit based on the full set of buffs and bonuses.
-            first_main_hit_pdif = get_avg_pdif_melee(player_attack1, main_skill_type, pdl_trait, pdl_gear, enemy_defense, first_main_hit_crit_rate)
-            first_main_hit_damage = get_avg_phys_damage(main_dmg, fstr_main, wsc, first_main_hit_pdif, ftp, first_main_hit_crit_rate, adjusted_crit_dmg, wsd, ws_bonus, ws_trait, sneak_attack_bonus, trick_attack_bonus, climactic_flourish_bonus, striking_flourish_bonus, ternary_flourish_bonus)
-            hybrid_first_hit_damage = first_main_hit_damage*hit_rate11
-
-            # Adds the extra damage gained by those bonuses to the first hit's damage.
-            physical_damage += (first_main_hit_damage*hit_rate11 - main_hit_damage*hit_rate11)
-
-            # Striking Flourish also boosts the crit rate for its double attack hit, but doesn't provide the +100% CHR bonus (probably)
-            if striking_flourish:
-                # Define a new crit rate that adds 70% only if crit_rate>0 already (only for critical hit WSs)
-                striking_flourish_crit_rate = crit_rate + striking_crit_rate*(crit_rate>0) # This crit_rate>0 ensures I am not letting non-crit WSs crit.
-                striking_flourish_crit_rate = striking_flourish_crit_rate if striking_flourish_crit_rate < 1.0 else 1.0
-                striking_flourish_pdif1 = get_avg_pdif_melee(player_attack1, main_skill_type, pdl_trait, pdl_gear, enemy_defense, striking_flourish_crit_rate)
-                striking_flourish_DA_damage = get_avg_phys_damage(main_dmg, fstr_main, wsc, striking_flourish_pdif1, ftp2, striking_flourish_crit_rate, crit_dmg, 0, ws_bonus, ws_trait)
-                physical_damage += (striking_flourish_DA_damage - main_hit_damage)*hit_rate11 # Add on the difference in damage from a 2nd hit with higher crit.
-
-            # Single-wield sets have no valid off-hand weapon skill type.
-            # Avoid evaluating an unused pDIF value for their zero off-hand
-            # hits; Hand-to-Hand and true dual-wield sets still use this path.
-            if sub_hits > 0:
-                offhand_pdif = get_avg_pdif_melee(player_attack2, sub_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
-                offhand_damage = get_avg_phys_damage(sub_dmg, fstr_sub, wsc, offhand_pdif, ftp2, crit_rate, crit_dmg, 0, ws_bonus, ws_trait)
-                physical_damage += offhand_damage*sub_hits
+            physical_damage, hybrid_first_hit_damage, tp_return = _average_ws_melee_average_core(
+                main_dmg, fstr_main, sub_dmg, fstr_sub, wsc, ftp, ftp2,
+                main_hits, sub_hits, player_attack1, player_attack2,
+                main_skill_type, sub_skill_type, pdl_trait, pdl_gear,
+                enemy_defense, crit_rate, first_main_hit_crit_rate,
+                striking_flourish_crit_rate, crit_dmg, adjusted_crit_dmg,
+                wsd, ws_bonus, ws_trait, sneak_attack_bonus,
+                trick_attack_bonus, climactic_flourish_bonus,
+                striking_flourish_bonus, ternary_flourish_bonus,
+                striking_flourish, hit_rate11, hit_rate21, mdelay, stp,
+                base_tp,
+                0.01 * (player.gearset["neck"]["Name"] == "Fotia Gorget"),
+                0.01 * (player.gearset["waist"]["Name"] == "Fotia Belt"),
+                min(1, player.stats.get("Conserve TP", 0) / 100),
+            )
 
             # print("------------------------------------------------------")
             # print("first_main_hit: ",player_attack1, main_skill_type, first_main_hit_pdif, first_main_hit_damage,main_hits,hit_rate11,hit_rate12,accuracy1,ftp)
@@ -2045,16 +2213,6 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
             # print("offhand: ",player_attack2, sub_skill_type, offhand_pdif, offhand_damage,sub_hits,hit_rate21,hit_rate22,accuracy2,ftp2)
             # print("stats: ",wsd,ws_trait,ws_bonus,crit_rate,crit_dmg,player.stats["DEX"],player.stats["STR"])
         
-            # Calculate melee WS TP return.
-            tp_return += get_tp(hit_rate11, mdelay/2 if (main_skill_type == "Hand-to-Hand") else mdelay, stp) # Calculate TP return from the first main hit, which gains full TP. H2H hits each use half of the total mdelay for TP return, but time between attack rounds is still the same full mdelay.
-            tp_return += get_tp(hit_rate21, mdelay/2 if (main_skill_type == "Hand-to-Hand") else mdelay, stp) # Add TP return from the first off-hand hit, which also gains the full TP amount
-
-            # Add TP return from the remaining main+off-hand hits together. All of these hits simply gain 10*(1+stp) TP
-            tp_return += 10*(1+stp)*(main_hits+sub_hits - hit_rate11 - hit_rate21) # main_hits and sub_hits already account for hit rates, so we only subtract off the number of first main+sub hits.
-            tp_return += (base_tp)*(0.01*(player.gearset["neck"]["Name"]=="Fotia Gorget"))*(0.01*(player.gearset["waist"]["Name"]=="Fotia Belt")) # Fotia gorget/belt each include +1% chance to retain TP on WS (before TP bonus)
-            
-            # Conserve TP procs return a random amount of TP between 10 and 200 (https://www.bg-wiki.com/ffxi/Conserve_TP). Here I assume the returned TP is uniformly distributed, which matches the testing linked on BG Wiki.
-            tp_return += 95 * min(1,player.stats.get("Conserve TP",0)/100)
 
 
         else: # Run a proper damage simulation for the weapon skill
@@ -2458,17 +2616,14 @@ def average_ws(player, enemy, ws_name, input_tp, ws_type, input_metric, simulati
             # Calculate average ranged damage
             avg_pdif_rng = get_avg_pdif_ranged(player_rangedattack, ranged_skill_type, pdl_trait, pdl_gear, enemy_defense, crit_rate)
 
-            ranged_hit_damage = get_avg_phys_damage(ranged_dmg+ammo_dmg, fstr_rng, wsc, avg_pdif_rng, ftp,  crit_rate, crit_dmg, wsd, ws_bonus, ws_trait) * (1 + hover_shot) # The amount of damage done by the first hit of the WS if it does not miss
-            ranged_hit_damage2 = get_avg_phys_damage(ranged_dmg+ammo_dmg, fstr_rng, wsc, avg_pdif_rng, ftp2,  crit_rate, crit_dmg, 0, ws_bonus, ws_trait) * (1 + hover_shot) # Ranged hits after the first main hit (ie Jishnu's Radiance is a 3-hit Ranged WS.)
-            hybrid_first_hit_damage = ranged_hit_damage*hit_rate_ranged1*(1 + true_shot)
-
-            physical_damage += ranged_hit_damage*hit_rate_ranged1 + ranged_hit_damage2*hit_rate_ranged2*(nhits-1)
-            physical_damage *= (1 + true_shot)
-
-            # Calculate Ranged WS TP return.
-            tp_return = 0
-            tp_return += get_tp(hit_rate_ranged1, ranged_delay+ammo_delay, stp) # First main shot TP
-            tp_return += 10*(1+stp)*(nhits-1)*hit_rate_ranged2 # TP from other ranged WS hits get 10*(1+stp) TP
+            ranged_physical, hybrid_first_hit_damage, ranged_tp = _average_ws_ranged_average_core(
+                ranged_dmg + ammo_dmg, fstr_rng, wsc, avg_pdif_rng, ftp, ftp2,
+                crit_rate, crit_dmg, wsd, ws_bonus, ws_trait,
+                hover_shot, true_shot, hit_rate_ranged1, hit_rate_ranged2,
+                nhits, ranged_delay, ammo_delay, stp,
+            )
+            physical_damage += ranged_physical
+            tp_return = ranged_tp
 
         else:
 

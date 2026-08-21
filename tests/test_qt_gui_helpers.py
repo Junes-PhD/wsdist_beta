@@ -19,6 +19,7 @@ from app.qt_gui_main import (
     _normalized_search_quality, _reference_enemy_names, _search_quality_settings,
     _item_job_eligible,
     _run_overnight_cache_task, _ws_distribution_chart_data,
+    _ws_tp_time_chart_data,
     item_tooltip, magic_damage_spell_choices, weapon_skill_choices,
 )
 from persistence.simulation_cache import SimulationCache
@@ -206,6 +207,17 @@ class ProfileReportHelperTests(unittest.TestCase):
         self.assertEqual(set(chart), {"total", "tp", "ws"})
         self.assertEqual(chart["total"][0].tolist(), [1.0, 7200.0])
         self.assertIsNone(_dps_series_chart_data({"dps_series": {}}))
+
+    def test_fixed_ws_tp_time_chart_uses_damage_per_time_with_tp_on_x_axis(self):
+        chart = _ws_tp_time_chart_data([
+            (1000, 10000, 10),
+            (2000, 15000, 20),
+            (3000, 20000, 0),
+        ])
+        self.assertEqual(chart, [
+            (1000.0, 1000.0, 10000.0, 10.0),
+            (2000.0, 750.0, 15000.0, 20.0),
+        ])
 
     def test_optimizer_running_state_is_explicit(self):
         self.assertEqual(OPTIMIZER_STATE_LABELS["running"], "SIMULATION RUNNING")

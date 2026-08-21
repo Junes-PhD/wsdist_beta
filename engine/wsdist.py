@@ -36,6 +36,11 @@ from engine.equipment_rules import apply_weapon_slot_rules, has_conditional_set_
 
 
 OPTIMIZER_RESULT_LIMIT = 50
+_WEAPON_SLOTS = frozenset(("main", "sub", "ranged", "ammo"))
+_HAND_SLOTS = frozenset(("main", "sub"))
+_RANGED_SLOTS = frozenset(("ranged", "ammo"))
+_EAR_SLOTS = frozenset(("ear1", "ear2"))
+_RING_SLOTS = frozenset(("ring1", "ring2"))
 
 
 class OptimizerStopped(RuntimeError):
@@ -247,10 +252,22 @@ def _prepare_candidates(check_gear, main_job, ws_type):
 def estimate_candidate_checks(check_gear, main_job, ws_type="None"):
     """Estimate raw one/two-slot candidates in one optimizer pass."""
     candidates = _prepare_candidates(check_gear, main_job.lower(), ws_type)
-    counts = [len(items) for items in candidates.values()]
+    counts = [len(candidates[slot]) for slot in _candidate_work_slots(candidates)]
     return sum(counts) + sum(
         left * right for index, left in enumerate(counts) for right in counts[index + 1:]
     )
+
+
+def _candidate_work_slots(check_gear):
+    """Return slots that can produce a different neighbor from the baseline.
+
+    A locked slot is represented by a one-item candidate list. It still has
+    to be copied into the starting set, but pairing it with every other slot
+    only recreates a baseline duplicate that is rejected later.
+    """
+    nonempty = [slot for slot, items in check_gear.items() if items]
+    variable = [slot for slot in nonempty if len(check_gear[slot]) > 1]
+    return variable or nonempty
 
 
 # Items whose help text forces other armor slots empty.  The bridge parser also
@@ -303,11 +320,19 @@ def forced_empty_slots(item):
     return blocked
 
 
-def apply_forced_empty_slots(gearset):
+def apply_forced_empty_slots(gearset, forced_empty_cache=None):
     """Apply all equipped-item slot restrictions and return slots changed."""
     blocked = set()
     for item in gearset.values():
-        blocked.update(forced_empty_slots(item))
+        if forced_empty_cache is None:
+            blocked.update(forced_empty_slots(item))
+        else:
+            key = id(item)
+            cached = forced_empty_cache.get(key)
+            if cached is None:
+                cached = forced_empty_slots(item)
+                forced_empty_cache[key] = cached
+            blocked.update(cached)
     changed = set()
     for slot in blocked:
         if slot in gearset and gearset[slot].get("Name") != "Empty":
@@ -738,7 +763,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
             evaluation_cache.move_to_end(key)
             return cached
         evaluation_cache_misses += 1
-        player = create_player(main_job, sub_job, master_level, gearset, buffs, abilities)
+        player = get_cached_player(main_job, sub_job, master_level, gearset, buffs, abilities)
         if action_type == "weapon skill":
             metric_base, output = average_ws(player, enemy, ws_name, min_tp, ws_type, input_metric)
             metric = metric_base ** output[-1]
@@ -910,11 +935,17 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
     check_gear = _prepare_candidates(check_gear, main_job, ws_type)
     for items in check_gear.values():
         rng.shuffle(items)
-    candidate_counts = [len(items) for items in check_gear.values()]
+    work_slots = _candidate_work_slots(check_gear)
+    candidate_counts = [len(check_gear[slot]) for slot in work_slots]
     estimated_checks = sum(candidate_counts) + sum(
         left * right for index, left in enumerate(candidate_counts)
         for right in candidate_counts[index + 1:]
     )
+    forced_empty_cache = {
+        id(item): forced_empty_slots(item)
+        for items in check_gear.values()
+        for item in items
+    }
 
     # Rather than start with an empty slot, randomly build a set from the selected gear so we likely start with some accuracy+ and avoid getting stuck.
     # Do not adjust slots that are not being checked.
@@ -946,7 +977,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                     and not duplicate_allowed(starting_gearset["ear2"])):
                 starting_gearset["ear2"] = Empty
 
-    apply_forced_empty_slots(starting_gearset)
+    apply_forced_empty_slots(starting_gearset, forced_empty_cache)
     apply_weapon_slot_rules(starting_gearset, main_job, sub_job, master_level)
     # Do not let the random starting point contain two +1000 TP Bonus weapons.
     # The candidate loop applies the same rule to every later swap.
@@ -1110,7 +1141,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
 
             # Randomize slot order per pass. Item order is randomized once per
             # restart; reshuffling it for every pair only consumed CPU.
-            check_slots = np.array([k for k in check_gear])
+            check_slots = np.array(work_slots)
             rng.shuffle(check_slots)
 
             # For now, the code will only support two simultaneous swaps. Adding a third requires only adding a new for loop, but it adds a significant amount of computation time.
@@ -1163,7 +1194,9 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             # Equip the items and check that the test_set is valid.
                             test_set[slot1] = item1
                             test_set[slot2] = item2
-                            forced_empty = apply_forced_empty_slots(test_set)
+                            forced_empty = apply_forced_empty_slots(
+                                test_set, forced_empty_cache
+                            )
                             # A candidate forcibly removed by another equipped
                             # piece would only duplicate an already-valid empty
                             # slot state, so skip that redundant combination.
@@ -1171,27 +1204,40 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                                     or (slot2 in forced_empty and item2.get("Name") != "Empty")):
                                 continue
 
-                            weapon_empty = apply_weapon_slot_rules(
-                                test_set, main_job, sub_job, master_level,
-                            )
-                            if ((slot1 in weapon_empty and item1.get("Name") != "Empty")
-                                    or (slot2 in weapon_empty and item2.get("Name") != "Empty")):
-                                continue
+                            weapon_changed = slot1 in _WEAPON_SLOTS or slot2 in _WEAPON_SLOTS
+                            if weapon_changed:
+                                weapon_empty = apply_weapon_slot_rules(
+                                    test_set, main_job, sub_job, master_level,
+                                )
+                                if ((slot1 in weapon_empty and item1.get("Name") != "Empty")
+                                        or (slot2 in weapon_empty and item2.get("Name") != "Empty")):
+                                    continue
 
                             # A bow/crossbow/gun is never a valid candidate
                             # with a non-projectile or mismatched projectile,
                             # even for a melee/TP search where no shot is fired.
-                            if not ranged_pair_compatible(test_set):
+                            ranged_changed = slot1 in _RANGED_SLOTS or slot2 in _RANGED_SLOTS
+                            if ranged_changed and not ranged_pair_compatible(test_set):
                                 continue
 
 
-                            if (test_set["ring1"]==test_set["ring2"]) and (test_set["ring1"]["Name"]!="Empty") and not duplicate_allowed(test_set["ring1"]):
+                            rings_changed = slot1 in _RING_SLOTS or slot2 in _RING_SLOTS
+                            ears_changed = slot1 in _EAR_SLOTS or slot2 in _EAR_SLOTS
+                            if (rings_changed and test_set["ring1"]==test_set["ring2"]
+                                    and test_set["ring1"]["Name"]!="Empty"
+                                    and not duplicate_allowed(test_set["ring1"])):
                                 continue
-                            if (test_set["ear1"]==test_set["ear2"]) and (test_set["ear1"]["Name"]!="Empty") and not duplicate_allowed(test_set["ear1"]):
+                            if (ears_changed and test_set["ear1"]==test_set["ear2"]
+                                    and test_set["ear1"]["Name"]!="Empty"
+                                    and not duplicate_allowed(test_set["ear1"])):
                                 continue
-                            if (test_set["main"]==test_set["sub"]) and (test_set["main"]["Name"]!="Empty") and not duplicate_allowed(test_set["main"]):
+                            if (slot1 in _HAND_SLOTS or slot2 in _HAND_SLOTS) and (
+                                    test_set["main"]==test_set["sub"]
+                                    and test_set["main"]["Name"]!="Empty"
+                                    and not duplicate_allowed(test_set["main"])):
                                 continue
-                            if duplicate_tp_bonus_weapon(test_set["main"], test_set["sub"]):
+                            if ((slot1 in _HAND_SLOTS or slot2 in _HAND_SLOTS)
+                                    and duplicate_tp_bonus_weapon(test_set["main"], test_set["sub"])):
                                 continue
                             #print("test1")
 
@@ -1199,38 +1245,45 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
                             # pair.  Other actions may retain stat ammo without
                             # firing it, but the shared slot rules have already
                             # removed impossible pairings.
-                            if ((ws_action and ws_type == "ranged")
-                                    or (action_type == "spell cast" and spell_name == "Ranged Attack")):
+                            if (ranged_changed and ((ws_action and ws_type == "ranged")
+                                    or (action_type == "spell cast" and spell_name == "Ranged Attack"))):
                                 if not ranged_attack_ready(test_set):
                                     continue
 
                             # Do not equip Balder Earring +1 and the JSE +2 ears at the same time. They both only work if in the right ear.
-                            if (test_set["ear1"]["Name"] in jse_ears) and (test_set["ear2"]["Name"]=="Balder Earring +1"):
+                            if (ears_changed and test_set["ear1"]["Name"] in jse_ears
+                                    and test_set["ear2"]["Name"]=="Balder Earring +1"):
                                 continue
-                            if (test_set["ear2"]["Name"] in jse_ears) and (test_set["ear1"]["Name"]=="Balder Earring +1"):
+                            if (ears_changed and test_set["ear2"]["Name"] in jse_ears
+                                    and test_set["ear1"]["Name"]=="Balder Earring +1"):
                                 continue
                             #print("test11")
 
                             # "Cannot equip headgear" armor is checked here.
-                            if (test_set["body"]["Name"] in ["Cohort Cloak","Cohort Cloak +1","Crepuscular Cloak","Twilight Cloak"]) and (test_set["head"]["Name"]!="Empty"):
+                            if ((slot1 in {"body", "head"} or slot2 in {"body", "head"})
+                                    and test_set["body"]["Name"] in ["Cohort Cloak","Cohort Cloak +1","Crepuscular Cloak","Twilight Cloak"]
+                                    and test_set["head"]["Name"]!="Empty"):
                                 continue
                             #print("test12")
 
                             # Impact can only be casted with Twilight Cloak or Crepuscular Cloak
-                            if action_type == "spell cast":
+                            if action_type == "spell cast" and (slot1 == "body" or slot2 == "body"):
                                 if (spell_name=="Impact") and (test_set["body"]["Name"] not in ["Crepuscular Cloak","Twilight Cloak"]):
                                     continue
                             #print("test13")
 
                             if ws_action:
                                 # Some weapon skills can only be used with certain weapons.
-                                if ws_name in restricted_ws:
+                                if ((slot1 in {"main", "ranged"} or slot2 in {"main", "ranged"})
+                                        and ws_name in restricted_ws):
                                     if (restricted_ws[ws_name]!=test_set["main"]["Name"]) and (restricted_ws[ws_name]!=test_set["ranged"]["Name"]):
                                         continue
                                 #print("test14")
 
                                 # Reject sets if their main-hand weapon or ranged weapon can't use the selected weapon skill.
-                                if (ws_name not in ws_dict.get(test_set["main"]["Skill Type"],[])) and (ws_name not in ws_dict.get(test_set["ranged"]["Skill Type"],[])):
+                                if ((slot1 in {"main", "ranged"} or slot2 in {"main", "ranged"})
+                                        and (ws_name not in ws_dict.get(test_set["main"]["Skill Type"],[]))
+                                        and (ws_name not in ws_dict.get(test_set["ranged"]["Skill Type"],[]))):
                                     continue
                                 #print("test15")
                             
@@ -1482,7 +1535,7 @@ def build_set(main_job, sub_job, master_level, buffs, abilities, enemy, ws_name,
         best_set["ear1"],best_set["ear2"] = best_set["ear2"],best_set["ear1"]
 
     # Record the stats for the best gear set.
-    best_player = create_player(main_job, sub_job, master_level, best_set, buffs, abilities)
+    best_player = get_cached_player(main_job, sub_job, master_level, best_set, buffs, abilities)
     actual_pdt, actual_mdt = calculate_damage_taken(
         best_set, buffs, abilities, damage_taken_item_cache
     )
@@ -1771,7 +1824,7 @@ def _optimize_single_run_parallel(main_job, sub_job, master_level, buffs, abilit
         if _stop_requested(stop_event):
             raise OptimizerStopped("Optimizer stopped by user.", results=_unique_ranked_results(history))
 
-    slot_names = sorted(check_gear)
+    slot_names = sorted(_candidate_work_slots(check_gear))
     slot_pairs = [
         tuple(sorted((left, right)))
         for index, left in enumerate(slot_names)
@@ -1808,6 +1861,29 @@ def _optimize_single_run_parallel(main_job, sub_job, master_level, buffs, abilit
     history = []
     latest = []
     max_rounds = max(1, int(n_iter))
+    executor = ProcessPoolExecutor(max_workers=worker_count) if worker_count > 1 else None
+
+    def shutdown_executor(*, wait_for_workers=True):
+        nonlocal executor
+        if executor is not None:
+            executor.shutdown(
+                wait=wait_for_workers,
+                cancel_futures=not wait_for_workers,
+            )
+            executor = None
+
+    class _ExecutorLease:
+        def __enter__(self):
+            return executor
+
+        def __exit__(self, exc_type, _exc_value, _traceback):
+            if exc_type is not None:
+                shutdown_executor(wait_for_workers=False)
+            # Keep the pool alive across successful split-search passes.
+            return False
+
+    executor_lease = _ExecutorLease()
+
     shared_args = (
         main_job, sub_job, master_level, buffs, abilities, enemy, ws_name, spell_name,
         action_type, min_tp, check_gear, baseline, pdt_requirement, mdt_requirement,
@@ -1843,7 +1919,7 @@ def _optimize_single_run_parallel(main_job, sub_job, master_level, buffs, abilit
         if worker_count == 1:
             latest = [_build_set_restart_worker(requests[0])]
         else:
-            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            with executor_lease as executor:
                 futures = [executor.submit(_build_set_restart_worker, request) for request in requests]
                 latest = []
                 pending = set(futures)
@@ -1910,6 +1986,7 @@ def _optimize_single_run_parallel(main_job, sub_job, master_level, buffs, abilit
             winner = fallback_ranked[0]
             top_results = _unique_ranked_results(history)
             notify("Search run 1/1 · full-search fallback completed.")
+            shutdown_executor()
             if return_details:
                 result = winner["player"], winner["output"], winner["metric"], winner["seed"]
                 return (*result, top_results) if return_top_results else result
@@ -1925,6 +2002,7 @@ def _optimize_single_run_parallel(main_job, sub_job, master_level, buffs, abilit
         if next_key == previous_key:
             break
 
+    shutdown_executor()
     check_stopped()
     top_results = _unique_ranked_results(history)
     if not top_results:

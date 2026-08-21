@@ -16,6 +16,11 @@ try:
 except ImportError:
     FFXIAH_MODELS = {}
 
+try:
+    from data.polutils_models import POLUTILS_MODELS
+except ImportError:
+    POLUTILS_MODELS = {}
+
 from data.curated_item_models import CURATED_ITEM_MODELS, UNVERIFIED_ITEM_MODELS
 
 
@@ -581,6 +586,36 @@ def _with_ffxiah_model(record: dict) -> dict:
     return enriched
 
 
+def _with_polutils_model(record: dict) -> dict:
+    """Fill missing base gear data from the local FFXI DAT resources."""
+    item_id = int(record.get("item_id") or 0)
+    model = POLUTILS_MODELS.get(str(item_id))
+    if not model:
+        return record
+
+    enriched = deepcopy(record)
+    enriched["name"] = enriched.get("name") or model.get("Name")
+    for key in ("slots_mask", "jobs_mask", "skill"):
+        if not enriched.get(key) and model.get(key) is not None:
+            enriched[key] = model[key]
+    if not enriched.get("weapon_type") and model.get("type") is not None:
+        enriched["weapon_type"] = model["type"]
+    if enriched.get("item_level") in (None, "", 0) and model.get("item_level"):
+        enriched["item_level"] = model["item_level"]
+    if not enriched.get("description") and model.get("description"):
+        enriched["description"] = model["description"]
+
+    # Character-scoped scanner/profile stats already include decoded and manual
+    # augments. Preserve them exactly; POLUtils supplies the base only when
+    # the bridge producer did not provide a model.
+    if not record.get("stats"):
+        enriched["stats"] = deepcopy(model.get("stats") or {})
+        enriched["model_complete"] = bool(model.get("complete"))
+        enriched["stat_source"] = "POLUtils native FFXI DAT resources"
+        enriched["data_source"] = "POLUtils native FFXI DAT resources"
+    return enriched
+
+
 def _with_curated_model(record: dict) -> dict:
     """Fill an incomplete record from a reviewed, source-attributed model."""
     item_id = int(record.get("item_id") or 0)
@@ -763,9 +798,9 @@ class BridgeStore:
         self.catalog = {}
         self.by_slot = {slot: [] for slot in SLOTS}
         for record in self.data.get("items", []):
-            record = _exact_rank_augment(
-                _with_unverified_warning(_with_curated_model(record))
-            )
+            record = _exact_rank_augment(_with_unverified_warning(record))
+            record = _with_polutils_model(record)
+            record = _with_curated_model(record)
             record = _with_ffxiah_model(record)
             item = _with_builtin_model(
                 record, _gear_record(record, hoxne_mastery_rank=self.hoxne_mastery_rank)
@@ -807,9 +842,9 @@ class BridgeStore:
                 continue
             if sorted(map(str, record.get("augments") or [])) != sorted(map(str, item.get("augments") or [])):
                 continue
-            record = _exact_rank_augment(
-                _with_unverified_warning(_with_curated_model(record))
-            )
+            record = _exact_rank_augment(_with_unverified_warning(record))
+            record = _with_polutils_model(record)
+            record = _with_curated_model(record)
             record = _with_ffxiah_model(record)
             return _with_builtin_model(
                 record,

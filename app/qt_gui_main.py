@@ -578,6 +578,24 @@ def _dps_series_chart_data(summary: dict | None) -> dict | None:
         return None
 
 
+def _ws_tp_time_chart_data(points) -> list[tuple[float, float, float, float]] | None:
+    """Normalize fixed-WS TP points to ``(tp, damage/time, damage, time)``."""
+    try:
+        chart = []
+        for tp, damage, elapsed in points or ():
+            tp = float(tp)
+            damage = float(damage)
+            elapsed = float(elapsed)
+            if not all(np.isfinite(value) for value in (tp, damage, elapsed)):
+                continue
+            if tp <= 0 or elapsed <= 0:
+                continue
+            chart.append((tp, damage / elapsed, damage, elapsed))
+        return chart or None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _remaining_time_estimate(samples: list[tuple[float, float]], *,
                              elapsed: float, progress: float) -> float | None:
     """Estimate remaining work from a stable blend of recent and total progress."""
@@ -2242,6 +2260,7 @@ class PlotThread(QThread):
             distribution = actions.simulate_ws_distribution(
                 self.player, self.enemy, self.ws_name, self.tp_value, self.ws_type,
                 seed=self.seed, samples=self.samples, stop_event=self._stop_requested,
+                workers=max(1, min(4, (os.cpu_count() or 2) - 1)),
             )
             if self.reference_enemies:
                 reference_distributions = {}
@@ -2252,6 +2271,7 @@ class PlotThread(QThread):
                         self.player, enemy, self.ws_name, self.tp_value, self.ws_type,
                         seed=(int(self.seed or 0) + offset) & 0xFFFFFFFF,
                         samples=self.samples, stop_event=self._stop_requested,
+                        workers=max(1, min(4, (os.cpu_count() or 2) - 1)),
                     )
                 distribution["reference_distributions"] = reference_distributions
             self.completed.emit(distribution)
@@ -5801,9 +5821,9 @@ class MainWindow(QMainWindow):
         distribution.setMaximumHeight(30)
         distribution.setToolTip("Sample the default 20,000 weapon skills and save the compact histogram to Results.")
         distribution.clicked.connect(self.plot_ws_distribution)
-        self.ws_tp_time_checkbox = QCheckBox("WS damage vs TP/time")
+        self.ws_tp_time_checkbox = QCheckBox("Fixed WS: damage / TP time")
         self.ws_tp_time_checkbox.setToolTip(
-            "Show one fixed WS set's average damage at several TP levels against the time needed to reach each level."
+            "Use one fixed WS set and graph average WS damage divided by the time needed to reach each TP threshold."
         )
         copy_tp_ws = QPushButton("Copy TP → WS")
         copy_tp_ws.clicked.connect(lambda: self.ws_set.set_gearset(self.tp_set.items))
@@ -5824,7 +5844,6 @@ class MainWindow(QMainWindow):
         ws_quick_row = QHBoxLayout()
         ws_quick_row.setSpacing(4)
         ws_quick_row.addWidget(distribution)
-        ws_quick_row.addWidget(self.ws_tp_time_checkbox)
         add_ws_quick = QPushButton("Add to Quick View")
         add_ws_quick.setObjectName("cycleSecondaryAction")
         add_ws_quick.setToolTip("Copy the WS phase gear into the Quick View set.")
@@ -5882,6 +5901,7 @@ class MainWindow(QMainWindow):
         graph_header.setContentsMargins(0, 0, 0, 0)
         graph_header.setSpacing(8)
         graph_header.addWidget(graph_title, 1)
+        graph_header.addWidget(self.ws_tp_time_checkbox)
         graph_header.addWidget(self.cycle_reference_checkbox)
         graph_header.addWidget(self.cycle_reference_details_checkbox)
         graph_layout.addLayout(graph_header)
@@ -13111,12 +13131,12 @@ class MainWindow(QMainWindow):
                 elapsed, _output, _invert = actions.average_attack_round(
                     player, enemy, 0.0, float(tp), "Time to WS"
                 )
-                points.append((float(elapsed), damage, tp))
+                points.append((float(tp), damage, float(elapsed)))
             self._render_ws_tp_time_graph(
                 self.cycle_result_figure, self.cycle_result_canvas, points, ws_name
             )
             self.plot_status.setText(
-                f"WS damage vs TP/time graph complete for {ws_name} using one fixed set."
+                f"Fixed-WS damage-per-TP-time graph complete for {ws_name}."
             )
         except Exception as error:
             self._plot_distribution_failed(str(error))
@@ -13124,19 +13144,25 @@ class MainWindow(QMainWindow):
     def _render_ws_tp_time_graph(self, figure, canvas, points, ws_name: str):
         if figure is None or canvas is None:
             return
+        chart = _ws_tp_time_chart_data(points)
+        if chart is None:
+            self._render_cycle_graph_placeholder("No valid TP/time points were produced.")
+            return
         figure.clear()
         figure.set_facecolor("#17142e")
         axis = figure.add_subplot(111)
         axis.set_facecolor("#17142e")
-        x = [point[0] for point in points]
-        y = [point[1] for point in points]
+        x = [point[0] for point in chart]
+        y = [point[1] for point in chart]
         axis.plot(x, y, color="#f3d989", marker="o", linewidth=2.2)
-        for elapsed, damage, tp in points:
-            axis.annotate(f"{tp:,} TP", (elapsed, damage), xytext=(0, 8),
+        for tp, damage_per_time, _damage, _elapsed in chart:
+            axis.annotate(f"{damage_per_time:,.0f}", (tp, damage_per_time), xytext=(0, 8),
                           textcoords="offset points", ha="center", color="#f1e9dc", fontsize=8)
-        axis.set_title(f"{ws_name} · damage by TP and time", color="#f5f0e8")
-        axis.set_xlabel("Time to TP threshold (seconds)", color="#c9c3d4")
-        axis.set_ylabel("Average weapon-skill damage", color="#c9c3d4")
+        axis.set_title(f"{ws_name} · WS damage per time to TP", color="#f5f0e8")
+        axis.set_xlabel("TP threshold", color="#c9c3d4")
+        axis.set_ylabel("Average WS damage / time to TP threshold (damage/s)", color="#c9c3d4")
+        axis.set_xticks(x)
+        axis.set_xticklabels([f"{tp:,.0f}" for tp in x])
         axis.tick_params(colors="#c9c3d4")
         for spine in axis.spines.values():
             spine.set_color("#665f7b")

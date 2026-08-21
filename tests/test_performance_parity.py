@@ -43,6 +43,37 @@ def empty_gearset():
 
 
 class PerformanceParityTests(unittest.TestCase):
+    def test_locked_slots_are_not_in_optimizer_pair_neighborhood(self):
+        variable = {"head": [{"Name": "A"}, {"Name": "B"}]}
+        variable["main"] = [{"Name": "Locked weapon"}]
+        variable["body"] = []
+        self.assertEqual(wsdist_module._candidate_work_slots(variable), ["head"])
+
+        all_locked = {
+            "head": [{"Name": "A"}],
+            "main": [{"Name": "Locked weapon"}],
+        }
+        self.assertEqual(
+            wsdist_module._candidate_work_slots(all_locked), ["head", "main"]
+        )
+
+    def test_compiled_ranged_average_matches_formula(self):
+        result = actions._average_ws_ranged_average_core(
+            100, 10, 20, 2.0, 1.0, 0.5,
+            0.25, 0.4, 0.1, 0.2, 0.05,
+            0.1, 0.2, 0.8, 0.7, 3,
+            600, 120, 0.25,
+        )
+        first = actions.get_avg_phys_damage(
+            100, 10, 20, 2.0, 1.0, 0.25, 0.4, 0.1, 0.2, 0.05,
+        ) * 1.1
+        other = actions.get_avg_phys_damage(
+            100, 10, 20, 2.0, 0.5, 0.25, 0.4, 0, 0.2, 0.05,
+        ) * 1.1
+        self.assertAlmostEqual(result[0], (first * 0.8 + other * 0.7 * 2) * 1.2)
+        self.assertAlmostEqual(result[1], first * 0.8 * 1.2)
+        self.assertAlmostEqual(result[2], actions.get_tp(0.8, 720, 0.25) + 10 * 1.25 * 2 * 0.7)
+
     def test_optimizer_retains_up_to_fifty_distinct_gear_results(self):
         results = [
             {
